@@ -854,7 +854,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 -   Additional settings to support mobile with WP-Rocket
 -   Add the ability to block nginx configuration overwriting by adding a file .custom. Example with /etc/nginx/conf.d/webp.conf -> `touch /etc/nginx/conf.d/webp.conf.custom`
 -   If there is a custom file, WordOps will write the configuration in a file named fileconf.conf.orig to let users implement possible changes
--   UFW minimal configuration during install. Can be disabled with the flag `-w`, `--wufw` or `--without-ufw`. Example : `wget -qO wo wops.cc && sudo bash wo -w`
+-   UFW minimal configuration during install. Can be disabled with the flag `-w`, `--wufw` or `--without-ufw`. Example : `wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/master/install && sudo bash wo -w`
 
 #### Fixed
 

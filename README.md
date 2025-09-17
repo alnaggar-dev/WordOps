@@ -6,6 +6,12 @@
 <h2 align="center">An essential toolset that eases WordPress site and server administration</h2>
 
 <p align="center">
+<strong>🔧 This is Saleh's Custom Fork of WordOps</strong><br>
+Enhanced with custom features and modifications<br>
+Original project: <a href="https://github.com/WordOps/WordOps">WordOps/WordOps</a>
+</p>
+
+<p align="center">
 <img src="https://docs.wordops.net/images/wordops-intro.gif" width="800" alt="WordOps" />
 </p>
 
@@ -73,7 +79,7 @@
 ## Getting Started
 
 ```bash
-wget -qO wo wops.cc && sudo bash wo      # Install WordOps
+wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/master/install && sudo bash wo      # Install Saleh's Custom WordOps
 sudo wo site create example.com --wp     # Install required packages & setup WordPress on example.com
 ```
 

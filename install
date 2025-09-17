@@ -2,12 +2,12 @@
 # -------------------------------------------------------------------------
 # WordOps install and update script
 # -------------------------------------------------------------------------
-# Website:       https://wordops.net
-# GitHub:        https://github.com/WordOps/WordOps
-# Copyright (c) 2019-2025 - WordOps
+# Website:       https://waashub.com
+# GitHub:        https://github.com/alnaggar-dev/WordOps
+# Copyright (c) 2019-2025 - Saleh's Custom WordOps
 # This script is licensed under M.I.T
 # -------------------------------------------------------------------------
-# wget -qO wo wops.cc && sudo -E bash wo
+# wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/master/install && sudo -E bash wo
 # -------------------------------------------------------------------------
 # Version 3.22.0 - 2024-12-06
 # -------------------------------------------------------------------------
@@ -90,7 +90,7 @@ done
 ###
 if [[ $EUID -ne 0 ]]; then
     wo_lib_echo_fail "Sudo privilege required..."
-    wo_lib_echo_fail "Use: wget -qO wo wops.cc && sudo bash wo  "
+    wo_lib_echo_fail "Use: wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/master/install && sudo bash wo  "
     exit 100
 fi
 
@@ -549,9 +549,9 @@ wo_install() {
     fi
 
     if [ "$wo_branch" = "master" ]; then
-        /opt/wo/bin/pip install -U wordops --upgrade-strategy=eager
+        /opt/wo/bin/pip install -I "git+https://github.com/alnaggar-dev/WordOps.git@master#egg=wordops" --upgrade-strategy=eager
     else
-        /opt/wo/bin/pip install -I "git+https://github.com/WordOps/WordOps.git@$wo_branch#egg=wordops" --upgrade-strategy=eager
+        /opt/wo/bin/pip install -I "git+https://github.com/alnaggar-dev/WordOps.git@$wo_branch#egg=wordops" --upgrade-strategy=eager
     fi
     local python_venv
     python_venv=$(python3 -c "import sys; print(sys.version_info[1])")
@@ -616,7 +616,7 @@ wo_travis_install() {
         fi
         /opt/wo/bin/pip install -U . --upgrade-strategy=eager
     else
-        /opt/wo/bin/pip install -U "git+https://github.com/WordOps/WordOps.git@$wo_branch#egg=wordops" --upgrade-strategy=eager
+        /opt/wo/bin/pip install -U "git+https://github.com/alnaggar-dev/WordOps.git@$wo_branch#egg=wordops" --upgrade-strategy=eager
     fi
     cp -rf /opt/wo/lib/python3."$python_ver"/site-packages/usr/* /usr/
     cp -rn /opt/wo/lib/python3."$python_ver"/site-packages/etc/* /etc/
@@ -849,7 +849,7 @@ wo_init() {
     if [ -f ./setup.py ]; then
         wo_version_new=$(grep "version='" setup.py | awk -F "'" '{print $2}' 2>&1)
     else
-        wo_version_new=$(curl -m 5 --retry 3 -sL https://api.github.com/repos/WordOps/WordOps/releases/latest 2>&1 | jq -r '.tag_name')
+        wo_version_new=$(curl -m 5 --retry 3 -sL https://api.github.com/repos/alnaggar-dev/WordOps/releases/latest 2>&1 | jq -r '.tag_name')
     fi
 
     echo ""
@@ -948,7 +948,7 @@ else
         echo
     elif [ "$wo_upgrade" = "1" ]; then
         wo_lib_echo "WordOps (wo) upgrade to $wo_version_new was successful!"
-        wo_lib_echo "Changelog is available on https://github.com/WordOps/WordOps/releases/tag/$wo_version_new"
+        wo_lib_echo "Changelog is available on https://github.com/alnaggar-dev/WordOps/releases/tag/$wo_version_new"
         echo
         version_to_check="v3.21"
         if echo "$wo_version_new" | grep -q "$version_to_check"; then
@@ -977,6 +977,6 @@ else
     wo_lib_echo "WordOps Documentation : https://docs.wordops.net"
     wo_lib_echo "WordOps Community Forum : https://community.wordops.net"
     echo
-    wo_lib_echo "Give WordOps a GitHub star : https://github.com/WordOps/WordOps/"
+    wo_lib_echo "Give Saleh's WordOps a GitHub star : https://github.com/alnaggar-dev/WordOps/"
     echo
 fi

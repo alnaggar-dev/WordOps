@@ -64,7 +64,7 @@ class WOUpdateController(CementBaseController):
             (not pargs.mainline) and (not pargs.beta) and
                 (not pargs.branch)):
             wo_current = ("v{0}".format(WOVar.wo_version))
-            wo_latest = WODownload.latest_release(self, "WordOps/WordOps")
+            wo_latest = WODownload.latest_release(self, "alnaggar-dev/WordOps")
             if wo_current == wo_latest:
                 Log.info(
                     self, "WordOps {0} is already installed"
@@ -75,7 +75,7 @@ class WOUpdateController(CementBaseController):
         if not pargs.force:
             Log.info(
                 self, "WordOps changelog available on "
-                "https://github.com/WordOps/WordOps/releases/tag/{0}"
+                "https://github.com/alnaggar-dev/WordOps/releases/tag/{0}"
                 .format(wo_latest))
             start_upgrade = input("Do you want to continue:[y/N]")
             if start_upgrade not in ("Y", "y"):
@@ -85,7 +85,7 @@ class WOUpdateController(CementBaseController):
         if not os.path.isdir('/var/lib/wo/tmp'):
             os.makedirs('/var/lib/wo/tmp')
         WODownload.download(self, [["https://raw.githubusercontent.com/"
-                                    "WordOps/WordOps/{0}/install"
+                                    "alnaggar-dev/WordOps/{0}/install"
                                     .format(wo_branch),
                                     "/var/lib/wo/tmp/{0}".format(filename),
                                     "update script"]])
