@@ -72,9 +72,19 @@
 
 ## Getting Started
 
+### Standard Installation
+
 ```bash
 wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/main/install && sudo bash wo      # Install WordOps
 sudo wo site create example.com --wp     # Install required packages & setup WordPress on example.com
+```
+
+### Silent Installation
+
+WordOps automatically configures Git during installation using system defaults. For completely silent installations in automation scripts:
+
+```bash
+wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/main/install && sudo bash wo --force
 ```
 
 Detailed Getting Started guide with additional installation methods can be found in [the documentation](https://docs.wordops.net/getting-started/installation-guide/).

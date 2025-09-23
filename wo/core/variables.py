@@ -76,23 +76,25 @@ class WOVar():
         wo_user = config['user']['name']
         wo_email = config['user']['email']
     except Exception:
-        print("WordOps (wo) require an username & and an email "
-              "address to configure Git (used to save server configurations)")
-        print("Your informations will ONLY be stored locally")
-
-        wo_user = input("Enter your name: ")
-        while wo_user == "":
-            print("Unfortunately, this can't be left blank")
-            wo_user = input("Enter your name: ")
-
-        wo_email = input("Enter your email: ")
-
-        while not match(r"^[A-Za-z0-9\.\+_-]+@[A-Za-z0-9\._-]+\.[a-zA-Z]*$",
-                        wo_email):
-            print("Whoops, seems like you made a typo - "
-                  "the e-mail address is invalid...")
-            wo_email = input("Enter your email: ")
-
+        # Use silent defaults instead of interactive prompts
+        # This should rarely happen now since install script sets up .gitconfig
+        import getpass
+        import socket
+        
+        try:
+            wo_user = getpass.getuser()
+        except Exception:
+            wo_user = "WordOps"
+            
+        try:
+            hostname = socket.getfqdn()
+        except Exception:
+            hostname = "localhost"
+            
+        wo_email = f"root@{hostname}"
+        
+        print(f"WordOps: Setting up Git configuration with user '{wo_user}' and email '{wo_email}'")
+        
         git.config("--global", "user.name", "{0}".format(wo_user))
         git.config("--global", "user.email", "{0}".format(wo_email))
 
