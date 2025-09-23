@@ -62,14 +62,9 @@ class WOUpdateController(CementBaseController):
         if ((not pargs.force) and (not pargs.travis) and
             (not pargs.mainline) and (not pargs.beta) and
                 (not pargs.branch)):
-            wo_current = ("v{0}".format(WOVar.wo_version))
-            # Skip release checking since alnaggar-dev/WordOps doesn't use releases
-            wo_latest = "dev-version"  # Always allow update from fork
-            if wo_current == wo_latest:
-                Log.info(
-                    self, "WordOps {0} is already installed"
-                    .format(wo_latest))
-                self.app.close(0)
+            # For fork updates, we always allow updates since we track main branch
+            # Users can use --force to skip this check entirely
+            Log.info(self, "Checking for updates from alnaggar-dev/WordOps main branch...")
 
         # prompt user before starting upgrade
         if not pargs.force:
