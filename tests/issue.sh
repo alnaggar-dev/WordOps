@@ -3,7 +3,7 @@
 # WordOps support script
 # -------------------------------------------------------------------------
 # Website:       https://wordops.net
-# GitHub:        https://github.com/WordOps/WordOps
+# GitHub:        https://github.com/alnaggar-dev/WordOps
 # Copyright (c) 2024 - WordOps
 # This script is licensed under M.I.T
 # -------------------------------------------------------------------------

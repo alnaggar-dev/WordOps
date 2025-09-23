@@ -46,10 +46,9 @@ class WOUpdateController(CementBaseController):
         filename = "woupdate" + time.strftime("%Y%m%d-%H%M%S")
 
         install_args = ""
-        wo_branch = "master"
+        wo_branch = "main"
         if pargs.mainline or pargs.beta:
-            wo_branch = "mainline"
-            install_args = install_args + "--mainline "
+            Log.error(self, "Mainline/beta branches are not supported in this fork. Use the main branch or specify a custom branch with --branch")
         elif pargs.branch:
             wo_branch = pargs.branch
             install_args = install_args + "-b {0} ".format(wo_branch)
@@ -64,7 +63,8 @@ class WOUpdateController(CementBaseController):
             (not pargs.mainline) and (not pargs.beta) and
                 (not pargs.branch)):
             wo_current = ("v{0}".format(WOVar.wo_version))
-            wo_latest = WODownload.latest_release(self, "WordOps/WordOps")
+            # Skip release checking since alnaggar-dev/WordOps doesn't use releases
+            wo_latest = "dev-version"  # Always allow update from fork
             if wo_current == wo_latest:
                 Log.info(
                     self, "WordOps {0} is already installed"
@@ -75,8 +75,7 @@ class WOUpdateController(CementBaseController):
         if not pargs.force:
             Log.info(
                 self, "WordOps changelog available on "
-                "https://github.com/WordOps/WordOps/releases/tag/{0}"
-                .format(wo_latest))
+                "https://github.com/alnaggar-dev/WordOps/commits/main")
             start_upgrade = input("Do you want to continue:[y/N]")
             if start_upgrade not in ("Y", "y"):
                 Log.error(self, "Not starting WordOps update")
@@ -85,7 +84,7 @@ class WOUpdateController(CementBaseController):
         if not os.path.isdir('/var/lib/wo/tmp'):
             os.makedirs('/var/lib/wo/tmp')
         WODownload.download(self, [["https://raw.githubusercontent.com/"
-                                    "WordOps/WordOps/{0}/install"
+                                    "alnaggar-dev/WordOps/{0}/install"
                                     .format(wo_branch),
                                     "/var/lib/wo/tmp/{0}".format(filename),
                                     "update script"]])
