@@ -72,7 +72,7 @@ This plugin is designed for scenarios where:
 │              Integration with WordOps Native Functions       │
 │  ┌────────────────────────────────────────────────────┐    │
 │  │ • setupdatabase() - Database creation              │    │
-│  │ • generateNginxConf() - Nginx configuration        │    │
+│  │ • setupdomain() - Nginx configuration              │    │
 │  │ • WOAcme() - SSL certificate management           │    │
 │  │ • WOService() - Service management                │    │
 │  └────────────────────────────────────────────────────┘    │
@@ -153,62 +153,30 @@ The plugin uses WordOps' existing nginx templates (wpfc.mustache, wpredis.mustac
 - **Permissions**: Root or sudo access
 - **Disk Space**: Minimum 2GB free
 
-### Installation Steps
+### Install/Update (Fork)
 
-1. **Clone or Download the Repository**
-   ```bash
-   cd /opt
-   git clone https://github.com/WordOps/WordOps.git
-   cd WordOps
-   ```
+- This plugin ships with this WordOps fork. To install or update it:
 
-2. **Run Installation Script**
-   ```bash
-   sudo chmod +x install-multitenancy.sh
-   sudo ./install-multitenancy.sh
-   ```
+  ```bash
+  wo update --force
+  ```
 
-3. **Verify Installation**
-   ```bash
-   wo multitenancy --help
-   ```
-
-### Manual Installation
-
-If the automated installer fails, you can install manually:
+### Verify Installation
 
 ```bash
-# Create directories
-sudo mkdir -p /var/lib/wo/plugins
-sudo mkdir -p /etc/wo/plugins.d
-# Note: No templates directory needed - using WordOps native templates
-
-# Copy plugin files
-sudo cp wo/cli/plugins/multitenancy.py /var/lib/wo/plugins/
-sudo cp wo/cli/plugins/multitenancy_functions.py /var/lib/wo/plugins/
-sudo cp wo/cli/plugins/multitenancy_db.py /var/lib/wo/plugins/
-sudo cp config/plugins.d/multitenancy.conf /etc/wo/plugins.d/
-
-# Set permissions
-sudo chmod 644 /var/lib/wo/plugins/multitenancy*.py
-sudo chmod 644 /etc/wo/plugins.d/multitenancy.conf
-
-# Enable plugin in WordOps config
-echo "[multitenancy]" | sudo tee -a /etc/wo/wo.conf
-echo "enable_plugin = true" | sudo tee -a /etc/wo/wo.conf
+wo multitenancy --help
+test -f /etc/wo/plugins.d/multitenancy.conf && echo OK
 ```
 
-### Uninstallation
+### Disable / Uninstall
 
-```bash
-# Remove plugin but keep sites and data
-sudo ./install-multitenancy.sh --uninstall
+- Disable plugin: edit `/etc/wo/plugins.d/multitenancy.conf` and set `enable_plugin = false`, or remove that file.
+- Remove shared infrastructure and data:
 
-# Complete removal including all data
-sudo wo multitenancy remove --force
-sudo rm -rf /var/www/shared
-sudo rm -f /etc/wo/plugins.d/multitenancy.conf
-```
+  ```bash
+  wo multitenancy remove --force
+  sudo rm -rf /var/www/shared
+  ```
 
 ---
 
@@ -486,7 +454,7 @@ def create_site():
     generate_wp_config()
     
     # 6. Generate nginx using WordOps templates
-    nginx_conf = generateNginxConf()  # Uses WordOps native function
+    setupdomain(app, data)  # Uses WordOps native template rendering
     
     # 7. Install WordPress with WP-CLI
     install_wordpress()
@@ -526,20 +494,28 @@ def update():
 
 ```python
 def generate_nginx_config(app, domain, php_version, cache_type, site_root):
-    # Uses WordOps' native nginx configuration generation
-    from wo.core.nginxconfig import generateNginxConf
-    
-    site_data = {
-        'domain': domain,
-        'webroot': f"{site_root}/htdocs",
-        'site_type': 'wp',
-        'cache_type': cache_type,  # wpfc, wpredis, etc.
-        'php_version': php_version,
+    # Use WordOps' site_functions.setupdomain to render templates
+    from wo.cli.plugins.site_functions import setupdomain
+
+    data = {
+        'site_name': domain,
+        'www_domain': f"www.{domain}",
+        'static': False,
+        'basic': cache_type not in ['wpfc', 'wpredis', 'wpsc', 'wprocket', 'wpce'],
+        'wp': True,
+        'wpfc': cache_type == 'wpfc',
+        'wpredis': cache_type == 'wpredis',
+        'wpsc': cache_type == 'wpsc',
+        'wprocket': cache_type == 'wprocket',
+        'wpce': cache_type == 'wpce',
+        'multisite': False,
+        'wpsubdir': False,
+        'webroot': site_root,
+        'wo_php': f"php{php_version.replace('.', '')}",
     }
-    
-    # This uses WordOps' existing templates - no custom templates needed!
-    nginx_conf = generateNginxConf(app, domain, site_data)
-    return nginx_conf
+
+    setupdomain(app, data)
+    return f"/etc/nginx/sites-available/{domain}"
 ```
 
 ### 5. Baseline Enforcement
@@ -611,7 +587,7 @@ Database operations using WordOps' SQLite database.
 
 ## Database Schema
 
-The plugin extends WordOps' SQLite database (`/var/lib/wo/wordops.db`) with three tables:
+The plugin extends WordOps' SQLite database (`/var/lib/wo/dbase.db`) with three tables:
 
 ### multitenancy_config
 ```sql
@@ -816,7 +792,7 @@ Plugins in the shared directory are read-only from the web. Updates must be done
 
 2. **Native WordOps Integration** ✅
    - Uses `setupdatabase()` for database creation
-   - Uses `generateNginxConf()` for nginx configuration
+   - Uses `setupdomain()` for nginx configuration
    - Uses existing SSL/cache functions
 
 3. **Atomic Deployments** ✅

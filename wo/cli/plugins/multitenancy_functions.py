@@ -274,44 +274,53 @@ require_once ABSPATH . 'wp-settings.php';
     
     @staticmethod
     def generate_nginx_config(app, domain, php_version, cache_type, site_root):
-        """Generate nginx configuration for shared WordPress site"""
-        
-        # Use WordOps' existing nginx configuration generation
-        # The shared setup works perfectly with standard WordOps templates
-        from wo.core.nginxconfig import generateNginxConf
-        
-        # Prepare site data for WordOps nginx generation
-        site_data = {
-            'domain': domain,
-            'webroot': f"{site_root}/htdocs",
-            'site_type': 'wp',
-            'cache_type': cache_type,
-            'php_version': php_version.replace('.', ''),
-            'is_ssl': False,  # SSL is configured separately
-            'is_enabled': True
+        """Generate nginx configuration for shared WordPress site using WordOps templates.
+
+        Falls back to a minimal config if template rendering fails.
+        """
+
+        # Build data structure expected by WordOps virtualconf.mustache
+        data = {
+            'site_name': domain,
+            'www_domain': f"www.{domain}",
+            'static': False,
+            'basic': False,
+            'wp': True,
+            'wpfc': cache_type == 'wpfc',
+            'wpredis': cache_type == 'wpredis',
+            'wpsc': cache_type == 'wpsc',
+            'wprocket': cache_type == 'wprocket',
+            'wpce': cache_type == 'wpce',
+            'multisite': False,
+            'wpsubdir': False,
+            'webroot': site_root,
         }
-        
-        # Use WordOps' native nginx configuration generator
-        # This ensures compatibility with all cache types and features
+
+        # Default to basic (no page cache) when not using a specific cache
+        if cache_type not in ['wpfc', 'wpredis', 'wpsc', 'wprocket', 'wpce']:
+            data['basic'] = True
+
+        # Map PHP version (e.g., 8.2) to WordOps key (e.g., php82)
         try:
-            # Generate nginx config using WordOps native function
-            nginx_conf = generateNginxConf(app, domain, site_data)
-            
-            if nginx_conf:
-                Log.debug(app, f"Generated nginx config for {domain} using WordOps templates")
-                return nginx_conf
-            else:
-                # Fallback to basic config if generation fails
-                Log.debug(app, "WordOps nginx generation failed, using fallback")
-                config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
-                nginx_conf = f"/etc/nginx/sites-available/{domain}"
-                with open(nginx_conf, 'w') as f:
-                    f.write(config_content)
-                return nginx_conf
-                
+            wo_php_key = None
+            for key, val in WOVar.wo_php_versions.items():
+                if val == php_version:
+                    wo_php_key = key
+                    break
+            if not wo_php_key:
+                wo_php_key = f"php{php_version.replace('.', '')}"
+            data['wo_php'] = wo_php_key
+        except Exception:
+            data['wo_php'] = f"php{php_version.replace('.', '')}"
+
+        # Render using WordOps helper
+        try:
+            from wo.cli.plugins.site_functions import setupdomain, SiteError
+            setupdomain(app, data)
+            Log.debug(app, f"Generated nginx config for {domain} using WordOps templates")
+            return f"/etc/nginx/sites-available/{domain}"
         except Exception as e:
-            Log.debug(app, f"Nginx generation error: {e}, using fallback")
-            # Fallback to basic nginx config
+            Log.debug(app, f"Nginx generation via templates failed ({e}), using fallback")
             config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
             nginx_conf = f"/etc/nginx/sites-available/{domain}"
             with open(nginx_conf, 'w') as f:
@@ -321,7 +330,8 @@ require_once ABSPATH . 'wp-settings.php';
     @staticmethod
     def generate_basic_nginx_config(domain, site_root, php_version):
         """Generate basic nginx configuration"""
-        php_sock = f"php{php_version.replace('.', '')}-fpm"
+        # Correct socket name format: php8.2-fpm.sock
+        php_sock = f"php{php_version}-fpm"
         
         return f"""server {{
     listen 80;
