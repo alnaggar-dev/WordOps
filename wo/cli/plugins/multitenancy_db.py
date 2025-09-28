@@ -192,7 +192,7 @@ class MTDatabase:
                 session.add(config)
             
             session.commit()
-                Log.debug(app, f"Updated current release to {release_name}")
+            Log.debug(app, f"Updated current release to {release_name}")
                 
         except Exception as e:
             Log.error(app, f"Failed to update release: {e}")
