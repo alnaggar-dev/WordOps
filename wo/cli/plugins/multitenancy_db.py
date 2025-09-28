@@ -86,7 +86,7 @@ class MTDatabase:
                 config = session.query(MultitenancyConfig).filter_by(
                     key=key
                 ).first()
-                
+
                 if config:
                     config.value = str(value)
                     config.updated_at = datetime.now()
@@ -110,7 +110,7 @@ class MTDatabase:
                 session.add(initialized)
             
             session.commit()
-                Log.debug(app, "Configuration saved to database")
+            Log.debug(app, "Configuration saved to database")
                 
         except Exception as e:
             Log.error(app, f"Failed to save configuration: {e}")
