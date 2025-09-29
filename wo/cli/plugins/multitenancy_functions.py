@@ -186,6 +186,10 @@ require __DIR__ . '/wp/wp-blog-header.php';
             # Generate fallback salts if API is unavailable
             salts = MTFunctions.generate_salts()
         
+        # Following HandPressed pattern: wp-config.php goes IN the webroot (htdocs)
+        # This is secure because WordPress blocks direct HTTP access to wp-config.php
+        # and it allows the router to load it without permission issues
+        
         wp_config = f"""<?php
 /**
  * WordPress Configuration for {domain}
@@ -207,12 +211,12 @@ define( 'DB_COLLATE', '' );
 $table_prefix = 'wp_';
 
 // ** WordPress Content Directory ** //
-define( 'WP_CONTENT_DIR', __DIR__ . '/htdocs/wp-content' );
+define( 'WP_CONTENT_DIR', __DIR__ . '/wp-content' );
 define( 'WP_CONTENT_URL', (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http') . '://{domain}/wp-content' );
 
 // ** WordPress Core Directory ** //
 if ( ! defined( 'ABSPATH' ) ) {{
-    define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );
+    define( 'ABSPATH', __DIR__ . '/wp/' );
 }}
 
 // ** File System Method ** //
@@ -242,52 +246,22 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 // ** Multisite Settings (if needed) ** //
 // define( 'WP_ALLOW_MULTISITE', true );
 
-// ** WordPress Core Path ** //
-if ( ! defined( 'ABSPATH' ) ) {{
-    define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );
-}}
-
 /* That's all, stop editing! Happy publishing. */
 
 /**
- * Note: wp-settings.php is loaded by the configuration loader
- * (either the multi-tenancy router or the WP-CLI shim)
+ * Note: wp-settings.php is loaded by the configuration loader (router)
  */
 """
         
-        wp_config_path = f"{site_root}/wp-config.php"
+        # Place wp-config.php in htdocs (webroot) like HandPressed does
+        # This is secure - WordPress blocks direct access via .htaccess/nginx rules
+        wp_config_path = f"{site_root}/htdocs/wp-config.php"
         with open(wp_config_path, 'w') as f:
             f.write(wp_config)
         
-        # Set secure permissions
+        # Set secure permissions (readable by www-data)
         os.chmod(wp_config_path, 0o640)
-        Log.debug(app, f"Generated wp-config.php for {domain}")
-
-        # Create a WP-CLI-compatible shim in htdocs
-        # WP-CLI looks for wp-config.php in the current directory before checking the wp/ directory
-        # This shim loads the real config and satisfies WP-CLI's requirements
-        shim_path = f"{site_root}/htdocs/wp-config.php"
-        shim_content = f"""<?php
-/**
- * WordPress Configuration Shim for {domain}
- * 
- * This file satisfies WP-CLI's requirements while loading the real
- * configuration kept outside the web root for security.
- */
-
-// Load the real configuration from parent directory
-require_once __DIR__ . '/../wp-config.php';
-
-/** Sets up WordPress vars and included files. */
-require_once ABSPATH . 'wp-settings.php';
-"""
-        try:
-            with open(shim_path, 'w') as f:
-                f.write(shim_content)
-            os.chmod(shim_path, 0o640)
-            Log.debug(app, f"Created WP-CLI shim at {shim_path}")
-        except Exception as e:
-            Log.debug(app, f"Could not create WP-CLI shim: {e}")
+        Log.debug(app, f"Generated wp-config.php at {wp_config_path}")
     
     @staticmethod
     def generate_salts():
@@ -600,14 +574,15 @@ require_once ABSPATH . 'wp-settings.php';
         
         with tarfile.open(backup_path, 'w:gz') as tar:
             tar.add(f"{site_root}/htdocs", arcname='htdocs')
-            tar.add(f"{site_root}/wp-config.php", arcname='wp-config.php')
+            # wp-config.php is now inside htdocs, so it's included in the htdocs backup
         
         return backup_path
     
     @staticmethod
     def update_wp_config_for_shared(app, site_root, site_htdocs):
         """Update wp-config.php when converting to shared"""
-        wp_config_path = f"{site_root}/wp-config.php"
+        # In multi-tenancy, wp-config.php is in htdocs
+        wp_config_path = f"{site_htdocs}/wp-config.php"
         
         if not os.path.exists(wp_config_path):
             Log.error(app, f"wp-config.php not found at {wp_config_path}")
@@ -617,12 +592,22 @@ require_once ABSPATH . 'wp-settings.php';
         with open(wp_config_path, 'r') as f:
             config = f.read()
         
-        # Update ABSPATH if needed
-        if "define( 'ABSPATH'" not in config:
+        # Update ABSPATH to point to shared WordPress core
+        # Change from __DIR__ to __DIR__ . '/wp/'
+        config = config.replace(
+            "define( 'ABSPATH'", 
+            "// define( 'ABSPATH' // OLD"
+        )
+        
+        # Add new ABSPATH before wp-settings.php
+        if "define( 'ABSPATH', __DIR__ . '/wp/' )" not in config:
             config = config.replace(
                 "require_once ABSPATH . 'wp-settings.php';",
-                "define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );\nrequire_once ABSPATH . 'wp-settings.php';"
+                "define( 'ABSPATH', __DIR__ . '/wp/' );\n\n/* That's all, stop editing! Happy publishing. */\n\n// Note: wp-settings.php is loaded by the router"
             )
+        
+        # Remove wp-settings.php loading (router handles it)
+        config = config.replace("require_once ABSPATH . 'wp-settings.php';", "")
         
         # Write updated config
         with open(wp_config_path, 'w') as f:
@@ -792,8 +777,8 @@ if ($domain) {
     $domain = preg_replace('/:\\d+$/', '', $domain);
 }
 
-// Define the site-specific config path
-$site_config = '/var/www/' . $domain . '/wp-config.php';
+// Define the site-specific config path (in htdocs, following HandPressed pattern)
+$site_config = '/var/www/' . $domain . '/htdocs/wp-config.php';
 
 // Load site-specific configuration if it exists
 if ($domain && file_exists($site_config) && is_readable($site_config)) {
