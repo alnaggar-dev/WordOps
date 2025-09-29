@@ -273,6 +273,17 @@ require_once ABSPATH . 'wp-settings.php';
 
 // Load the real configuration
 require_once dirname(__DIR__) . '/wp-config.php';
+
+// WP-CLI requires wp-settings.php to be loaded directly in wp-config.php
+// Since we've already loaded it in the real config, we just need to satisfy the check
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/wp/' );
+}
+
+// Only load wp-settings.php if it hasn't been loaded yet
+if ( ! defined( 'WPINC' ) ) {
+    require_once ABSPATH . 'wp-settings.php';
+}
 """
         try:
             with open(shim_path, 'w') as f:
