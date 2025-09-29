@@ -243,12 +243,12 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 // define( 'WP_ALLOW_MULTISITE', true );
 
 // ** WordPress Bootstrap ** //
-// ABSPATH is defined by the shim that includes this file
 if ( ! defined( 'ABSPATH' ) ) {{
     define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );
 }}
 
-// WordPress bootstrap (wp-settings.php) is loaded by the shim
+/** Sets up WordPress vars and included files. */
+require_once ABSPATH . 'wp-settings.php';
 """
         
         wp_config_path = f"{site_root}/wp-config.php"
@@ -259,36 +259,8 @@ if ( ! defined( 'ABSPATH' ) ) {{
         os.chmod(wp_config_path, 0o640)
         Log.debug(app, f"Generated wp-config.php for {domain}")
 
-        # Also place a shim in htdocs so WP-CLI and wp-load.php can locate the config
-        # WordPress searches ABSPATH (wp root) and its parent only. Our real config
-        # is two levels up from ABSPATH (htdocs/wp), so we create a parent shim.
-        shim_path = f"{site_root}/htdocs/wp-config.php"
-        shim_content = """<?php
-/**
- * WordPress Configuration Shim
- * 
- * This file allows WordPress and WP-CLI to locate the real configuration
- * kept outside the web root for security.
- */
-
-// Load the real configuration (database settings, salts, etc.)
-require_once dirname(__DIR__) . '/wp-config.php';
-
-// Define ABSPATH if not already set by the real config
-if ( ! defined( 'ABSPATH' ) ) {
-    define( 'ABSPATH', __DIR__ . '/wp/' );
-}
-
-// Load WordPress bootstrap (required by WP-CLI)
-require_once ABSPATH . 'wp-settings.php';
-"""
-        try:
-            with open(shim_path, 'w') as f:
-                f.write(shim_content)
-            os.chmod(shim_path, 0o640)
-            Log.debug(app, f"Created wp-config.php shim at {shim_path}")
-        except Exception as e:
-            Log.debug(app, f"Could not create wp-config.php shim: {e}")
+        # Note: WordPress core now has a router wp-config.php that loads site-specific configs
+        # No shim needed in htdocs - the router handles everything automatically
     
     @staticmethod
     def generate_salts():
@@ -754,12 +726,75 @@ class SharedInfrastructure:
                 shutil.rmtree(wp_content_path)
             os.symlink(self.wp_content_dir, wp_content_path)
             
+            # Create router wp-config.php in shared core
+            self.create_router_wp_config(release_path)
+            
             Log.debug(self.app, f"WordPress downloaded: {release_name}")
             return release_name
             
         except subprocess.CalledProcessError as e:
             Log.error(self.app, f"Failed to download WordPress: {e}")
             raise
+    
+    def create_router_wp_config(self, release_path):
+        """Create a router wp-config.php in shared WordPress core that loads site-specific configs"""
+        router_config = '''<?php
+/**
+ * WordPress Multi-tenancy Router Configuration
+ * This file routes to site-specific wp-config.php based on the requested domain
+ */
+
+// Determine the domain being accessed
+$domain = '';
+
+// Try to get domain from various sources (web request, WP-CLI, environment)
+if (defined('WP_CLI') && WP_CLI) {
+    // WP-CLI context - try to determine site from current directory
+    $cwd = getcwd();
+    if (preg_match('#/var/www/([^/]+)#', $cwd, $matches)) {
+        $domain = $matches[1];
+    }
+} elseif (isset($_SERVER['HTTP_HOST'])) {
+    $domain = $_SERVER['HTTP_HOST'];
+} elseif (isset($_SERVER['SERVER_NAME'])) {
+    $domain = $_SERVER['SERVER_NAME'];
+}
+
+// Clean up domain
+if ($domain) {
+    // Remove www. prefix for consistency
+    $domain = preg_replace('/^www\\./', '', $domain);
+    // Remove port number if present
+    $domain = preg_replace('/:\\d+$/', '', $domain);
+}
+
+// Define the site-specific config path
+$site_config = '/var/www/' . $domain . '/wp-config.php';
+
+// Load site-specific configuration if it exists
+if ($domain && file_exists($site_config) && is_readable($site_config)) {
+    require_once $site_config;
+} else {
+    // Fallback error
+    if (defined('WP_CLI') && WP_CLI) {
+        WP_CLI::error('Site configuration not found. Run wp commands from the site directory: cd /var/www/DOMAIN/htdocs && wp ...');
+    } else {
+        $error_domain = $domain ?: 'unknown';
+        header('HTTP/1.1 503 Service Temporarily Unavailable');
+        header('Status: 503 Service Temporarily Unavailable');
+        header('Retry-After: 300');
+        die('Site configuration not found for: ' . htmlspecialchars($error_domain));
+    }
+}
+
+// Don't load wp-settings.php here - the site-specific config handles that
+'''
+        
+        router_path = f"{release_path}/wp-config.php"
+        with open(router_path, 'w') as f:
+            f.write(router_config)
+        os.chmod(router_path, 0o644)
+        Log.debug(self.app, f"Created router wp-config.php in {release_path}")
     
     def seed_plugins_and_themes(self, config):
         """Download initial plugins and themes"""
@@ -974,6 +1009,12 @@ add_action('init', function() {
         
         if not os.path.exists(release_path):
             raise Exception(f"Release {release_name} not found")
+        
+        # Ensure router wp-config.php exists in this release
+        router_config_path = f"{release_path}/wp-config.php"
+        if not os.path.exists(router_config_path):
+            Log.debug(self.app, f"Creating missing router wp-config.php for {release_name}")
+            self.create_router_wp_config(release_path)
         
         current_link = f"{self.shared_root}/current"
         
