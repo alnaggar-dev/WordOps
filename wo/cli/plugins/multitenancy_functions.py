@@ -734,14 +734,13 @@ class SharedInfrastructure:
                 shutil.rmtree(wp_content_path)
             os.symlink(self.wp_content_dir, wp_content_path)
             
-            # Remove any default wp-config files that come with WordPress
-            # We don't need a router - WordPress's wp-load.php will naturally find
-            # the site-specific wp-config.php in the htdocs directory
-            for config_file in ['wp-config.php', 'wp-config-sample.php']:
-                config_path = f"{release_path}/{config_file}"
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-                    Log.debug(self.app, f"Removed {config_file} from shared core")
+            # Remove sample config
+            sample_config = f"{release_path}/wp-config-sample.php"
+            if os.path.exists(sample_config):
+                os.remove(sample_config)
+            
+            # Create router wp-config.php (required by WordPress)
+            self.create_router_wp_config(release_path)
             
             Log.debug(self.app, f"WordPress downloaded: {release_name}")
             return release_name
@@ -755,57 +754,50 @@ class SharedInfrastructure:
         router_config = '''<?php
 /**
  * WordPress Multi-tenancy Router Configuration
- * This file routes to site-specific wp-config.php based on the requested domain
+ * This file is required by WordPress and loads site-specific configs
+ * Following HandPressed pattern: wp-config.php in shared core loads real config
  */
 
-// Determine the domain being accessed
-$domain = '';
+// Get the document root to determine which site is being accessed
+$doc_root = $_SERVER['DOCUMENT_ROOT'] ?? '';
 
-// Try to get domain from various sources (web request, WP-CLI, environment)
-if (defined('WP_CLI') && WP_CLI) {
-    // WP-CLI context - try to determine site from current directory
-    $cwd = getcwd();
-    if (preg_match('#/var/www/([^/]+)#', $cwd, $matches)) {
+// Determine site config path from document root
+// Document root is /var/www/DOMAIN/htdocs, so go up one level and into htdocs
+if ($doc_root && strpos($doc_root, '/var/www/') === 0) {
+    // Extract domain from document root: /var/www/DOMAIN/htdocs
+    if (preg_match('#^/var/www/([^/]+)/htdocs#', $doc_root, $matches)) {
         $domain = $matches[1];
-    }
-} elseif (isset($_SERVER['HTTP_HOST'])) {
-    $domain = $_SERVER['HTTP_HOST'];
-} elseif (isset($_SERVER['SERVER_NAME'])) {
-    $domain = $_SERVER['SERVER_NAME'];
-}
-
-// Clean up domain
-if ($domain) {
-    // Remove www. prefix for consistency
-    $domain = preg_replace('/^www\\./', '', $domain);
-    // Remove port number if present
-    $domain = preg_replace('/:\\d+$/', '', $domain);
-}
-
-// Define the site-specific config path (in htdocs, following HandPressed pattern)
-$site_config = '/var/www/' . $domain . '/htdocs/wp-config.php';
-
-// Load site-specific configuration if it exists
-if ($domain && file_exists($site_config) && is_readable($site_config)) {
-    require_once $site_config;
-    
-    // Load WordPress bootstrap after site configuration
-    // Note: ABSPATH is defined in the site-specific config
-    if (defined('ABSPATH') && file_exists(ABSPATH . 'wp-settings.php')) {
-        require_once ABSPATH . 'wp-settings.php';
-    }
-} else {
-    // Fallback error
-    if (defined('WP_CLI') && WP_CLI) {
-        WP_CLI::error('Site configuration not found. Run wp commands from the site directory: cd /var/www/DOMAIN/htdocs && wp ...');
-    } else {
-        $error_domain = $domain ?: 'unknown';
-        header('HTTP/1.1 503 Service Temporarily Unavailable');
-        header('Status: 503 Service Temporarily Unavailable');
-        header('Retry-After: 300');
-        die('Site configuration not found for: ' . htmlspecialchars($error_domain));
+        $site_config = $doc_root . '/wp-config.php';
+        
+        if (file_exists($site_config)) {
+            // Load site-specific configuration
+            // The site config will define ABSPATH and load wp-settings.php
+            require_once $site_config;
+            
+            // Exit here - site config handles everything including wp-settings.php
+            return;
+        }
     }
 }
+
+// Fallback for WP-CLI context
+if (defined('WP_CLI') && WP_CLI) {
+    $cwd = getcwd();
+    if (preg_match('#^/var/www/([^/]+)/htdocs#', $cwd, $matches)) {
+        $site_config = $cwd . '/wp-config.php';
+        if (file_exists($site_config)) {
+            require_once $site_config;
+            return;
+        }
+    }
+    WP_CLI::error('Site configuration not found. Run wp commands from: cd /var/www/DOMAIN/htdocs && wp ...');
+}
+
+// Error fallback
+$error_msg = 'WordPress configuration not found. Document root: ' . htmlspecialchars($doc_root ?? 'unknown');
+header('HTTP/1.1 503 Service Temporarily Unavailable');
+header('Status: 503 Service Temporarily Unavailable');
+die($error_msg);
 '''
         
         router_path = f"{release_path}/wp-config.php"
@@ -1028,12 +1020,11 @@ add_action('init', function() {
         if not os.path.exists(release_path):
             raise Exception(f"Release {release_name} not found")
         
-        # Ensure no wp-config.php exists in shared core
-        # (WordPress should find site-specific configs in htdocs)
+        # Ensure router wp-config.php exists (required by WordPress)
         router_config_path = f"{release_path}/wp-config.php"
-        if os.path.exists(router_config_path):
-            os.remove(router_config_path)
-            Log.debug(self.app, f"Removed wp-config.php from shared core (not needed)")
+        if not os.path.exists(router_config_path):
+            Log.debug(self.app, f"Creating router wp-config.php for {release_name}")
+            self.create_router_wp_config(release_path)
         
         current_link = f"{self.shared_root}/current"
         
