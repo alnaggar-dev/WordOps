@@ -229,7 +229,7 @@ class MTDatabase:
                 session.add(config)
             
             session.commit()
-                Log.debug(app, f"Incremented baseline version to {new_version}")
+            Log.debug(app, f"Incremented baseline version to {new_version}")
                 
         except Exception as e:
             Log.error(app, f"Failed to increment baseline version: {e}")
@@ -264,7 +264,7 @@ class MTDatabase:
                 session.add(site)
             
             session.commit()
-                Log.debug(app, f"Added shared site: {domain}")
+            Log.debug(app, f"Added shared site: {domain}")
                 
         except Exception as e:
             Log.error(app, f"Failed to add shared site: {e}")
