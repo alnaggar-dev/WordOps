@@ -248,9 +248,8 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
 /* That's all, stop editing! Happy publishing. */
 
-/**
- * Note: wp-settings.php is loaded by the configuration loader (router)
- */
+/** Sets up WordPress vars and included files. */
+require_once ABSPATH . 'wp-settings.php';
 """
         
         # Place wp-config.php in htdocs (webroot) like HandPressed does
@@ -735,8 +734,14 @@ class SharedInfrastructure:
                 shutil.rmtree(wp_content_path)
             os.symlink(self.wp_content_dir, wp_content_path)
             
-            # Create router wp-config.php in shared core
-            self.create_router_wp_config(release_path)
+            # Remove any default wp-config files that come with WordPress
+            # We don't need a router - WordPress's wp-load.php will naturally find
+            # the site-specific wp-config.php in the htdocs directory
+            for config_file in ['wp-config.php', 'wp-config-sample.php']:
+                config_path = f"{release_path}/{config_file}"
+                if os.path.exists(config_path):
+                    os.remove(config_path)
+                    Log.debug(self.app, f"Removed {config_file} from shared core")
             
             Log.debug(self.app, f"WordPress downloaded: {release_name}")
             return release_name
@@ -1023,11 +1028,12 @@ add_action('init', function() {
         if not os.path.exists(release_path):
             raise Exception(f"Release {release_name} not found")
         
-        # Ensure router wp-config.php exists in this release
+        # Ensure no wp-config.php exists in shared core
+        # (WordPress should find site-specific configs in htdocs)
         router_config_path = f"{release_path}/wp-config.php"
-        if not os.path.exists(router_config_path):
-            Log.debug(self.app, f"Creating missing router wp-config.php for {release_name}")
-            self.create_router_wp_config(release_path)
+        if os.path.exists(router_config_path):
+            os.remove(router_config_path)
+            Log.debug(self.app, f"Removed wp-config.php from shared core (not needed)")
         
         current_link = f"{self.shared_root}/current"
         
