@@ -518,13 +518,20 @@ require_once ABSPATH . 'wp-settings.php';
             
             # Configure Let's Encrypt SSL
             if WOAcme.setupletsencrypt(app, acme_domains, acmedata):
-                # SSL setup successful - configure HTTPS redirect
+                # Deploy certificate files and create ssl.conf with listen 443 directives
+                WOAcme.deploycert(app, domain)
+                
+                # Configure HTTPS redirect
                 SSL.httpsredirect(app, domain, acme_domains, redirect=True)
                 SSL.siteurlhttps(app, domain)
                 
                 # Enable HSTS if requested
                 if hasattr(pargs, 'hsts') and pargs.hsts:
-                    SSL.enablehsts(app, domain)
+                    SSL.setuphsts(app, domain)
+                
+                # Reload nginx to apply SSL configuration
+                if not WOService.reload_service(app, 'nginx'):
+                    Log.warn(app, "Failed to reload nginx after SSL setup")
                 
                 Log.info(app, f"SSL configured successfully for {domain}")
                 return True
