@@ -248,8 +248,10 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
 /* That's all, stop editing! Happy publishing. */
 
-/** Sets up WordPress vars and included files. */
-require_once ABSPATH . 'wp-settings.php';
+/**
+ * Note: wp-settings.php is loaded by the router in shared WordPress core
+ * Do not load it here to avoid double-loading
+ */
 """
         
         # Place wp-config.php in htdocs (webroot) like HandPressed does
@@ -770,11 +772,14 @@ if ($doc_root && strpos($doc_root, '/var/www/') === 0) {
         $site_config = $doc_root . '/wp-config.php';
         
         if (file_exists($site_config)) {
-            // Load site-specific configuration
-            // The site config will define ABSPATH and load wp-settings.php
+            // Load site-specific configuration (defines ABSPATH, constants, etc.)
             require_once $site_config;
             
-            // Exit here - site config handles everything including wp-settings.php
+            // Now load WordPress (required to be in this file for WP-CLI)
+            if (defined('ABSPATH')) {
+                /** Sets up WordPress vars and included files. */
+                require_once ABSPATH . 'wp-settings.php';
+            }
             return;
         }
     }
@@ -787,6 +792,10 @@ if (defined('WP_CLI') && WP_CLI) {
         $site_config = $cwd . '/wp-config.php';
         if (file_exists($site_config)) {
             require_once $site_config;
+            // Load WordPress
+            if (defined('ABSPATH')) {
+                require_once ABSPATH . 'wp-settings.php';
+            }
             return;
         }
     }
