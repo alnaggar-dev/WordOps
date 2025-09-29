@@ -161,11 +161,25 @@ The plugin uses WordOps' existing nginx templates (wpfc.mustache, wpredis.mustac
   wo update --force
   ```
 
+### Activation (enable plugin)
+
+After updating, ensure the plugin is enabled via WordOps' plugin config directory:
+
+```bash
+sudo mkdir -p /etc/wo/plugins.d
+sudo tee /etc/wo/plugins.d/multitenancy.conf >/dev/null <<'EOF'
+[multitenancy]
+enable_plugin = true
+EOF
+```
+
 ### Verify Installation
 
 ```bash
 wo multitenancy --help
 test -f /etc/wo/plugins.d/multitenancy.conf && echo OK
+# Optional: confirm module path (internal plugin)
+python3 -c "import wo.cli.plugins.multitenancy as m; print(m.__file__)"
 ```
 
 ### Disable / Uninstall
@@ -342,13 +356,20 @@ wo multitenancy remove [--force]
 ### Plugin Files
 
 ```
-/var/lib/wo/plugins/
+# Packaged internal plugin (default in this fork)
+/opt/wo/lib/python3.x/site-packages/wo/cli/plugins/
 ├── multitenancy.py                 # Main controller
 ├── multitenancy_functions.py       # Core functions (uses WordOps native functions)
 └── multitenancy_db.py              # Database operations
 
+# External override location (optional; not required in this fork)
+/var/lib/wo/plugins/
+├── multitenancy.py
+├── multitenancy_functions.py
+└── multitenancy_db.py
+
 /etc/wo/plugins.d/
-└── multitenancy.conf               # Configuration file
+└── multitenancy.conf               # Activation/configuration file
 
 # NO CUSTOM TEMPLATES - Uses WordOps existing nginx templates:
 # - /var/lib/wo/templates/wpfc.mustache (FastCGI cache)
@@ -431,7 +452,10 @@ def init():
     switch_release(release_name)
     
     # 7. Save configuration to database
-    MTDatabase.save_config()
+    MTDatabase.save_config(app, {
+        'current_release': release_name,
+        'baseline_version': 1
+    })
 ```
 
 ### 2. Site Creation Process
@@ -636,15 +660,44 @@ CREATE TABLE multitenancy_sites (
 ### Plugin Not Loading
 
 ```bash
-# Check plugin files
-ls -la /var/lib/wo/plugins/multitenancy*.py
+# Check activation (must exist and be enabled)
+sudo grep -n "enable_plugin" /etc/wo/plugins.d/multitenancy.conf || echo "missing config"
 
-# Check configuration
-grep multitenancy /etc/wo/wo.conf
+# Confirm subcommand is registered
+wo multitenancy --help | cat
 
-# Reload WordOps
-wo stack reload
+# Confirm internal module is present (packaged plugin)
+python3 -c "import wo.cli.plugins.multitenancy as m; print(m.__file__)"
+
+# (Optional) If using external override location
+ls -la /var/lib/wo/plugins/multitenancy*.py || true
 ```
+
+### "unrecognized arguments: multitenancy"
+
+```bash
+# 1) Ensure activation file exists and enabled
+sudo tee /etc/wo/plugins.d/multitenancy.conf >/dev/null <<'EOF'
+[multitenancy]
+enable_plugin = true
+EOF
+
+# 2) Clear Python caches (defensive)
+sudo find /opt/wo/lib/python3.*/*site-packages/wo -name __pycache__ -type d -exec rm -rf {} +
+
+# 3) Retry
+wo multitenancy --help | cat
+```
+
+### Startup errors during initialization
+
+- If you see an `IndentationError` or `AttributeError: 'WOApp' object has no attribute 'app'` during initial load, update to the latest fork version:
+
+```bash
+wo update --force
+```
+
+This fork includes a startup hook logging compatibility fix and indentation corrections (v2.0.1).
 
 ### Site Not Loading (404/502 Errors)
 
@@ -867,8 +920,8 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 
 ---
 
-**Last Updated:** January 2025  
-**Plugin Version:** 2.0.0  
+**Last Updated:** September 2025  
+**Plugin Version:** 2.0.1  
 **Compatible with:** WordOps 3.20.0+  
 **Status:** Production Ready
 
