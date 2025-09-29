@@ -37,7 +37,16 @@ def wo_multitenancy_hook(app):
     import wo.cli.plugins.models
     init_db(app)
     # Initialize multitenancy database tables
-    MTDatabase.initialize_tables(app)
+    # Pass a context that matches Log.* expectations (has `.app`)
+    try:
+        from types import SimpleNamespace
+        ctx = SimpleNamespace(app=app)
+    except Exception:
+        class _Ctx:
+            pass
+        ctx = _Ctx()
+        ctx.app = app
+    MTDatabase.initialize_tables(ctx)
 
 
 class WOMultitenancyController(CementBaseController):
