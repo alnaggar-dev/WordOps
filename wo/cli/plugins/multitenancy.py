@@ -246,7 +246,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Setting permissions...")
             setwebrootpermissions(self, site_htdocs)
             
-            # Add to database
+            # Add to database (WordOps core DB and plugin DB)
             site_data = {
                 'domain': wo_domain,
                 'site_type': 'wp',
@@ -254,9 +254,25 @@ class WOMultitenancyController(CementBaseController):
                 'site_path': site_root,
                 'php_version': php_version,
                 'is_shared': True,
+                'is_ssl': bool(pargs.letsencrypt),
                 'shared_release': MTDatabase.get_current_release(self)
             }
-            addNewSite(self, site_data)
+            addNewSite(
+                self,
+                wo_domain,
+                'wp',
+                cache_type,
+                site_root,
+                enabled=True,
+                ssl=bool(pargs.letsencrypt),
+                fs='ext4',
+                db='mysql',
+                db_name=db_name,
+                db_user=db_user,
+                db_password=db_pass,
+                db_host=db_host,
+                php_version=php_version
+            )
             MTDatabase.add_shared_site(self, wo_domain, site_data)
             
             # Configure SSL if requested
