@@ -261,8 +261,30 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
         os.chmod(wp_config_path, 0o640)
         Log.debug(app, f"Generated wp-config.php for {domain}")
 
-        # Note: WordPress core now has a router wp-config.php that loads site-specific configs
-        # No shim needed in htdocs - the router handles everything automatically
+        # Create a WP-CLI-compatible shim in htdocs
+        # WP-CLI looks for wp-config.php in the current directory before checking the wp/ directory
+        # This shim loads the real config and satisfies WP-CLI's requirements
+        shim_path = f"{site_root}/htdocs/wp-config.php"
+        shim_content = f"""<?php
+/**
+ * WordPress Configuration Shim for {domain}
+ * 
+ * This file satisfies WP-CLI's requirements while loading the real
+ * configuration kept outside the web root for security.
+ */
+
+// Load the real configuration from parent directory
+require_once __DIR__ . '/../wp-config.php';
+
+// Note: The real wp-config.php handles ABSPATH and wp-settings.php loading
+"""
+        try:
+            with open(shim_path, 'w') as f:
+                f.write(shim_content)
+            os.chmod(shim_path, 0o640)
+            Log.debug(app, f"Created WP-CLI shim at {shim_path}")
+        except Exception as e:
+            Log.debug(app, f"Could not create WP-CLI shim: {e}")
     
     @staticmethod
     def generate_salts():
@@ -420,12 +442,12 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
                 f'--admin_user={admin_user}',
                 f'--admin_password={admin_pass}',
                 f'--admin_email={admin_email}',
-                '--path=wp',  # Relative path to wp directory from htdocs
                 '--skip-email',
                 '--allow-root'
             ]
             
             # Run from htdocs directory where wp-config.php shim is located
+            # WP-CLI will find htdocs/wp-config.php (shim) which loads the real config
             result = subprocess.run(cmd, cwd=site_htdocs, capture_output=True, text=True, check=True)
             Log.debug(app, f"WordPress installed for {domain}")
             
@@ -452,7 +474,6 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
             try:
                 cmd = [
                     'wp', 'plugin', 'activate', plugin,
-                    '--path=wp',  # Relative path from htdocs
                     '--allow-root'
                 ]
                 subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
@@ -465,7 +486,6 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
         try:
             cmd = [
                 'wp', 'theme', 'activate', theme,
-                '--path=wp',  # Relative path from htdocs
                 '--allow-root'
             ]
             subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
@@ -546,13 +566,12 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
         
         # Clear WordPress cache
         try:
-            wp_root = f"/var/www/{domain}/htdocs/wp"
+            htdocs = f"/var/www/{domain}/htdocs"
             cmd = [
                 'wp', 'cache', 'flush',
-                f'--path={wp_root}',
                 '--allow-root'
             ]
-            subprocess.run(cmd, capture_output=True, check=False)
+            subprocess.run(cmd, cwd=htdocs, capture_output=True, check=False)
         except:
             pass
     
