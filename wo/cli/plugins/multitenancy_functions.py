@@ -505,8 +505,8 @@ require_once ABSPATH . 'wp-settings.php';
             }
             
             # Get keylength from config if available
-            if app.config.has_section('letsencrypt'):
-                acmedata['keylength'] = app.config.get('letsencrypt', 'keylength')
+            if app.app.config.has_section('letsencrypt'):
+                acmedata['keylength'] = app.app.config.get('letsencrypt', 'keylength')
             
             # Handle DNS validation if requested
             if hasattr(pargs, 'dns') and pargs.dns:
