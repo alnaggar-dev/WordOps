@@ -248,7 +248,9 @@ if ( ! defined( 'ABSPATH' ) ) {{
 }}
 
 /** Sets up WordPress vars and included files. */
-require_once ABSPATH . 'wp-settings.php';
+if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
+    require_once ABSPATH . 'wp-settings.php';
+}}
 """
         
         wp_config_path = f"{site_root}/wp-config.php"
