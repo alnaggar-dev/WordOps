@@ -246,6 +246,16 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Setting permissions...")
             setwebrootpermissions(self, site_htdocs)
             
+            # Enable site in nginx first (without SSL)
+            WOFileUtils.create_symlink(self, [
+                f"/etc/nginx/sites-available/{wo_domain}",
+                f"/etc/nginx/sites-enabled/{wo_domain}"
+            ])
+            
+            # Reload nginx
+            if not WOService.reload_service(self, 'nginx'):
+                Log.error(self, "Failed to reload nginx")
+            
             # Add to database (WordOps core DB and plugin DB)
             site_data = {
                 'domain': wo_domain,
@@ -254,7 +264,7 @@ class WOMultitenancyController(CementBaseController):
                 'site_path': site_root,
                 'php_version': php_version,
                 'is_shared': True,
-                'is_ssl': bool(pargs.letsencrypt),
+                'is_ssl': False,  # Will be updated after SSL setup
                 'shared_release': MTDatabase.get_current_release(self)
             }
             addNewSite(
@@ -264,7 +274,7 @@ class WOMultitenancyController(CementBaseController):
                 cache_type,
                 site_root,
                 enabled=True,
-                ssl=bool(pargs.letsencrypt),
+                ssl=False,  # Will be updated after SSL setup
                 fs='ext4',
                 db='mysql',
                 db_name=db_name,
@@ -278,17 +288,15 @@ class WOMultitenancyController(CementBaseController):
             # Configure SSL if requested
             if pargs.letsencrypt:
                 Log.info(self, "Configuring Let's Encrypt SSL...")
-                MTFunctions.setup_ssl(self, wo_domain, pargs)
-            
-            # Enable site in nginx
-            WOFileUtils.create_symlink(self, [
-                f"/etc/nginx/sites-available/{wo_domain}",
-                f"/etc/nginx/sites-enabled/{wo_domain}"
-            ])
-            
-            # Reload nginx
-            if not WOService.reload_service(self, 'nginx'):
-                Log.error(self, "Failed to reload nginx")
+                ssl_success = MTFunctions.setup_ssl(self, wo_domain, pargs)
+                if ssl_success:
+                    # Update database with SSL status
+                    updateSiteInfo(self, wo_domain, ssl=True)
+                    site_data['is_ssl'] = True
+                    MTDatabase.add_shared_site(self, wo_domain, site_data)
+                    # Reload nginx again after SSL
+                    if not WOService.reload_service(self, 'nginx'):
+                        Log.warn(self, "Failed to reload nginx after SSL setup")
             
             # Clear cache
             MTFunctions.clear_cache(self, wo_domain, cache_type)

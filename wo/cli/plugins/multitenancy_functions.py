@@ -477,14 +477,39 @@ require_once ABSPATH . 'wp-settings.php';
     
     @staticmethod
     def setup_ssl(app, domain, pargs):
-        """Setup SSL for shared site"""
+        """Setup SSL for shared site using WordOps native SSL functions"""
         from wo.core.acme import WOAcme
         from wo.core.sslutils import SSL
+        from wo.cli.plugins.sitedb import updateSiteInfo
         
-        # This is a simplified SSL setup - the actual implementation
-        # would use WordOps' existing SSL functions
-        Log.info(app, f"SSL setup would be performed for {domain}")
-        # TODO: Implement actual SSL setup using WOAcme
+        try:
+            # Prepare data for SSL setup
+            data = {
+                'site_name': domain,
+                'www_domain': f'www.{domain}',
+                'webroot': f'/var/www/{domain}'
+            }
+            
+            # Configure Let's Encrypt SSL
+            if WOAcme.setupletsencrypt(app, [domain, f'www.{domain}']):
+                # SSL setup successful
+                SSL.httpsredirect(app, domain, True, True)
+                SSL.siteurlhttps(app, domain)
+                
+                # Enable HSTS if requested
+                if hasattr(pargs, 'hsts') and pargs.hsts:
+                    SSL.enablehsts(app, domain)
+                
+                Log.info(app, f"SSL configured successfully for {domain}")
+                return True
+            else:
+                Log.warn(app, f"SSL setup failed for {domain}")
+                return False
+                
+        except Exception as e:
+            Log.debug(app, f"SSL setup error: {e}")
+            Log.warn(app, f"Could not configure SSL for {domain}: {str(e)}")
+            return False
     
     @staticmethod
     def clear_cache(app, domain, cache_type):
