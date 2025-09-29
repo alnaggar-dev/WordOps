@@ -261,6 +261,10 @@ require_once ABSPATH . 'wp-settings.php';
         shim_content = """<?php
 // This file allows WordPress to locate the real configuration kept outside the web root
 require_once dirname(__DIR__) . '/wp-config.php';
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/wp/' );
+}
+require_once ABSPATH . 'wp-settings.php';
 """
         try:
             with open(shim_path, 'w') as f:
