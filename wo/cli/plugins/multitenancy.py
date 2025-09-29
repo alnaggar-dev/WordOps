@@ -201,11 +201,18 @@ class WOMultitenancyController(CementBaseController):
             
             # Create database
             Log.info(self, "Setting up database...")
-            db_info = setupdatabase(self, wo_domain)
-            if not db_info:
+            db_data = {
+                'site_name': wo_domain,
+                'webroot': site_root,
+            }
+            db_data = setupdatabase(self, db_data)
+            if not db_data or not all(k in db_data for k in ['wo_db_name', 'wo_db_user', 'wo_db_pass', 'wo_db_host']):
                 Log.error(self, "Failed to create database")
             
-            db_name, db_user, db_pass, db_host = db_info
+            db_name = db_data['wo_db_name']
+            db_user = db_data['wo_db_user']
+            db_pass = db_data['wo_db_pass']
+            db_host = db_data['wo_db_host']
             
             # Create symlinks to shared infrastructure
             Log.info(self, "Linking to shared WordPress core...")
