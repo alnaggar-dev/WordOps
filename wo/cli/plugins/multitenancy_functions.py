@@ -492,15 +492,32 @@ require_once ABSPATH . 'wp-settings.php';
         from wo.cli.plugins.sitedb import updateSiteInfo
         
         try:
-            # Prepare data for SSL setup
-            data = {
-                'site_name': domain,
-                'www_domain': f'www.{domain}',
-                'webroot': f'/var/www/{domain}'
+            # Prepare acme domains list
+            acme_domains = [domain, f'www.{domain}']
+            
+            # Prepare acmedata dict as expected by setupletsencrypt
+            acmedata = {
+                'dns': False,
+                'acme_dns': 'dns_cf',
+                'dnsalias': False,
+                'acme_alias': '',
+                'keylength': 'ec-384'
             }
             
+            # Get keylength from config if available
+            if app.config.has_section('letsencrypt'):
+                acmedata['keylength'] = app.config.get('letsencrypt', 'keylength')
+            
+            # Handle DNS validation if requested
+            if hasattr(pargs, 'dns') and pargs.dns:
+                Log.debug(app, "DNS validation enabled")
+                acmedata['dns'] = True
+                if pargs.dns != 'dns_cf':
+                    Log.debug(app, f"DNS API: {pargs.dns}")
+                    acmedata['acme_dns'] = pargs.dns
+            
             # Configure Let's Encrypt SSL
-            if WOAcme.setupletsencrypt(app, [domain, f'www.{domain}']):
+            if WOAcme.setupletsencrypt(app, acme_domains, acmedata):
                 # SSL setup successful
                 SSL.httpsredirect(app, domain, True, True)
                 SSL.siteurlhttps(app, domain)
