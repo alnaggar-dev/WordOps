@@ -518,8 +518,8 @@ require_once ABSPATH . 'wp-settings.php';
             
             # Configure Let's Encrypt SSL
             if WOAcme.setupletsencrypt(app, acme_domains, acmedata):
-                # SSL setup successful
-                SSL.httpsredirect(app, domain, True, True)
+                # SSL setup successful - configure HTTPS redirect
+                SSL.httpsredirect(app, domain, acme_domains, redirect=True)
                 SSL.siteurlhttps(app, domain)
                 
                 # Enable HSTS if requested
