@@ -420,9 +420,8 @@ require_once ABSPATH . 'wp-settings.php';
         # Determine site URL
         site_url = f"http://{domain}"
         
-        # Install WordPress
+        # Install WordPress (run from htdocs where wp-config.php shim exists)
         try:
-            wp_root = f"{site_htdocs}/wp"
             cmd = [
                 'wp', 'core', 'install',
                 f'--url={site_url}',
@@ -430,12 +429,13 @@ require_once ABSPATH . 'wp-settings.php';
                 f'--admin_user={admin_user}',
                 f'--admin_password={admin_pass}',
                 f'--admin_email={admin_email}',
-                f'--path={wp_root}',
+                '--path=wp',  # Relative path to wp directory from htdocs
                 '--skip-email',
                 '--allow-root'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Run from htdocs directory where wp-config.php shim is located
+            result = subprocess.run(cmd, cwd=site_htdocs, capture_output=True, text=True, check=True)
             Log.debug(app, f"WordPress installed for {domain}")
             
         except subprocess.CalledProcessError as e:
@@ -455,31 +455,29 @@ require_once ABSPATH . 'wp-settings.php';
     def apply_baseline(app, domain, site_htdocs, config):
         """Apply baseline configuration to site"""
         
-        # Activate baseline plugins
+        # Activate baseline plugins (run from htdocs where wp-config.php shim exists)
         plugins = config.get('baseline_plugins', [])
         for plugin in plugins:
             try:
-                wp_root = f"{site_htdocs}/wp"
                 cmd = [
                     'wp', 'plugin', 'activate', plugin,
-                    f'--path={wp_root}',
+                    '--path=wp',  # Relative path from htdocs
                     '--allow-root'
                 ]
-                subprocess.run(cmd, capture_output=True, check=False)
+                subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
                 Log.debug(app, f"Activated plugin {plugin} for {domain}")
             except:
                 Log.debug(app, f"Could not activate plugin {plugin}")
         
-        # Activate baseline theme
+        # Activate baseline theme (run from htdocs where wp-config.php shim exists)
         theme = config.get('baseline_theme', 'twentytwentyfour')
         try:
-            wp_root = f"{site_htdocs}/wp"
             cmd = [
                 'wp', 'theme', 'activate', theme,
-                f'--path={wp_root}',
+                '--path=wp',  # Relative path from htdocs
                 '--allow-root'
             ]
-            subprocess.run(cmd, capture_output=True, check=False)
+            subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
             Log.debug(app, f"Activated theme {theme} for {domain}")
         except:
             Log.debug(app, f"Could not activate theme {theme}")
