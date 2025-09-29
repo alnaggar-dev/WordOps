@@ -329,8 +329,17 @@ require_once ABSPATH . 'wp-settings.php';
             if not wo_php_key:
                 wo_php_key = f"php{php_version.replace('.', '')}"
             data['wo_php'] = wo_php_key
+            
+            # Add PHP version flags
+            for version_key in WOVar.wo_php_versions.keys():
+                data[version_key] = (version_key == wo_php_key)
+                
         except Exception:
-            data['wo_php'] = f"php{php_version.replace('.', '')}"
+            wo_php_key = f"php{php_version.replace('.', '')}"
+            data['wo_php'] = wo_php_key
+            # Set all PHP versions to False except current
+            for version_key in ['php74', 'php80', 'php81', 'php82', 'php83', 'php84']:
+                data[version_key] = (version_key == wo_php_key)
 
         # Render using WordOps helper
         try:
