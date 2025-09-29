@@ -253,6 +253,22 @@ require_once ABSPATH . 'wp-settings.php';
         # Set secure permissions
         os.chmod(wp_config_path, 0o640)
         Log.debug(app, f"Generated wp-config.php for {domain}")
+
+        # Also place a shim in htdocs so WP-CLI and wp-load.php can locate the config
+        # WordPress searches ABSPATH (wp root) and its parent only. Our real config
+        # is two levels up from ABSPATH (htdocs/wp), so we create a parent shim.
+        shim_path = f"{site_root}/htdocs/wp-config.php"
+        shim_content = """<?php
+// This file allows WordPress to locate the real configuration kept outside the web root
+require_once dirname(__DIR__) . '/wp-config.php';
+"""
+        try:
+            with open(shim_path, 'w') as f:
+                f.write(shim_content)
+            os.chmod(shim_path, 0o640)
+            Log.debug(app, f"Created wp-config.php shim at {shim_path}")
+        except Exception as e:
+            Log.debug(app, f"Could not create wp-config.php shim: {e}")
     
     @staticmethod
     def generate_salts():
@@ -394,6 +410,7 @@ require_once ABSPATH . 'wp-settings.php';
         
         # Install WordPress
         try:
+            wp_root = f"{site_htdocs}/wp"
             cmd = [
                 'wp', 'core', 'install',
                 f'--url={site_url}',
@@ -401,7 +418,7 @@ require_once ABSPATH . 'wp-settings.php';
                 f'--admin_user={admin_user}',
                 f'--admin_password={admin_pass}',
                 f'--admin_email={admin_email}',
-                f'--path={site_htdocs}',
+                f'--path={wp_root}',
                 '--skip-email',
                 '--allow-root'
             ]
@@ -430,9 +447,10 @@ require_once ABSPATH . 'wp-settings.php';
         plugins = config.get('baseline_plugins', [])
         for plugin in plugins:
             try:
+                wp_root = f"{site_htdocs}/wp"
                 cmd = [
                     'wp', 'plugin', 'activate', plugin,
-                    f'--path={site_htdocs}',
+                    f'--path={wp_root}',
                     '--allow-root'
                 ]
                 subprocess.run(cmd, capture_output=True, check=False)
@@ -443,9 +461,10 @@ require_once ABSPATH . 'wp-settings.php';
         # Activate baseline theme
         theme = config.get('baseline_theme', 'twentytwentyfour')
         try:
+            wp_root = f"{site_htdocs}/wp"
             cmd = [
                 'wp', 'theme', 'activate', theme,
-                f'--path={site_htdocs}',
+                f'--path={wp_root}',
                 '--allow-root'
             ]
             subprocess.run(cmd, capture_output=True, check=False)
@@ -477,10 +496,10 @@ require_once ABSPATH . 'wp-settings.php';
         
         # Clear WordPress cache
         try:
-            site_htdocs = f"/var/www/{domain}/htdocs"
+            wp_root = f"/var/www/{domain}/htdocs/wp"
             cmd = [
                 'wp', 'cache', 'flush',
-                f'--path={site_htdocs}',
+                f'--path={wp_root}',
                 '--allow-root'
             ]
             subprocess.run(cmd, capture_output=True, check=False)
