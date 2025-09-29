@@ -242,8 +242,7 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 // ** Multisite Settings (if needed) ** //
 // define( 'WP_ALLOW_MULTISITE', true );
 
-// ** Load WordPress ** //
-require_once ABSPATH . 'wp-settings.php';
+// WordPress bootstrap is loaded by the htdocs/wp-config.php shim
 """
         
         wp_config_path = f"{site_root}/wp-config.php"
@@ -794,7 +793,20 @@ class SharedInfrastructure:
  * Ensures all sites maintain baseline configuration
  */
 
-// Only run in admin context
+// Do not run during installation or before tables are created
+if (defined('WP_INSTALLING') && WP_INSTALLING) {
+    return;
+}
+
+// Skip if WordPress not fully installed (no tables yet)
+if (!function_exists('is_blog_installed')) {
+    require_once ABSPATH . 'wp-includes/load.php';
+}
+if (!function_exists('is_blog_installed') || !is_blog_installed()) {
+    return;
+}
+
+// Only run in admin or CLI contexts
 if (!is_admin() && !defined('WP_CLI')) {
     return;
 }
