@@ -242,15 +242,17 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 // ** Multisite Settings (if needed) ** //
 // define( 'WP_ALLOW_MULTISITE', true );
 
-// ** WordPress Bootstrap ** //
+// ** WordPress Core Path ** //
 if ( ! defined( 'ABSPATH' ) ) {{
     define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );
 }}
 
-/** Sets up WordPress vars and included files. */
-if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
-    require_once ABSPATH . 'wp-settings.php';
-}}
+/* That's all, stop editing! Happy publishing. */
+
+/**
+ * Note: wp-settings.php is loaded by the configuration loader
+ * (either the multi-tenancy router or the WP-CLI shim)
+ */
 """
         
         wp_config_path = f"{site_root}/wp-config.php"
@@ -276,7 +278,8 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {{
 // Load the real configuration from parent directory
 require_once __DIR__ . '/../wp-config.php';
 
-// Note: The real wp-config.php handles ABSPATH and wp-settings.php loading
+/** Sets up WordPress vars and included files. */
+require_once ABSPATH . 'wp-settings.php';
 """
         try:
             with open(shim_path, 'w') as f:
@@ -795,6 +798,12 @@ $site_config = '/var/www/' . $domain . '/wp-config.php';
 // Load site-specific configuration if it exists
 if ($domain && file_exists($site_config) && is_readable($site_config)) {
     require_once $site_config;
+    
+    // Load WordPress bootstrap after site configuration
+    // Note: ABSPATH is defined in the site-specific config
+    if (defined('ABSPATH') && file_exists(ABSPATH . 'wp-settings.php')) {
+        require_once ABSPATH . 'wp-settings.php';
+    }
 } else {
     // Fallback error
     if (defined('WP_CLI') && WP_CLI) {
@@ -807,8 +816,6 @@ if ($domain && file_exists($site_config) && is_readable($site_config)) {
         die('Site configuration not found for: ' . htmlspecialchars($error_domain));
     }
 }
-
-// Don't load wp-settings.php here - the site-specific config handles that
 '''
         
         router_path = f"{release_path}/wp-config.php"
