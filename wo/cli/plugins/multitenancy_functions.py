@@ -242,7 +242,13 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 // ** Multisite Settings (if needed) ** //
 // define( 'WP_ALLOW_MULTISITE', true );
 
-// WordPress bootstrap is loaded by the htdocs/wp-config.php shim
+// ** WordPress Bootstrap ** //
+if ( ! defined( 'ABSPATH' ) ) {{
+    define( 'ABSPATH', __DIR__ . '/htdocs/wp/' );
+}}
+
+/** Sets up WordPress vars and included files. */
+require_once ABSPATH . 'wp-settings.php';
 """
         
         wp_config_path = f"{site_root}/wp-config.php"
@@ -258,12 +264,15 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         # is two levels up from ABSPATH (htdocs/wp), so we create a parent shim.
         shim_path = f"{site_root}/htdocs/wp-config.php"
         shim_content = """<?php
-// This file allows WordPress to locate the real configuration kept outside the web root
+/**
+ * WordPress Configuration Shim
+ * 
+ * This file allows WordPress and WP-CLI to locate the real configuration
+ * kept outside the web root for security.
+ */
+
+// Load the real configuration
 require_once dirname(__DIR__) . '/wp-config.php';
-if ( ! defined( 'ABSPATH' ) ) {
-    define( 'ABSPATH', __DIR__ . '/wp/' );
-}
-require_once ABSPATH . 'wp-settings.php';
 """
         try:
             with open(shim_path, 'w') as f:
