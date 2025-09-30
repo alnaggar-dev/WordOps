@@ -596,6 +596,9 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
     location ~* \\.(log|sql|conf)$ {{
         deny all;
     }}
+
+    # Include SSL and custom configurations
+    include {site_root}/conf/nginx/*.conf;
 }}"""
     
     @staticmethod
