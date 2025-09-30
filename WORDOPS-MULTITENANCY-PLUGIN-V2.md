@@ -276,16 +276,32 @@ wo multitenancy create <domain> [options]
 - `--wprocket`: WordPress with WP Rocket
 - `--wpce`: WordPress with Cache Enabler
 - `--wpsc`: WordPress with WP Super Cache
-- `--letsencrypt`, `-le`: Configure Let's Encrypt SSL
+- `--letsencrypt`, `--le`: Configure Let's Encrypt SSL
 - `--hsts`: Enable HSTS
 - `--dns=<provider>`: DNS provider for wildcard SSL
 - `--admin-email=<email>`: Admin email address
 - `--admin-user=<username>`: Admin username (default: admin)
 
-**Example:**
+**Examples:**
 ```bash
+# Basic WordPress site with PHP 8.3 and FastCGI cache
+sudo wo multitenancy create example.com --php83 --wpfc
+
+# WordPress site with SSL (note: use double hyphen --)
 sudo wo multitenancy create example.com --php83 --wpfc --le
+
+# WordPress site with SSL and HSTS
+sudo wo multitenancy create example.com --php83 --wpfc --letsencrypt --hsts
+
+# WordPress site with Redis cache and wildcard SSL
+sudo wo multitenancy create example.com --php83 --wpredis --le --dns=dns_cf
 ```
+
+**⚠️ Common Syntax Errors:**
+- ❌ Wrong: `—le` (em dash)
+- ✅ Correct: `--le` (double hyphen)
+- ❌ Wrong: `–le` (en dash)
+- ✅ Correct: `--le` (double hyphen)
 
 ### wo multitenancy update
 
@@ -673,6 +689,20 @@ python3 -c "import wo.cli.plugins.multitenancy as m; print(m.__file__)"
 ls -la /var/lib/wo/plugins/multitenancy*.py || true
 ```
 
+### "unrecognized arguments: —le" or similar SSL errors
+
+This is usually a character encoding issue where em dash (—) or en dash (–) is used instead of double hyphen (--).
+
+**Fix:**
+```bash
+# Wrong (em dash): —le
+# Wrong (en dash): –le
+# Correct (double hyphen): --le
+
+# Use the correct syntax:
+sudo wo multitenancy create example.com --php83 --wpfc --le
+```
+
 ### "unrecognized arguments: multitenancy"
 
 ```bash
@@ -699,6 +729,34 @@ wo update --force
 
 This fork includes a startup hook logging compatibility fix and indentation corrections (v2.0.1).
 
+### Nginx Configuration Test Failures
+
+If you see errors like "Testing Nginx configuration [KO]" or "Failed to reload nginx":
+
+```bash
+# 1) Test nginx configuration manually
+sudo nginx -t
+
+# 2) Check for syntax errors in site config
+sudo nginx -t -c /etc/nginx/nginx.conf
+
+# 3) Check PHP-FPM service status
+sudo systemctl status php8.3-fpm
+
+# 4) Check PHP-FPM socket exists
+ls -la /var/run/php/php8.3-fpm.sock
+
+# 5) Restart PHP-FPM if needed
+sudo systemctl restart php8.3-fpm
+
+# 6) Check nginx error logs
+sudo tail -f /var/log/nginx/error.log
+
+# 7) Remove problematic site and retry
+sudo wo site delete problematic-site.com
+sudo wo multitenancy create problematic-site.com --php83 --wpfc --le
+```
+
 ### Site Not Loading (404/502 Errors)
 
 ```bash
@@ -706,7 +764,7 @@ This fork includes a startup hook logging compatibility fix and indentation corr
 ls -la /var/www/example.com/htdocs/wp
 ls -la /var/www/shared/current
 
-# Check nginx
+# Check nginx configuration
 nginx -t
 systemctl reload nginx
 

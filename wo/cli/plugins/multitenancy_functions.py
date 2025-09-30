@@ -101,6 +101,42 @@ class MTFunctions:
             return 'wpsc'
         else:
             return 'basic'  # No cache
+
+    @staticmethod
+    def validate_nginx_config(app, config_file=None):
+        """Validate nginx configuration using nginx -t"""
+        try:
+            if config_file:
+                # Test specific configuration file
+                cmd = ['nginx', '-t', '-c', '/etc/nginx/nginx.conf']
+                Log.debug(app, f"Testing nginx configuration: {config_file}")
+            else:
+                # Test general nginx configuration
+                cmd = ['nginx', '-t']
+                Log.debug(app, "Testing general nginx configuration")
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                Log.debug(app, "Nginx configuration test passed")
+                return True
+            else:
+                Log.debug(app, f"Nginx configuration test failed: {result.stderr}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            Log.debug(app, "Nginx configuration test timed out")
+            return False
+        except Exception as e:
+            Log.debug(app, f"Nginx configuration test error: {e}")
+            return False
+
+    @staticmethod
+    def get_php_fpm_socket(php_version):
+        """Get correct PHP-FPM socket path for given PHP version"""
+        # WordOps uses this socket naming convention
+        php_clean = php_version.replace('.', '')
+        return f"php{php_version}-fpm"
     
     @staticmethod
     def create_site_directories(app, domain, site_root, site_htdocs):
@@ -288,6 +324,13 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
         Falls back to a minimal config if template rendering fails.
         """
+        nginx_conf = f"/etc/nginx/sites-available/{domain}"
+
+        # Backup existing configuration if it exists
+        if os.path.exists(nginx_conf):
+            backup_conf = f"{nginx_conf}.backup.{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(nginx_conf, backup_conf)
+            Log.debug(app, f"Backed up existing nginx config to {backup_conf}")
 
         # Build data structure expected by WordOps virtualconf.mustache
         data = {
@@ -320,11 +363,11 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             if not wo_php_key:
                 wo_php_key = f"php{php_version.replace('.', '')}"
             data['wo_php'] = wo_php_key
-            
+
             # Add PHP version flags
             for version_key in WOVar.wo_php_versions.keys():
                 data[version_key] = (version_key == wo_php_key)
-                
+
         except Exception:
             wo_php_key = f"php{php_version.replace('.', '')}"
             data['wo_php'] = wo_php_key
@@ -337,20 +380,42 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             from wo.cli.plugins.site_functions import setupdomain, SiteError
             setupdomain(app, data)
             Log.debug(app, f"Generated nginx config for {domain} using WordOps templates")
-            return f"/etc/nginx/sites-available/{domain}"
+
+            # Validate the generated configuration
+            if MTFunctions.validate_nginx_config(app):
+                Log.debug(app, f"WordOps template nginx config validated successfully for {domain}")
+                return nginx_conf
+            else:
+                Log.warn(app, "Generated nginx config failed validation, using fallback")
+                raise Exception("Nginx config validation failed")
+
         except Exception as e:
             Log.debug(app, f"Nginx generation via templates failed ({e}), using fallback")
             config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
-            nginx_conf = f"/etc/nginx/sites-available/{domain}"
             with open(nginx_conf, 'w') as f:
                 f.write(config_content)
-            return nginx_conf
+
+            # Validate fallback configuration
+            if MTFunctions.validate_nginx_config(app):
+                Log.debug(app, f"Fallback nginx config validated successfully for {domain}")
+                return nginx_conf
+            else:
+                Log.error(app, f"Both template and fallback nginx configs failed validation for {domain}")
+                # Restore backup if it exists
+                backup_files = [f for f in os.listdir('/etc/nginx/sites-available/')
+                               if f.startswith(f"{domain}.backup.")]
+                if backup_files:
+                    latest_backup = sorted(backup_files)[-1]
+                    backup_path = f"/etc/nginx/sites-available/{latest_backup}"
+                    shutil.copy2(backup_path, nginx_conf)
+                    Log.debug(app, f"Restored backup configuration for {domain}")
+                raise Exception("All nginx configuration attempts failed validation")
     
     @staticmethod
     def generate_basic_nginx_config(domain, site_root, php_version):
         """Generate basic nginx configuration"""
-        # Correct socket name format: php8.2-fpm.sock
-        php_sock = f"php{php_version}-fpm"
+        # Use proper PHP-FPM socket function
+        php_sock = MTFunctions.get_php_fpm_socket(php_version)
         
         return f"""server {{
     listen 80;
@@ -477,11 +542,20 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         from wo.core.acme import WOAcme
         from wo.core.sslutils import SSL
         from wo.cli.plugins.sitedb import updateSiteInfo
-        
+
         try:
+            Log.debug(app, f"Starting SSL setup for {domain}")
+
+            # Backup current nginx configuration before SSL modifications
+            nginx_conf = f"/etc/nginx/sites-available/{domain}"
+            if os.path.exists(nginx_conf):
+                backup_conf = f"{nginx_conf}.ssl_backup.{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                shutil.copy2(nginx_conf, backup_conf)
+                Log.debug(app, f"Backed up nginx config before SSL setup: {backup_conf}")
+
             # Prepare acme domains list
             acme_domains = [domain, f'www.{domain}']
-            
+
             # Prepare acmedata dict as expected by setupletsencrypt
             acmedata = {
                 'dns': False,
@@ -490,11 +564,11 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
                 'acme_alias': '',
                 'keylength': 'ec-384'
             }
-            
+
             # Get keylength from config if available
-            if app.app.config.has_section('letsencrypt'):
+            if hasattr(app.app, 'config') and app.app.config.has_section('letsencrypt'):
                 acmedata['keylength'] = app.app.config.get('letsencrypt', 'keylength')
-            
+
             # Handle DNS validation if requested
             if hasattr(pargs, 'dns') and pargs.dns:
                 Log.debug(app, "DNS validation enabled")
@@ -502,46 +576,149 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
                 if pargs.dns != 'dns_cf':
                     Log.debug(app, f"DNS API: {pargs.dns}")
                     acmedata['acme_dns'] = pargs.dns
-            
+
             # Configure Let's Encrypt SSL
             if WOAcme.setupletsencrypt(app, acme_domains, acmedata):
+                Log.debug(app, f"Let's Encrypt certificates obtained for {domain}")
+
                 # Deploy certificate files and create ssl.conf with listen 443 directives
-                WOAcme.deploycert(app, domain)
-                
-                # Configure HTTPS redirect
-                SSL.httpsredirect(app, domain, acme_domains, redirect=True)
-                SSL.siteurlhttps(app, domain)
-                
-                # Enable HSTS if requested
-                if hasattr(pargs, 'hsts') and pargs.hsts:
-                    SSL.setuphsts(app, domain)
-                
-                # Reload nginx to apply SSL configuration
-                if not WOService.reload_service(app, 'nginx'):
-                    Log.warn(app, "Failed to reload nginx after SSL setup")
-                
-                Log.info(app, f"SSL configured successfully for {domain}")
-                return True
+                if WOAcme.deploycert(app, domain):
+                    Log.debug(app, f"SSL certificates deployed for {domain}")
+
+                    # Test nginx configuration before applying SSL changes
+                    if MTFunctions.validate_nginx_config(app):
+                        # Configure HTTPS redirect
+                        SSL.httpsredirect(app, domain, acme_domains, redirect=True)
+                        SSL.siteurlhttps(app, domain)
+
+                        # Enable HSTS if requested
+                        if hasattr(pargs, 'hsts') and pargs.hsts:
+                            SSL.setuphsts(app, domain)
+
+                        # Final validation after all SSL changes
+                        if MTFunctions.validate_nginx_config(app):
+                            # Reload nginx to apply SSL configuration
+                            if WOService.reload_service(app, 'nginx'):
+                                Log.info(app, f"SSL configured successfully for {domain}")
+                                return True
+                            else:
+                                Log.error(app, f"Failed to reload nginx after SSL setup for {domain}")
+                                return False
+                        else:
+                            Log.error(app, f"Nginx configuration invalid after SSL setup for {domain}")
+                            MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
+                            return False
+                    else:
+                        Log.error(app, f"Nginx configuration invalid after certificate deployment for {domain}")
+                        MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
+                        return False
+                else:
+                    Log.error(app, f"Failed to deploy SSL certificates for {domain}")
+                    return False
             else:
-                Log.warn(app, f"SSL setup failed for {domain}")
+                Log.warn(app, f"Failed to obtain SSL certificates for {domain}")
                 return False
-                
+
         except Exception as e:
             Log.debug(app, f"SSL setup error: {e}")
             Log.warn(app, f"Could not configure SSL for {domain}: {str(e)}")
+            # Attempt to restore backup on error
+            MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
+            return False
+
+    @staticmethod
+    def restore_nginx_backup(app, domain, backup_type):
+        """Restore nginx configuration from backup"""
+        try:
+            nginx_conf = f"/etc/nginx/sites-available/{domain}"
+            backup_files = [f for f in os.listdir('/etc/nginx/sites-available/')
+                           if f.startswith(f"{domain}.{backup_type}.")]
+
+            if backup_files:
+                latest_backup = sorted(backup_files)[-1]
+                backup_path = f"/etc/nginx/sites-available/{latest_backup}"
+                shutil.copy2(backup_path, nginx_conf)
+                Log.debug(app, f"Restored nginx config from backup: {backup_path}")
+
+                # Reload nginx with restored configuration
+                WOService.reload_service(app, 'nginx')
+                return True
+            else:
+                Log.debug(app, f"No {backup_type} backup found for {domain}")
+                return False
+        except Exception as e:
+            Log.debug(app, f"Failed to restore nginx backup for {domain}: {e}")
             return False
     
     @staticmethod
+    def cleanup_failed_site(app, domain, site_root):
+        """Cleanup partially created site on failure"""
+        from wo.cli.plugins.sitedb import deleteSiteInfo
+        from wo.core.fileutils import WOFileUtils
+
+        Log.debug(app, f"Starting cleanup for failed site: {domain}")
+
+        # Remove nginx configuration files
+        nginx_conf = f"/etc/nginx/sites-available/{domain}"
+        nginx_enabled = f"/etc/nginx/sites-enabled/{domain}"
+
+        # Remove enabled symlink first
+        if os.path.exists(nginx_enabled):
+            os.remove(nginx_enabled)
+            Log.debug(app, f"Removed nginx enabled symlink: {nginx_enabled}")
+
+        # Remove configuration file and backups
+        nginx_files = [f for f in os.listdir('/etc/nginx/sites-available/') if f.startswith(domain)]
+        for nginx_file in nginx_files:
+            nginx_path = f"/etc/nginx/sites-available/{nginx_file}"
+            if os.path.exists(nginx_path):
+                os.remove(nginx_path)
+                Log.debug(app, f"Removed nginx config: {nginx_path}")
+
+        # Remove site directory if it exists
+        if os.path.exists(site_root):
+            try:
+                shutil.rmtree(site_root)
+                Log.debug(app, f"Removed site directory: {site_root}")
+            except Exception as e:
+                Log.debug(app, f"Could not remove site directory {site_root}: {e}")
+
+        # Remove from WordOps database if exists
+        try:
+            deleteSiteInfo(app, domain)
+            Log.debug(app, f"Removed {domain} from WordOps database")
+        except Exception as e:
+            Log.debug(app, f"Could not remove {domain} from WordOps database: {e}")
+
+        # Remove from multitenancy database if exists
+        try:
+            from wo.cli.plugins.multitenancy_db import MTDatabase
+            MTDatabase.remove_shared_site(app, domain)
+            Log.debug(app, f"Removed {domain} from multitenancy database")
+        except Exception as e:
+            Log.debug(app, f"Could not remove {domain} from multitenancy database: {e}")
+
+        # Reload nginx to remove any references
+        try:
+            if MTFunctions.validate_nginx_config(app):
+                WOService.reload_service(app, 'nginx')
+                Log.debug(app, "Reloaded nginx after cleanup")
+        except Exception as e:
+            Log.debug(app, f"Could not reload nginx after cleanup: {e}")
+
+        Log.debug(app, f"Cleanup completed for {domain}")
+
+    @staticmethod
     def clear_cache(app, domain, cache_type):
         """Clear cache for a site"""
-        
+
         # Clear nginx cache
         if cache_type in ['wpfc', 'wpredis']:
             try:
                 WOShellExec.cmd_exec(app, f"wo clean --fastcgi {domain}")
             except:
                 pass
-        
+
         # Clear WordPress cache
         try:
             htdocs = f"/var/www/{domain}/htdocs"

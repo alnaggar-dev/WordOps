@@ -169,7 +169,17 @@ class WOMultitenancyController(CementBaseController):
         
         # Validate domain
         wo_domain = WODomain.validate(self, pargs.site_name)
-        
+
+        # Enhanced argument validation
+        if hasattr(pargs, 'letsencrypt') and pargs.letsencrypt:
+            # Check if the argument contains em dash instead of double hyphen
+            site_name_arg = getattr(pargs, 'site_name', '')
+            if '—' in ' '.join(sys.argv):  # Check for em dash in command line
+                Log.error(self, "Invalid argument syntax detected!")
+                Log.error(self, "Did you use '—le' (em dash) instead of '--le' (double hyphen)?")
+                Log.error(self, "Correct syntax: wo multitenancy create example.com --php83 --wpfc --le")
+                return
+
         # Check if site exists
         if check_domain_exists(self, wo_domain):
             Log.error(self, f"Site {wo_domain} already exists")
@@ -319,6 +329,14 @@ class WOMultitenancyController(CementBaseController):
             
         except Exception as e:
             Log.error(self, f"Failed to create site: {str(e)}")
+            # Cleanup failed site creation
+            try:
+                Log.info(self, "Attempting cleanup of partially created site...")
+                MTFunctions.cleanup_failed_site(self, wo_domain, site_root)
+                Log.info(self, "Cleanup completed")
+            except Exception as cleanup_error:
+                Log.warn(self, f"Cleanup failed: {cleanup_error}")
+            return False
 
     @expose(help="Update WordPress core and plugins for all shared sites")
     def update(self):
