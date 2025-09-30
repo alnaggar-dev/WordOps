@@ -773,7 +773,9 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
                 Log.debug(app, f"Let's Encrypt certificates obtained for {domain}")
 
                 # Deploy certificate files and create ssl.conf with listen 443 directives
-                if WOAcme.deploycert(app, domain):
+                # Note: deploycert() returns 0 on success, not True
+                deploy_result = WOAcme.deploycert(app, domain)
+                if deploy_result == 0:
                     Log.debug(app, f"SSL certificates deployed for {domain}")
 
                     # Test nginx configuration before applying SSL changes
