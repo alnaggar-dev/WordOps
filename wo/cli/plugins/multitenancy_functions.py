@@ -135,8 +135,9 @@ class MTFunctions:
     @staticmethod
     def get_php_fpm_socket(php_version):
         """Get correct PHP-FPM socket path for given PHP version"""
-        # WordOps uses this socket naming convention
-        return f"php{php_version}-fpm"
+        # WordOps uses socket naming convention without dots: php83-fpm, not php8.3-fpm
+        php_clean = php_version.replace('.', '')
+        return f"php{php_clean}-fpm"
 
     @staticmethod
     def ensure_nginx_directories(app, domain, site_root):
@@ -160,9 +161,10 @@ class MTFunctions:
                 os.makedirs(sites_enabled, mode=0o755, exist_ok=True)
                 Log.debug(app, f"Created sites-enabled directory: {sites_enabled}")
 
-            # Check if PHP-FPM socket exists
+            # Check if PHP-FPM socket exists (using WordOps naming convention)
             php_version = "8.3"  # Default, will be overridden by actual version
-            php_socket = f"/var/run/php/php{php_version}-fpm.sock"
+            php_clean = php_version.replace('.', '')
+            php_socket = f"/var/run/php/php{php_clean}-fpm.sock"
             if not os.path.exists(php_socket):
                 Log.warn(app, f"PHP-FPM socket not found: {php_socket}")
                 Log.warn(app, "You may need to start PHP-FPM service")
