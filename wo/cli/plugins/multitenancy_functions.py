@@ -139,6 +139,38 @@ class MTFunctions:
         return f"php{php_version}-fpm"
 
     @staticmethod
+    def ensure_nginx_directories(app, domain, site_root):
+        """Ensure all directories required by nginx config exist"""
+        try:
+            # Ensure log directory exists
+            logs_dir = f"{site_root}/logs"
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir, mode=0o755, exist_ok=True)
+                Log.debug(app, f"Created logs directory: {logs_dir}")
+
+            # Ensure nginx sites-available directory exists
+            sites_available = "/etc/nginx/sites-available"
+            if not os.path.exists(sites_available):
+                os.makedirs(sites_available, mode=0o755, exist_ok=True)
+                Log.debug(app, f"Created sites-available directory: {sites_available}")
+
+            # Ensure nginx sites-enabled directory exists
+            sites_enabled = "/etc/nginx/sites-enabled"
+            if not os.path.exists(sites_enabled):
+                os.makedirs(sites_enabled, mode=0o755, exist_ok=True)
+                Log.debug(app, f"Created sites-enabled directory: {sites_enabled}")
+
+            # Check if PHP-FPM socket exists
+            php_version = "8.3"  # Default, will be overridden by actual version
+            php_socket = f"/var/run/php/php{php_version}-fpm.sock"
+            if not os.path.exists(php_socket):
+                Log.warn(app, f"PHP-FPM socket not found: {php_socket}")
+                Log.warn(app, "You may need to start PHP-FPM service")
+
+        except Exception as e:
+            Log.warn(app, f"Error ensuring nginx directories for {domain}: {e}")
+
+    @staticmethod
     def test_nginx_config_file(app, config_file):
         """Test a specific nginx configuration file"""
         try:
@@ -418,9 +450,15 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
 
         try:
+            # Ensure all directories exist before writing config
+            MTFunctions.ensure_nginx_directories(app, domain, site_root)
+
             with open(nginx_conf, 'w') as f:
                 f.write(config_content)
             Log.debug(app, f"Written nginx config to {nginx_conf}")
+
+            # Set proper permissions on the nginx config file
+            os.chmod(nginx_conf, 0o644)
 
             # Validate the generated configuration file specifically
             if MTFunctions.test_nginx_config_file(app, nginx_conf):
