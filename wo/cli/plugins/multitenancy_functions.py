@@ -209,6 +209,51 @@ class MTFunctions:
         except Exception as e:
             Log.error(app, f"Error testing nginx config file {config_file}: {e}")
             return False
+
+    @staticmethod
+    def safe_nginx_reload(app, domain):
+        """Safely reload nginx with detailed error reporting"""
+        try:
+            Log.debug(app, f"Attempting nginx reload for {domain}")
+
+            # First test the configuration
+            test_cmd = ['nginx', '-t']
+            test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=30)
+
+            if test_result.returncode != 0:
+                Log.error(app, f"Nginx configuration test failed before reload:")
+                Log.error(app, f"Error: {test_result.stderr}")
+                Log.error(app, f"Output: {test_result.stdout}")
+                return False
+
+            # Try systemctl reload first
+            reload_cmd = ['systemctl', 'reload', 'nginx']
+            reload_result = subprocess.run(reload_cmd, capture_output=True, text=True, timeout=30)
+
+            if reload_result.returncode == 0:
+                Log.debug(app, f"Nginx reloaded successfully via systemctl for {domain}")
+                return True
+
+            # If systemctl reload fails, try nginx -s reload
+            Log.warn(app, f"systemctl reload failed, trying nginx -s reload")
+            Log.debug(app, f"systemctl error: {reload_result.stderr}")
+
+            signal_cmd = ['nginx', '-s', 'reload']
+            signal_result = subprocess.run(signal_cmd, capture_output=True, text=True, timeout=30)
+
+            if signal_result.returncode == 0:
+                Log.debug(app, f"Nginx reloaded successfully via signal for {domain}")
+                return True
+
+            # Both methods failed
+            Log.error(app, f"All nginx reload methods failed for {domain}")
+            Log.error(app, f"systemctl error: {reload_result.stderr}")
+            Log.error(app, f"signal error: {signal_result.stderr}")
+            return False
+
+        except Exception as e:
+            Log.error(app, f"Exception during nginx reload for {domain}: {e}")
+            return False
     
     @staticmethod
     def create_site_directories(app, domain, site_root, site_htdocs):

@@ -275,21 +275,21 @@ class WOMultitenancyController(CementBaseController):
                     os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
                 raise Exception("Nginx configuration invalid after enabling site")
 
-            # Reload nginx
+            # Reload nginx using our enhanced function
             try:
-                if not WOService.reload_service(self, 'nginx'):
-                    Log.error(self, "Failed to reload nginx - checking configuration...")
-                    # Additional validation with detailed error output
-                    MTFunctions.validate_nginx_config(self, log_errors=True)
+                if not MTFunctions.safe_nginx_reload(self, wo_domain):
+                    Log.error(self, "Failed to reload nginx with enhanced diagnostics")
                     raise Exception("Nginx reload failed")
                 else:
                     Log.debug(self, "Nginx reloaded successfully")
             except Exception as reload_error:
                 Log.error(self, f"Nginx reload error: {reload_error}")
-                # Try to disable the site and reload
+                # Try to disable the site and reload to restore working state
                 if os.path.exists(f"/etc/nginx/sites-enabled/{wo_domain}"):
                     os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
                     Log.info(self, "Disabled problematic site configuration")
+                    # Try to reload nginx again after disabling the site
+                    MTFunctions.safe_nginx_reload(self, wo_domain)
                 raise Exception("Failed to reload nginx after site creation")
             
             # Add to database (WordOps core DB and plugin DB)
