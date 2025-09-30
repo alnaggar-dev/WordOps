@@ -644,15 +644,62 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         
         # Activate baseline theme (run from htdocs where wp-config.php shim exists)
         theme = config.get('baseline_theme', 'twentytwentyfour')
+        if not MTFunctions.ensure_and_activate_theme(app, domain, site_htdocs, theme):
+            Log.warn(app, f"Failed to activate theme {theme}, trying fallback themes")
+            # Try fallback themes if primary theme fails
+            fallback_themes = ['twentytwentyfour', 'twentytwentythree', 'twentytwentytwo']
+            for fallback_theme in fallback_themes:
+                if MTFunctions.ensure_and_activate_theme(app, domain, site_htdocs, fallback_theme):
+                    Log.info(app, f"Successfully activated fallback theme {fallback_theme} for {domain}")
+                    break
+            else:
+                Log.warn(app, f"All theme activation attempts failed for {domain}")
+
+    @staticmethod
+    def ensure_and_activate_theme(app, domain, site_htdocs, theme):
+        """Ensure theme exists and activate it"""
         try:
-            cmd = [
+            # First check if theme is available
+            check_cmd = [
+                'wp', 'theme', 'list', '--field=name', '--format=csv',
+                '--allow-root'
+            ]
+            result = subprocess.run(check_cmd, cwd=site_htdocs, capture_output=True, text=True, timeout=30)
+
+            available_themes = result.stdout.strip().split('\n') if result.stdout else []
+
+            if theme not in available_themes:
+                Log.debug(app, f"Theme {theme} not available, attempting to install")
+                # Try to install the theme first
+                install_cmd = [
+                    'wp', 'theme', 'install', theme,
+                    '--allow-root'
+                ]
+                install_result = subprocess.run(install_cmd, cwd=site_htdocs, capture_output=True, text=True, timeout=60)
+
+                if install_result.returncode != 0:
+                    Log.debug(app, f"Failed to install theme {theme}: {install_result.stderr}")
+                    return False
+
+                Log.debug(app, f"Successfully installed theme {theme}")
+
+            # Now try to activate the theme
+            activate_cmd = [
                 'wp', 'theme', 'activate', theme,
                 '--allow-root'
             ]
-            subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
-            Log.debug(app, f"Activated theme {theme} for {domain}")
-        except:
-            Log.debug(app, f"Could not activate theme {theme}")
+            activate_result = subprocess.run(activate_cmd, cwd=site_htdocs, capture_output=True, text=True, timeout=30)
+
+            if activate_result.returncode == 0:
+                Log.debug(app, f"Successfully activated theme {theme} for {domain}")
+                return True
+            else:
+                Log.debug(app, f"Failed to activate theme {theme}: {activate_result.stderr}")
+                return False
+
+        except Exception as e:
+            Log.debug(app, f"Exception while ensuring/activating theme {theme}: {e}")
+            return False
     
     @staticmethod
     def setup_ssl(app, domain, pargs):
@@ -1156,27 +1203,189 @@ die($error_msg);
                 Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
     
     def download_theme(self, theme_slug):
-        """Download a theme from WordPress.org"""
+        """Download a theme from WordPress.org with multiple fallback methods"""
         theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
-        
+
         if not os.path.exists(theme_dir):
-            try:
-                # Download using curl
-                url = f"https://downloads.wordpress.org/theme/{theme_slug}.zip"
-                zip_path = f"/tmp/{theme_slug}.zip"
-                
-                subprocess.run(['curl', '-o', zip_path, url], check=True, capture_output=True)
-                
+            Log.debug(self.app, f"Downloading theme: {theme_slug}")
+
+            # Method 1: Try WP-CLI (most reliable)
+            if self.download_theme_wp_cli(theme_slug):
+                return
+
+            # Method 2: Try direct download
+            if self.download_theme_direct(theme_slug):
+                return
+
+            # Method 3: Try to copy from existing WordPress installation
+            if self.copy_theme_from_existing(theme_slug):
+                return
+
+            Log.warn(self.app, f"Failed to download theme {theme_slug}, creating minimal fallback")
+            self.create_minimal_theme(theme_slug)
+
+    def download_theme_wp_cli(self, theme_slug):
+        """Download theme using WP-CLI"""
+        try:
+            # Create temp WordPress install for theme download
+            temp_wp = f"/tmp/wp_temp_{theme_slug}"
+            os.makedirs(temp_wp, exist_ok=True)
+
+            # Download WordPress core to temp location
+            subprocess.run([
+                'wp', 'core', 'download',
+                f'--path={temp_wp}',
+                '--allow-root'
+            ], check=True, capture_output=True, timeout=60)
+
+            # Download theme to temp location
+            subprocess.run([
+                'wp', 'theme', 'install', theme_slug,
+                f'--path={temp_wp}',
+                '--allow-root'
+            ], check=True, capture_output=True, timeout=60)
+
+            # Move theme to shared location
+            temp_theme = f"{temp_wp}/wp-content/themes/{theme_slug}"
+            if os.path.exists(temp_theme):
+                shutil.move(temp_theme, f"{self.wp_content_dir}/themes/{theme_slug}")
+                Log.debug(self.app, f"Downloaded theme {theme_slug} via WP-CLI")
+
+                # Cleanup temp
+                shutil.rmtree(temp_wp)
+                return True
+
+        except Exception as e:
+            Log.debug(self.app, f"WP-CLI theme download failed for {theme_slug}: {e}")
+            # Cleanup temp on failure
+            if os.path.exists(temp_wp):
+                shutil.rmtree(temp_wp)
+
+        return False
+
+    def download_theme_direct(self, theme_slug):
+        """Download theme directly from WordPress.org"""
+        try:
+            url = f"https://downloads.wordpress.org/theme/{theme_slug}.zip"
+            zip_path = f"/tmp/{theme_slug}.zip"
+
+            # Download with curl
+            result = subprocess.run([
+                'curl', '-L', '-o', zip_path, url, '--max-time', '30'
+            ], capture_output=True, timeout=45)
+
+            if result.returncode == 0 and os.path.exists(zip_path):
                 # Extract theme
-                subprocess.run(['unzip', '-q', zip_path, '-d', f"{self.wp_content_dir}/themes/"], 
-                             check=True, capture_output=True)
-                
+                subprocess.run([
+                    'unzip', '-q', zip_path, '-d', f"{self.wp_content_dir}/themes/"
+                ], check=True, capture_output=True)
+
                 # Cleanup
                 os.remove(zip_path)
-                Log.debug(self.app, f"Downloaded theme: {theme_slug}")
-                
-            except Exception as e:
-                Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
+                Log.debug(self.app, f"Downloaded theme {theme_slug} via direct download")
+                return True
+
+        except Exception as e:
+            Log.debug(self.app, f"Direct theme download failed for {theme_slug}: {e}")
+            # Cleanup
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+        return False
+
+    def copy_theme_from_existing(self, theme_slug):
+        """Copy theme from existing WordPress installation if available"""
+        possible_locations = [
+            f"/var/www/html/wp-content/themes/{theme_slug}",
+            f"/usr/share/wordpress/wp-content/themes/{theme_slug}",
+            f"/var/lib/wordpress/wp-content/themes/{theme_slug}"
+        ]
+
+        for location in possible_locations:
+            if os.path.exists(location):
+                try:
+                    shutil.copytree(location, f"{self.wp_content_dir}/themes/{theme_slug}")
+                    Log.debug(self.app, f"Copied theme {theme_slug} from {location}")
+                    return True
+                except Exception as e:
+                    Log.debug(self.app, f"Failed to copy theme from {location}: {e}")
+
+        return False
+
+    def create_minimal_theme(self, theme_slug):
+        """Create a minimal fallback theme"""
+        theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
+        os.makedirs(theme_dir, exist_ok=True)
+
+        # Create style.css
+        style_css = f"""/*
+Theme Name: {theme_slug.title()}
+Description: Minimal fallback theme for WordOps Multitenancy
+Version: 1.0
+*/
+
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    line-height: 1.6;
+    margin: 0;
+    padding: 20px;
+    background: #f8f9fa;
+}}
+
+.container {{
+    max-width: 800px;
+    margin: 0 auto;
+    background: white;
+    padding: 40px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}}
+
+h1, h2 {{ color: #333; }}
+"""
+
+        # Create index.php
+        index_php = """<?php get_header(); ?>
+<div class="container">
+    <h1><?php bloginfo('name'); ?></h1>
+    <p><?php bloginfo('description'); ?></p>
+
+    <?php if (have_posts()) : while (have_posts()) : the_post(); ?>
+        <article>
+            <h2><a href="<?php the_permalink(); ?>"><?php the_title(); ?></a></h2>
+            <div><?php the_content(); ?></div>
+        </article>
+    <?php endwhile; endif; ?>
+</div>
+<?php get_footer(); ?>"""
+
+        # Create header.php and footer.php
+        header_php = """<!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <?php wp_head(); ?>
+</head>
+<body <?php body_class(); ?>>"""
+
+        footer_php = """    <?php wp_footer(); ?>
+</body>
+</html>"""
+
+        # Write files
+        files = {
+            'style.css': style_css,
+            'index.php': index_php,
+            'header.php': header_php,
+            'footer.php': footer_php
+        }
+
+        for filename, content in files.items():
+            with open(f"{theme_dir}/{filename}", 'w') as f:
+                f.write(content)
+
+        Log.debug(self.app, f"Created minimal fallback theme: {theme_slug}")
     
     def create_baseline_config(self, config):
         """Create baseline configuration file"""
