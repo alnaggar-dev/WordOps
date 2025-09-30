@@ -277,13 +277,13 @@ class MTFunctions:
     @staticmethod
     def create_shared_symlinks(app, site_htdocs, shared_root):
         """Create symlinks to shared WordPress infrastructure"""
-        
+
         # Symlink to WordPress core
         wp_symlink = f"{site_htdocs}/wp"
         if not os.path.exists(wp_symlink):
             os.symlink(f"{shared_root}/current", wp_symlink)
             Log.debug(app, f"Created symlink: {wp_symlink} -> {shared_root}/current")
-        
+
         # Symlink shared directories
         shared_dirs = {
             'plugins': f"{shared_root}/wp-content/plugins",
@@ -291,13 +291,29 @@ class MTFunctions:
             'mu-plugins': f"{shared_root}/wp-content/mu-plugins",
             'languages': f"{shared_root}/wp-content/languages"
         }
-        
+
         for dir_name, target in shared_dirs.items():
             symlink = f"{site_htdocs}/wp-content/{dir_name}"
             if not os.path.exists(symlink):
                 os.symlink(target, symlink)
                 Log.debug(app, f"Created symlink: {symlink} -> {target}")
-        
+
+        # Create symlinks for WordPress core files that must be accessible from document root
+        # This is required for wp-admin access, login, cron, xmlrpc, etc.
+        wp_core_files = {
+            'wp-login.php': f"{site_htdocs}/wp/wp-login.php",
+            'wp-admin': f"{site_htdocs}/wp/wp-admin",
+            'wp-cron.php': f"{site_htdocs}/wp/wp-cron.php",
+            'xmlrpc.php': f"{site_htdocs}/wp/xmlrpc.php",
+            'wp-comments-post.php': f"{site_htdocs}/wp/wp-comments-post.php"
+        }
+
+        for link_name, target in wp_core_files.items():
+            symlink = f"{site_htdocs}/{link_name}"
+            if not os.path.exists(symlink):
+                os.symlink(target, symlink)
+                Log.debug(app, f"Created symlink: {symlink} -> {target}")
+
         # Copy index.php from WordPress core
         index_source = f"{shared_root}/current/index.php"
         index_dest = f"{site_htdocs}/index.php"
