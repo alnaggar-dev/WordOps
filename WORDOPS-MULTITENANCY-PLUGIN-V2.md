@@ -757,6 +757,18 @@ sudo wo site delete problematic-site.com
 sudo wo multitenancy create problematic-site.com --php83 --wpfc --le
 ```
 
+**Common Root Causes:**
+
+1. **PHP-FPM Socket Path Mismatch**
+   - WordOps uses socket naming convention without dots: `php83-fpm.sock` (not `php8.3-fpm.sock`)
+   - Plugin automatically handles this via `get_php_fpm_socket()` function
+   - If you see connection refused errors, verify socket path matches systemd service
+
+2. **Systemd Mount Namespace Issues**
+   - On some servers, `systemctl reload nginx` fails with mount namespacing errors
+   - Plugin uses `safe_nginx_reload()` with automatic fallback to `nginx -s reload`
+   - This is handled transparently in the plugin
+
 ### Site Not Loading (404/502 Errors)
 
 ```bash
@@ -772,6 +784,26 @@ systemctl reload nginx
 systemctl status php8.3-fpm
 ```
 
+### Blank Page / Missing Themes
+
+If WordPress sites show blank pages after creation:
+
+**Root Cause:** WordPress requires at least one theme to be installed and activated.
+
+**Solution:** The plugin implements a multi-tier theme download system:
+1. WP-CLI download (most reliable)
+2. Direct download from WordPress.org
+3. Copy from existing WordPress installation
+4. Fallback: create minimal theme
+
+The plugin automatically:
+- Downloads baseline themes during initialization
+- Activates themes during site creation
+- Auto-installs themes if missing during activation
+- Falls back through multiple methods if download fails
+
+This is handled automatically by `download_theme()` and `ensure_and_activate_theme()` functions.
+
 ### Permission Issues
 
 ```bash
@@ -782,6 +814,48 @@ sudo chown -R www-data:www-data /var/www/shared
 # Fix permissions
 sudo find /var/www/example.com/htdocs/wp-content/uploads -type d -exec chmod 755 {} \;
 sudo find /var/www/example.com/htdocs/wp-content/uploads -type f -exec chmod 644 {} \;
+```
+
+### SSL Certificate Issues
+
+#### SSL Certificates Issued but HTTPS Not Working
+
+**Symptoms:** Certificate issued successfully but site only accessible via HTTP, HTTPS shows ERR_CONNECTION_REFUSED
+
+**Root Cause:** The `ssl.conf` file created by `WOAcme.deploycert()` is not being loaded by nginx.
+
+**Solution:** The plugin automatically adds this include statement to nginx configuration:
+```nginx
+include {site_root}/conf/nginx/*.conf;
+```
+
+This ensures that `ssl.conf` (which contains `listen 443 ssl;` directives) is loaded.
+
+**Verification:**
+```bash
+# Check if ssl.conf exists
+ls -la /var/www/example.com/conf/nginx/ssl.conf
+
+# Check if include statement is present in nginx config
+grep -r "include.*conf/nginx/\*.conf" /etc/nginx/sites-available/example.com
+
+# Check nginx is listening on 443
+sudo netstat -tlnp | grep :443
+```
+
+#### SSL Deployment Showing as Failed Despite Success
+
+**Symptoms:** Log shows "Failed to deploy SSL certificates" but certificates are actually deployed correctly.
+
+**Root Cause:** `WOAcme.deploycert()` returns `0` on success (Unix convention), but Python treats `0` as `False` in boolean context.
+
+**Solution:** The plugin explicitly checks `deploy_result == 0` instead of `if deploy_result:` to properly detect success.
+
+This is handled automatically in `multitenancy_functions.py`:
+```python
+deploy_result = WOAcme.deploycert(app, domain)
+if deploy_result == 0:  # 0 means success in Unix convention
+    Log.debug(app, f"SSL certificates deployed for {domain}")
 ```
 
 ### Update Failures
@@ -914,6 +988,147 @@ Plugins in the shared directory are read-only from the web. Updates must be done
    - MU-plugin ensures consistency
    - Survives database resets
 
+### Critical Implementation Details
+
+These details were discovered through production troubleshooting and are essential for future developers and AI assistants:
+
+#### 1. PHP-FPM Socket Naming Convention
+
+**Issue:** WordOps uses PHP-FPM socket paths without dots in the version number.
+
+**Implementation:**
+```python
+@staticmethod
+def get_php_fpm_socket(php_version):
+    """Get correct PHP-FPM socket path for given PHP version"""
+    # WordOps uses socket naming convention without dots: php83-fpm, not php8.3-fpm
+    php_clean = php_version.replace('.', '')
+    return f"php{php_clean}-fpm"
+```
+
+**Why:** systemd services are named `php8.3-fpm.service` but the socket files are `php83-fpm.sock`. The plugin must use the correct socket path in nginx configurations.
+
+**Location:** `multitenancy_functions.py:135-140`
+
+#### 2. SSL Configuration Loading
+
+**Issue:** `WOAcme.deploycert()` creates `ssl.conf` in `/var/www/{domain}/conf/nginx/ssl.conf` but it won't be loaded unless nginx config includes it.
+
+**Implementation:**
+```python
+# In generate_basic_nginx_config():
+# Include SSL and custom configurations
+include {site_root}/conf/nginx/*.conf;
+```
+
+**Why:** Standard WordOps sites have this include statement in their nginx configs. Without it, the ssl.conf file (containing `listen 443 ssl;` directives) is created but never loaded, causing HTTPS to fail.
+
+**Location:** `multitenancy_functions.py:595-602`
+
+#### 3. Unix Exit Code Handling
+
+**Issue:** `WOAcme.deploycert()` returns `0` on success (Unix convention), but Python treats `0` as `False`.
+
+**Wrong Implementation:**
+```python
+if WOAcme.deploycert(app, domain):  # This fails! 0 is falsy in Python
+    Log.info("SSL deployed")
+```
+
+**Correct Implementation:**
+```python
+deploy_result = WOAcme.deploycert(app, domain)
+if deploy_result == 0:  # Explicitly check for 0
+    Log.info("SSL deployed")
+```
+
+**Why:** This caused SSL deployments to report as failed even when they succeeded.
+
+**Location:** `multitenancy_functions.py:775-779`
+
+#### 4. Robust Nginx Reload
+
+**Issue:** `systemctl reload nginx` can fail with mount namespacing errors on some servers.
+
+**Implementation:**
+```python
+@staticmethod
+def safe_nginx_reload(app, domain):
+    """Safely reload nginx with fallback to direct reload"""
+    try:
+        # Try systemctl first
+        result = subprocess.run(['systemctl', 'reload', 'nginx'],
+                              capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return True
+
+        # Fallback to direct nginx reload
+        result = subprocess.run(['nginx', '-s', 'reload'],
+                              capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+    except Exception as e:
+        Log.error(app, f"Failed to reload nginx: {e}")
+        return False
+```
+
+**Why:** Some server configurations have systemd mount namespace issues that prevent `systemctl reload` from working, but direct `nginx -s reload` works fine.
+
+**Used In:**
+- `multitenancy_functions.py:792` (SSL setup)
+- `multitenancy.py:334` (after SSL deployment)
+
+#### 5. Multi-Tier Theme Download System
+
+**Issue:** WordPress sites show blank pages if no theme is installed.
+
+**Implementation:**
+```python
+def download_theme(self, theme_slug):
+    """Download theme with multiple fallback methods"""
+    # Method 1: WP-CLI (most reliable)
+    if self.download_theme_wp_cli(theme_slug):
+        return
+
+    # Method 2: Direct download from WordPress.org
+    if self.download_theme_direct(theme_slug):
+        return
+
+    # Method 3: Copy from existing installation
+    if self.copy_theme_from_existing(theme_slug):
+        return
+
+    # Method 4: Create minimal fallback theme
+    self.create_minimal_theme(theme_slug)
+```
+
+**Why:** Network issues, API rate limits, or missing dependencies can cause any single method to fail. Multiple fallbacks ensure themes are always available.
+
+**Location:** `multitenancy_functions.py:1158-1341`
+
+#### 6. Theme Activation with Auto-Install
+
+**Issue:** Themes might not be installed even if specified in baseline.
+
+**Implementation:**
+```python
+@staticmethod
+def ensure_and_activate_theme(app, domain, site_htdocs, theme):
+    """Ensure theme exists and activate it"""
+    # Check if theme is available
+    available_themes = get_available_themes()
+
+    if theme not in available_themes:
+        # Auto-install missing theme
+        install_theme(theme)
+
+    # Activate theme
+    activate_theme(theme)
+```
+
+**Why:** Ensures themes are available before activation, prevents blank pages, and provides fallback to default themes if specified theme can't be installed.
+
+**Location:** `multitenancy_functions.py:658-702`
+
 ### Files Created by This Plugin
 
 ```
@@ -929,6 +1144,18 @@ Plugins in the shared directory are read-only from the web. Updates must be done
 - ❌ Custom nginx templates (uses WordOps existing ones)
 - ❌ Custom PHP configurations (uses WordOps defaults)
 - ❌ Modified WordOps core files (pure plugin)
+
+### Testing Checklist
+
+When testing or modifying this plugin, verify:
+
+1. ✅ PHP-FPM socket paths are correct in generated nginx configs
+2. ✅ SSL include statement is present in nginx configs
+3. ✅ `deploycert()` return value is checked with `== 0`
+4. ✅ Nginx reloads use `safe_nginx_reload()` instead of direct systemctl calls
+5. ✅ Themes are downloaded and activated during site creation
+6. ✅ HTTPS works immediately after SSL setup (not just HTTP)
+7. ✅ Sites remain accessible after WordPress core updates
 
 ---
 
@@ -978,9 +1205,9 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 
 ---
 
-**Last Updated:** September 2025  
-**Plugin Version:** 2.0.1  
-**Compatible with:** WordOps 3.20.0+  
+**Last Updated:** September 30, 2025
+**Plugin Version:** 2.0.2
+**Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
 ---
