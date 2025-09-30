@@ -103,40 +103,78 @@ class MTFunctions:
             return 'basic'  # No cache
 
     @staticmethod
-    def validate_nginx_config(app, config_file=None):
+    def validate_nginx_config(app, config_file=None, log_errors=True):
         """Validate nginx configuration using nginx -t"""
         try:
-            if config_file:
-                # Test specific configuration file
-                cmd = ['nginx', '-t', '-c', '/etc/nginx/nginx.conf']
-                Log.debug(app, f"Testing nginx configuration: {config_file}")
-            else:
-                # Test general nginx configuration
-                cmd = ['nginx', '-t']
-                Log.debug(app, "Testing general nginx configuration")
+            cmd = ['nginx', '-t']
+            if log_errors:
+                Log.debug(app, "Testing nginx configuration")
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
             if result.returncode == 0:
-                Log.debug(app, "Nginx configuration test passed")
+                if log_errors:
+                    Log.debug(app, "Nginx configuration test passed")
                 return True
             else:
-                Log.debug(app, f"Nginx configuration test failed: {result.stderr}")
+                if log_errors:
+                    Log.error(app, f"Nginx configuration test failed!")
+                    Log.error(app, f"Error: {result.stderr.strip()}")
+                    Log.error(app, f"Output: {result.stdout.strip()}")
                 return False
 
         except subprocess.TimeoutExpired:
-            Log.debug(app, "Nginx configuration test timed out")
+            if log_errors:
+                Log.error(app, "Nginx configuration test timed out")
             return False
         except Exception as e:
-            Log.debug(app, f"Nginx configuration test error: {e}")
+            if log_errors:
+                Log.error(app, f"Nginx configuration test error: {e}")
             return False
 
     @staticmethod
     def get_php_fpm_socket(php_version):
         """Get correct PHP-FPM socket path for given PHP version"""
         # WordOps uses this socket naming convention
-        php_clean = php_version.replace('.', '')
         return f"php{php_version}-fpm"
+
+    @staticmethod
+    def test_nginx_config_file(app, config_file):
+        """Test a specific nginx configuration file"""
+        try:
+            # First check if the file exists and is readable
+            if not os.path.exists(config_file):
+                Log.error(app, f"Nginx config file does not exist: {config_file}")
+                return False
+
+            # Check file permissions
+            if not os.access(config_file, os.R_OK):
+                Log.error(app, f"Cannot read nginx config file: {config_file}")
+                return False
+
+            # Read and log the config content for debugging
+            with open(config_file, 'r') as f:
+                content = f.read()
+
+            Log.debug(app, f"Testing nginx config file: {config_file}")
+            Log.debug(app, f"Config file size: {len(content)} bytes")
+
+            # Use nginx -t to test the configuration
+            cmd = ['nginx', '-t']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                Log.debug(app, f"Nginx config file test passed: {config_file}")
+                return True
+            else:
+                Log.error(app, f"Nginx config file test failed: {config_file}")
+                Log.error(app, f"Error: {result.stderr}")
+                Log.error(app, f"Output: {result.stdout}")
+                return False
+
+        except Exception as e:
+            Log.error(app, f"Error testing nginx config file {config_file}: {e}")
+            return False
     
     @staticmethod
     def create_site_directories(app, domain, site_root, site_htdocs):
@@ -375,41 +413,36 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             for version_key in ['php74', 'php80', 'php81', 'php82', 'php83', 'php84']:
                 data[version_key] = (version_key == wo_php_key)
 
-        # Render using WordOps helper
+        # Always use fallback config for multitenancy to ensure compatibility
+        Log.debug(app, f"Generating fallback nginx config for {domain} (multitenancy optimized)")
+        config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
+
         try:
-            from wo.cli.plugins.site_functions import setupdomain, SiteError
-            setupdomain(app, data)
-            Log.debug(app, f"Generated nginx config for {domain} using WordOps templates")
-
-            # Validate the generated configuration
-            if MTFunctions.validate_nginx_config(app):
-                Log.debug(app, f"WordOps template nginx config validated successfully for {domain}")
-                return nginx_conf
-            else:
-                Log.warn(app, "Generated nginx config failed validation, using fallback")
-                raise Exception("Nginx config validation failed")
-
-        except Exception as e:
-            Log.debug(app, f"Nginx generation via templates failed ({e}), using fallback")
-            config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
             with open(nginx_conf, 'w') as f:
                 f.write(config_content)
+            Log.debug(app, f"Written nginx config to {nginx_conf}")
 
-            # Validate fallback configuration
-            if MTFunctions.validate_nginx_config(app):
-                Log.debug(app, f"Fallback nginx config validated successfully for {domain}")
+            # Validate the generated configuration file specifically
+            if MTFunctions.test_nginx_config_file(app, nginx_conf):
+                Log.debug(app, f"Nginx config file validated successfully for {domain}")
                 return nginx_conf
             else:
-                Log.error(app, f"Both template and fallback nginx configs failed validation for {domain}")
-                # Restore backup if it exists
-                backup_files = [f for f in os.listdir('/etc/nginx/sites-available/')
-                               if f.startswith(f"{domain}.backup.")]
-                if backup_files:
-                    latest_backup = sorted(backup_files)[-1]
-                    backup_path = f"/etc/nginx/sites-available/{latest_backup}"
-                    shutil.copy2(backup_path, nginx_conf)
-                    Log.debug(app, f"Restored backup configuration for {domain}")
-                raise Exception("All nginx configuration attempts failed validation")
+                Log.warn(app, f"Generated nginx config file failed validation for {domain}")
+                # Log the actual config for debugging
+                Log.debug(app, f"Config content:\n{config_content}")
+                raise Exception("Nginx config file validation failed")
+
+        except Exception as e:
+            Log.error(app, f"Failed to generate or validate nginx config for {domain}: {e}")
+            # Restore backup if it exists
+            backup_files = [f for f in os.listdir('/etc/nginx/sites-available/')
+                           if f.startswith(f"{domain}.backup.")]
+            if backup_files:
+                latest_backup = sorted(backup_files)[-1]
+                backup_path = f"/etc/nginx/sites-available/{latest_backup}"
+                shutil.copy2(backup_path, nginx_conf)
+                Log.debug(app, f"Restored backup configuration for {domain}")
+            raise Exception(f"Nginx configuration generation failed: {e}")
     
     @staticmethod
     def generate_basic_nginx_config(domain, site_root, php_version):

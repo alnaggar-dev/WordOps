@@ -256,15 +256,41 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Setting permissions...")
             setwebrootpermissions(self, site_htdocs)
             
+            # Test nginx configuration before enabling site
+            if not MTFunctions.validate_nginx_config(self, log_errors=True):
+                Log.error(self, "Nginx configuration validation failed before enabling site")
+                raise Exception("Invalid nginx configuration")
+
             # Enable site in nginx first (without SSL)
             WOFileUtils.create_symlink(self, [
                 f"/etc/nginx/sites-available/{wo_domain}",
                 f"/etc/nginx/sites-enabled/{wo_domain}"
             ])
-            
+
+            # Test nginx configuration after enabling site
+            if not MTFunctions.validate_nginx_config(self, log_errors=True):
+                Log.error(self, "Nginx configuration validation failed after enabling site")
+                # Remove the symlink we just created
+                if os.path.exists(f"/etc/nginx/sites-enabled/{wo_domain}"):
+                    os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
+                raise Exception("Nginx configuration invalid after enabling site")
+
             # Reload nginx
-            if not WOService.reload_service(self, 'nginx'):
-                Log.error(self, "Failed to reload nginx")
+            try:
+                if not WOService.reload_service(self, 'nginx'):
+                    Log.error(self, "Failed to reload nginx - checking configuration...")
+                    # Additional validation with detailed error output
+                    MTFunctions.validate_nginx_config(self, log_errors=True)
+                    raise Exception("Nginx reload failed")
+                else:
+                    Log.debug(self, "Nginx reloaded successfully")
+            except Exception as reload_error:
+                Log.error(self, f"Nginx reload error: {reload_error}")
+                # Try to disable the site and reload
+                if os.path.exists(f"/etc/nginx/sites-enabled/{wo_domain}"):
+                    os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
+                    Log.info(self, "Disabled problematic site configuration")
+                raise Exception("Failed to reload nginx after site creation")
             
             # Add to database (WordOps core DB and plugin DB)
             site_data = {
