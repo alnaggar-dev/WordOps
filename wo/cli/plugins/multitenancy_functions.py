@@ -303,6 +303,7 @@ class MTFunctions:
         wp_core_files = {
             'wp-login.php': f"{site_htdocs}/wp/wp-login.php",
             'wp-admin': f"{site_htdocs}/wp/wp-admin",
+            'wp-includes': f"{site_htdocs}/wp/wp-includes",
             'wp-cron.php': f"{site_htdocs}/wp/wp-cron.php",
             'xmlrpc.php': f"{site_htdocs}/wp/xmlrpc.php",
             'wp-comments-post.php': f"{site_htdocs}/wp/wp-comments-post.php"

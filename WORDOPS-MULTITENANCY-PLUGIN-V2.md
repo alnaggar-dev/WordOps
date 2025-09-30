@@ -784,6 +784,45 @@ systemctl reload nginx
 systemctl status php8.3-fpm
 ```
 
+### Missing CSS/JS Files (404 Errors for wp-includes)
+
+**Symptoms:** WordPress site loads but without styling, JavaScript files return 404 errors, console shows errors loading files from `/wp-includes/`.
+
+**Root Cause:** Missing `wp-includes` symlink in the site's htdocs directory. WordPress core assets (CSS, JS, images) are loaded from `/wp-includes/` but the symlink wasn't created during site setup.
+
+**Fix for Existing Sites:**
+```bash
+# Create the missing symlink manually
+sudo ln -s wp/wp-includes /var/www/example.com/htdocs/wp-includes
+
+# Verify the symlink
+ls -la /var/www/example.com/htdocs/wp-includes
+
+# Clear browser cache and reload
+```
+
+**Fix for All Sites:**
+```bash
+# Find and fix all sites missing wp-includes symlink
+for site in /var/www/*/htdocs; do
+    if [ ! -e "$site/wp-includes" ] && [ -e "$site/wp" ]; then
+        domain=$(basename $(dirname "$site"))
+        echo "Fixing $domain"
+        sudo ln -s wp/wp-includes "$site/wp-includes"
+    fi
+done
+```
+
+**Prevention:** This issue has been fixed in the plugin code (v8.0+). New sites created after the fix will automatically have the `wp-includes` symlink. The symlink structure should be:
+```
+/var/www/example.com/htdocs/
+├── wp → /var/www/shared/current
+├── wp-admin → wp/wp-admin
+├── wp-includes → wp/wp-includes  ✅ This was missing
+├── wp-login.php → wp/wp-login.php
+└── wp-cron.php → wp/wp-cron.php
+```
+
 ### Blank Page / Missing Themes
 
 If WordPress sites show blank pages after creation:
@@ -1129,6 +1168,42 @@ def ensure_and_activate_theme(app, domain, site_htdocs, theme):
 
 **Location:** `multitenancy_functions.py:658-702`
 
+#### 7. WordPress Core Assets Symlink (wp-includes)
+
+**Issue:** WordPress loads CSS, JavaScript, and images from `/wp-includes/` directory, but if this symlink is missing, all core assets return 404 errors causing unstyled pages and broken functionality.
+
+**Critical Discovery:** In early versions (before v8.0), the `create_shared_symlinks()` function created symlinks for `wp-admin`, `wp-login.php`, `wp-cron.php`, etc., but **forgot to create the `wp-includes` symlink**. This caused widespread 404 errors for all WordPress core assets.
+
+**Implementation:**
+```python
+# In create_shared_symlinks():
+wp_core_files = {
+    'wp-login.php': f"{site_htdocs}/wp/wp-login.php",
+    'wp-admin': f"{site_htdocs}/wp/wp-admin",
+    'wp-includes': f"{site_htdocs}/wp/wp-includes",  # ✅ CRITICAL - Must include this!
+    'wp-cron.php': f"{site_htdocs}/wp/wp-cron.php",
+    'xmlrpc.php': f"{site_htdocs}/wp/xmlrpc.php",
+    'wp-comments-post.php': f"{site_htdocs}/wp/wp-comments-post.php"
+}
+```
+
+**Why This is Critical:**
+- WordPress core loads CSS from `/wp-includes/css/`
+- WordPress core loads JS from `/wp-includes/js/`
+- Admin dashboard loads resources from `/wp-includes/`
+- Without this symlink, sites appear unstyled and non-functional
+- Error logs show hundreds of 404 errors for `/wp-includes/*` files
+
+**Fix for Existing Sites:**
+```bash
+# Manual fix for sites created before v8.0
+sudo ln -s wp/wp-includes /var/www/DOMAIN/htdocs/wp-includes
+```
+
+**Location:** `multitenancy_functions.py:301-315`
+
+**Version Fixed:** v8.0 (September 30, 2025)
+
 ### Files Created by This Plugin
 
 ```
@@ -1156,6 +1231,9 @@ When testing or modifying this plugin, verify:
 5. ✅ Themes are downloaded and activated during site creation
 6. ✅ HTTPS works immediately after SSL setup (not just HTTP)
 7. ✅ Sites remain accessible after WordPress core updates
+8. ✅ **wp-includes symlink is created** (critical for CSS/JS loading)
+9. ✅ WordPress admin dashboard displays with proper styling
+10. ✅ Browser console shows no 404 errors for wp-includes assets
 
 ---
 
@@ -1205,8 +1283,8 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 
 ---
 
-**Last Updated:** September 30, 2025
-**Plugin Version:** 2.0.2
+**Last Updated:** October 1, 2025
+**Plugin Version:** 8.0
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
