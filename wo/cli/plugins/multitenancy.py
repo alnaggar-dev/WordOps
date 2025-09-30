@@ -330,9 +330,11 @@ class WOMultitenancyController(CementBaseController):
                     updateSiteInfo(self, wo_domain, ssl=True)
                     site_data['is_ssl'] = True
                     MTDatabase.add_shared_site(self, wo_domain, site_data)
-                    # Reload nginx again after SSL
-                    if not WOService.reload_service(self, 'nginx'):
+                    # Reload nginx again after SSL using our robust function
+                    if not MTFunctions.safe_nginx_reload(self, wo_domain):
                         Log.warn(self, "Failed to reload nginx after SSL setup")
+                    else:
+                        Log.debug(self, "Nginx reloaded successfully after SSL deployment")
             
             # Clear cache
             MTFunctions.clear_cache(self, wo_domain, cache_type)

@@ -788,8 +788,8 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
                         # Final validation after all SSL changes
                         if MTFunctions.validate_nginx_config(app):
-                            # Reload nginx to apply SSL configuration
-                            if WOService.reload_service(app, 'nginx'):
+                            # Reload nginx to apply SSL configuration using our robust function
+                            if MTFunctions.safe_nginx_reload(app, domain):
                                 Log.info(app, f"SSL configured successfully for {domain}")
                                 return True
                             else:
