@@ -539,22 +539,29 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
     listen 80;
     listen [::]:80;
     server_name {domain} www.{domain};
-    
+
     root {site_root}/htdocs;
     index index.php index.html;
-    
+
     access_log {site_root}/logs/access.log;
     error_log {site_root}/logs/error.log;
-    
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html;
+        try_files $uri =404;
+    }}
+
     # WordPress shared core specific
     location /wp {{
         try_files $uri $uri/ /wp/index.php?$args;
     }}
-    
+
     location / {{
         try_files $uri $uri/ /index.php?$args;
     }}
-    
+
+    # Handle PHP files
     location ~ \\.php$ {{
         try_files $uri =404;
         fastcgi_split_path_info ^(.+\\.php)(/.+)$;
@@ -562,16 +569,32 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         fastcgi_index index.php;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
     }}
-    
-    location ~ /\\. {{
+
+    # Deny access to hidden files (but allow .well-known)
+    location ~ /\\.(?!well-known) {{
+        deny all;
+        access_log off;
+        log_not_found off;
+    }}
+
+    # Deny access to wp-config.php
+    location ~* wp-config\\.php {{
         deny all;
     }}
-    
+
+    # Static files caching
     location ~* \\.(jpg|jpeg|gif|png|webp|svg|woff|woff2|ttf|css|js|ico|xml)$ {{
         access_log off;
         log_not_found off;
-        expires 360d;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }}
+
+    # Deny access to sensitive files
+    location ~* \\.(log|sql|conf)$ {{
+        deny all;
     }}
 }}"""
     
