@@ -564,12 +564,13 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         fastcgi_cache WORDPRESS;
         add_header X-fastcgi-cache $upstream_cache_status;"""
 
-            purge_location = """
-    # FastCGI cache purge
-    location ~ /purge(/.*) {{
+        purge_location = """
+        # FastCGI cache purge
+        location ~ /purge(/.*)
+        {   
         fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";
         access_log off;
-    }}"""
+    }"""
 
         return f"""server {{
     listen 80;
