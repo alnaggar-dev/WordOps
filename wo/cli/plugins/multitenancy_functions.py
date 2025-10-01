@@ -1138,33 +1138,40 @@ die($error_msg);
     def download_plugin(self, plugin_slug):
         """Download a plugin from WordPress.org"""
         plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
-        
+
         if not os.path.exists(plugin_dir):
             try:
-                # Download plugin
-                cmd = [
-                    'wp', 'plugin', 'install', plugin_slug,
-                    f'--path={self.releases_dir}/temp',
-                    '--allow-root'
-                ]
-                
-                # Create temp WordPress for downloading
-                temp_wp = f"{self.releases_dir}/temp"
-                os.makedirs(temp_wp, exist_ok=True)
-                
-                # Run download
-                subprocess.run(cmd, check=False, capture_output=True)
-                
-                # Move plugin to shared location
-                downloaded = f"{temp_wp}/wp-content/plugins/{plugin_slug}"
-                if os.path.exists(downloaded):
-                    shutil.move(downloaded, plugin_dir)
-                    Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
-                
-                # Cleanup temp
-                if os.path.exists(temp_wp):
-                    shutil.rmtree(temp_wp)
-                    
+                # Create temp directory for plugin download
+                temp_dir = f"/tmp/wo_plugin_{plugin_slug}"
+                os.makedirs(temp_dir, exist_ok=True)
+
+                # Download plugin zip from wordpress.org
+                plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.latest-stable.zip"
+                zip_file = f"{temp_dir}/{plugin_slug}.zip"
+
+                # Download using curl
+                download_cmd = ['curl', '-L', '-o', zip_file, plugin_url]
+                result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
+
+                if result.returncode == 0 and os.path.exists(zip_file):
+                    # Extract the plugin
+                    unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                    subprocess.run(unzip_cmd, capture_output=True, check=False)
+
+                    # Move to shared plugins directory
+                    extracted_plugin = f"{temp_dir}/{plugin_slug}"
+                    if os.path.exists(extracted_plugin):
+                        shutil.move(extracted_plugin, plugin_dir)
+                        Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
+                    else:
+                        Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
+                else:
+                    Log.debug(self.app, f"Plugin download failed for: {plugin_slug}")
+
+                # Cleanup temp directory
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+
             except Exception as e:
                 Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
     
@@ -1173,47 +1180,42 @@ die($error_msg);
         theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
         if not os.path.exists(theme_dir):
-            Log.debug(self.app, f"Downloading theme: {theme_slug}")
-            self.download_theme_wp_cli(theme_slug)
+            try:
+                Log.debug(self.app, f"Downloading theme: {theme_slug}")
 
-    def download_theme_wp_cli(self, theme_slug):
-        """Download theme using WP-CLI"""
-        try:
-            # Create temp WordPress install for theme download
-            temp_wp = f"/tmp/wp_temp_{theme_slug}"
-            os.makedirs(temp_wp, exist_ok=True)
+                # Create temp directory for theme download
+                temp_dir = f"/tmp/wo_theme_{theme_slug}"
+                os.makedirs(temp_dir, exist_ok=True)
 
-            # Download WordPress core to temp location
-            subprocess.run([
-                'wp', 'core', 'download',
-                f'--path={temp_wp}',
-                '--allow-root'
-            ], check=True, capture_output=True, timeout=60)
+                # Download theme zip from wordpress.org
+                theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
+                zip_file = f"{temp_dir}/{theme_slug}.zip"
 
-            # Download theme to temp location
-            subprocess.run([
-                'wp', 'theme', 'install', theme_slug,
-                f'--path={temp_wp}',
-                '--allow-root'
-            ], check=True, capture_output=True, timeout=60)
+                # Download using curl
+                download_cmd = ['curl', '-L', '-o', zip_file, theme_url]
+                result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
 
-            # Move theme to shared location
-            temp_theme = f"{temp_wp}/wp-content/themes/{theme_slug}"
-            if os.path.exists(temp_theme):
-                shutil.move(temp_theme, f"{self.wp_content_dir}/themes/{theme_slug}")
-                Log.debug(self.app, f"Downloaded theme {theme_slug} via WP-CLI")
+                if result.returncode == 0 and os.path.exists(zip_file):
+                    # Extract the theme
+                    unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                    subprocess.run(unzip_cmd, capture_output=True, check=False)
 
-                # Cleanup temp
-                shutil.rmtree(temp_wp)
-                return True
+                    # Move to shared themes directory
+                    extracted_theme = f"{temp_dir}/{theme_slug}"
+                    if os.path.exists(extracted_theme):
+                        shutil.move(extracted_theme, theme_dir)
+                        Log.debug(self.app, f"Downloaded theme: {theme_slug}")
+                    else:
+                        Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
+                else:
+                    Log.debug(self.app, f"Theme download failed for: {theme_slug}")
 
-        except Exception as e:
-            Log.debug(self.app, f"WP-CLI theme download failed for {theme_slug}: {e}")
-            # Cleanup temp on failure
-            if os.path.exists(temp_wp):
-                shutil.rmtree(temp_wp)
+                # Cleanup temp directory
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
 
-        return False
+            except Exception as e:
+                Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
 
     def create_baseline_config(self, config):
         """Create baseline configuration file"""

@@ -845,8 +845,8 @@ If WordPress sites show blank pages after creation:
 
 **Root Cause:** WordPress requires at least one theme to be installed and activated.
 
-**Solution:** The plugin uses WP-CLI to download themes:
-1. WP-CLI download (most reliable method)
+**Solution:** The plugin uses direct download from WordPress.org:
+1. Direct download via curl + unzip (most reliable method)
 
 The plugin automatically:
 - Downloads baseline themes during initialization
@@ -855,7 +855,7 @@ The plugin automatically:
 
 This is handled automatically by `download_theme()` and `ensure_and_activate_theme()` functions.
 
-**Note:** Since v8.3.2, the plugin uses a simplified single-method approach instead of the previous multi-tier fallback system, resulting in cleaner and more maintainable code.
+**Note:** Since v8.4.3, the plugin uses direct curl+unzip downloads instead of WP-CLI, eliminating the need for temporary WordPress installations and improving reliability.
 
 ### Permission Issues
 
@@ -1132,9 +1132,9 @@ def safe_nginx_reload(app, domain):
 - `multitenancy_functions.py:792` (SSL setup)
 - `multitenancy.py:334` (after SSL deployment)
 
-#### 5. Simplified Theme Download System
+#### 5. Direct Download System for Themes and Plugins
 
-**Issue:** WordPress sites show blank pages if no theme is installed.
+**Issue:** WordPress sites show blank pages if no theme is installed. WP-CLI-based downloads required temporary WordPress installations and were less reliable.
 
 **Implementation:**
 ```python
@@ -1143,18 +1143,49 @@ def download_theme(self, theme_slug):
     theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
     if not os.path.exists(theme_dir):
-        Log.debug(self.app, f"Downloading theme: {theme_slug}")
-        self.download_theme_wp_cli(theme_slug)
+        try:
+            # Create temp directory for theme download
+            temp_dir = f"/tmp/wo_theme_{theme_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Download theme zip from wordpress.org
+            theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
+            zip_file = f"{temp_dir}/{theme_slug}.zip"
+
+            # Download using curl
+            download_cmd = ['curl', '-L', '-o', zip_file, theme_url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
+
+            if result.returncode == 0 and os.path.exists(zip_file):
+                # Extract and move to shared location
+                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                subprocess.run(unzip_cmd, capture_output=True, check=False)
+
+                extracted_theme = f"{temp_dir}/{theme_slug}"
+                if os.path.exists(extracted_theme):
+                    shutil.move(extracted_theme, theme_dir)
+
+def download_plugin(self, plugin_slug):
+    """Download plugin from WordPress.org"""
+    # Same approach: curl + unzip from downloads.wordpress.org
 ```
 
-**Why:** Simplified to use only WP-CLI method which is the most reliable. Removed fallback methods that added complexity without significant benefit.
+**Why:** Direct downloads from WordPress.org are more reliable than WP-CLI which requires temporary WordPress installations. This approach:
+- Eliminates WP-CLI dependency for downloads
+- Reduces disk I/O (no temp WordPress installations needed)
+- Simpler error handling
+- Faster download process
+- More predictable behavior
 
-**Location:** `multitenancy_functions.py:1171-1177`
+**Location:**
+- `multitenancy_functions.py:1138-1176` (plugin download)
+- `multitenancy_functions.py:1178-1218` (theme download)
 
 **Change History:**
+- v8.4.3 (October 2025): Switched from WP-CLI to direct curl+unzip downloads
 - v8.3.2 (October 2025): Simplified from 4-tier fallback system to single WP-CLI method
-- Removed methods: `download_theme_direct()`, `copy_theme_from_existing()`, `create_minimal_theme()`
-- Result: -139 lines of code, cleaner implementation
+- Removed methods: `download_theme_wp_cli()`, `download_theme_direct()`, `copy_theme_from_existing()`, `create_minimal_theme()`
+- Result: Simpler, faster, more reliable downloads
 
 #### 6. Theme Activation with Auto-Install
 
@@ -1547,14 +1578,21 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 ---
 
 **Last Updated:** October 2025
-**Plugin Version:** 8.3.2
+**Plugin Version:** 8.4.3
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
-**Recent Changes (v8.3.2):**
+**Recent Changes (v8.4.3):**
+- ✅ **Switched to direct curl+unzip downloads** - Replaced WP-CLI-based plugin/theme downloads with direct downloads from WordPress.org
+- ✅ **Eliminated WP-CLI dependency for downloads** - No longer requires temporary WordPress installations for downloading plugins/themes
+- ✅ **Improved download reliability** - Direct downloads are faster and more predictable
+- ✅ **Simplified download methods** - Cleaner implementation with better error handling
+- ✅ **Reduced disk I/O** - No temporary WordPress core downloads needed
+
+**Previous Changes (v8.3.2):**
 - ✅ **Added auto-cleanup during initialization** - Old releases are now automatically cleaned up during `init()`
 - ✅ **Fixed keep_releases parameter handling** - Properly wrapped with `int()` to prevent type errors
-- ✅ **Simplified theme download system** - Removed 3 fallback methods, kept only WP-CLI approach
+- ✅ **Simplified theme download system** - Removed 3 fallback methods
 - ✅ **Code reduction** - Removed 139 lines of code for better maintainability
 - ✅ Cleaner, more focused implementation
 
