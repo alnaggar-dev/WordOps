@@ -72,7 +72,7 @@ This plugin is designed for scenarios where:
 │              Integration with WordOps Native Functions       │
 │  ┌────────────────────────────────────────────────────┐    │
 │  │ • setupdatabase() - Database creation              │    │
-│  │ • setupdomain() - Nginx configuration              │    │
+│  │ • Nginx config via modular includes (no setupdomain) │ │
 │  │ • WOAcme() - SSL certificate management           │    │
 │  │ • WOService() - Service management                │    │
 │  └────────────────────────────────────────────────────┘    │
@@ -497,8 +497,8 @@ def create_site():
     # 5. Generate wp-config.php
     generate_wp_config()
     
-    # 6. Generate nginx using WordOps templates
-    setupdomain(app, data)  # Uses WordOps native template rendering
+    # 6. Generate nginx using modular includes (no templates)
+    MTFunctions.generate_nginx_config(app, domain, php_version, cache_type, site_root)
     
     # 7. Install WordPress with WP-CLI
     install_wordpress()
@@ -537,29 +537,25 @@ def update():
 ### 4. Nginx Configuration Generation
 
 ```python
+@staticmethod
 def generate_nginx_config(app, domain, php_version, cache_type, site_root):
-    # Use WordOps' site_functions.setupdomain to render templates
-    from wo.cli.plugins.site_functions import setupdomain
+    """Generate nginx configuration using WordOps modular includes.
+    Replaces template rendering via setupdomain()."""
 
-    data = {
-        'site_name': domain,
-        'www_domain': f"www.{domain}",
-        'static': False,
-        'basic': cache_type not in ['wpfc', 'wpredis', 'wpsc', 'wprocket', 'wpce'],
-        'wp': True,
-        'wpfc': cache_type == 'wpfc',
-        'wpredis': cache_type == 'wpredis',
-        'wpsc': cache_type == 'wpsc',
-        'wprocket': cache_type == 'wprocket',
-        'wpce': cache_type == 'wpce',
-        'multisite': False,
-        'wpsubdir': False,
-        'webroot': site_root,
-        'wo_php': f"php{php_version.replace('.', '')}",
-    }
+    nginx_conf = f"/etc/nginx/sites-available/{domain}"
 
-    setupdomain(app, data)
-    return f"/etc/nginx/sites-available/{domain}"
+    # Build configuration content using modular includes
+    config_content = MTFunctions.generate_modular_nginx_config(
+        domain, site_root, php_version, cache_type
+    )
+
+    # Ensure directories exist, write file, set perms, and validate
+    MTFunctions.ensure_nginx_directories(app, domain, site_root)
+    with open(nginx_conf, 'w') as f:
+        f.write(config_content)
+    os.chmod(nginx_conf, 0o644)
+    MTFunctions.test_nginx_config_file(app, nginx_conf)
+    return nginx_conf
 ```
 
 ### 5. Baseline Enforcement
@@ -605,7 +601,8 @@ Utility functions for multi-tenancy operations.
 
 **Key Methods:**
 - `load_config()` - Load plugin configuration
-- `generate_nginx_config()` - **Uses WordOps native function**
+- `generate_nginx_config()` - Generates config via modular includes
+- `generate_modular_nginx_config()` - Builds server block with includes
 - `create_shared_symlinks()` - Create symlink structure
 - `install_wordpress()` - Install WordPress using WP-CLI
 
@@ -1035,8 +1032,8 @@ Plugins in the shared directory are read-only from the web. Updates must be done
 
 2. **Native WordOps Integration** ✅
    - Uses `setupdatabase()` for database creation
-   - Uses `setupdomain()` for nginx configuration
-   - Uses existing SSL/cache functions
+   - Generates nginx config via modular includes (no `setupdomain()`)
+   - Uses existing SSL/cache functions and safe nginx reload
 
 3. **Atomic Deployments** ✅
    - Release-based structure with instant switching
@@ -1250,6 +1247,8 @@ grep -A5 "fastcgi_cache" /etc/nginx/sites-available/example.com
 **Location:** `multitenancy_functions.py:550-610`
 
 **Version Fixed:** v8.1 (October 1, 2025)
+
+Note: This basic templated approach was superseded in v8.3 by the modular includes refactor. See “Modular Nginx Configuration with Includes” below; `generate_basic_nginx_config()` is no longer used.
 
 #### 8. WordPress Core Assets Symlink (wp-includes)
 
