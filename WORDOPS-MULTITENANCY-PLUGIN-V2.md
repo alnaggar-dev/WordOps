@@ -1195,10 +1195,10 @@ def generate_basic_nginx_config(domain, site_root, php_version, cache_type="basi
 
         purge_location = """
     # FastCGI cache purge
-    location ~ /purge(/.*) {{
+    location ~ /purge(/.*) {
         fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";
         access_log off;
-    }}"""
+    }"""
 ```
 
 **Integration in nginx template:**
