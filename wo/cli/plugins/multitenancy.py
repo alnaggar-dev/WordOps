@@ -140,7 +140,13 @@ class WOMultitenancyController(CementBaseController):
             # Set permissions
             Log.info(self, "Setting permissions...")
             infra.set_permissions()
-            
+
+            # Auto-cleanup old releases
+            Log.info(self, "Cleaning up old releases...")
+            release_manager = ReleaseManager(self, shared_root)
+            keep_releases = int(config.get('keep_releases', 3))
+            release_manager.cleanup_old_releases(keep_releases)
+
             # Update database
             MTDatabase.save_config(self, {
                 'shared_root': shared_root,
@@ -426,7 +432,7 @@ class WOMultitenancyController(CementBaseController):
             
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
-            release_manager.cleanup_old_releases(config.get('keep_releases', 3))
+            release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
             
             # Update baseline version to trigger reapplication
             MTDatabase.increment_baseline_version(self)

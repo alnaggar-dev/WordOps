@@ -1169,26 +1169,12 @@ die($error_msg);
                 Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
     
     def download_theme(self, theme_slug):
-        """Download a theme from WordPress.org with multiple fallback methods"""
+        """Download a theme from WordPress.org"""
         theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
         if not os.path.exists(theme_dir):
             Log.debug(self.app, f"Downloading theme: {theme_slug}")
-
-            # Method 1: Try WP-CLI (most reliable)
-            if self.download_theme_wp_cli(theme_slug):
-                return
-
-            # Method 2: Try direct download
-            if self.download_theme_direct(theme_slug):
-                return
-
-            # Method 3: Try to copy from existing WordPress installation
-            if self.copy_theme_from_existing(theme_slug):
-                return
-
-            Log.warn(self.app, f"Failed to download theme {theme_slug}, creating minimal fallback")
-            self.create_minimal_theme(theme_slug)
+            self.download_theme_wp_cli(theme_slug)
 
     def download_theme_wp_cli(self, theme_slug):
         """Download theme using WP-CLI"""
@@ -1229,130 +1215,6 @@ die($error_msg);
 
         return False
 
-    def download_theme_direct(self, theme_slug):
-        """Download theme directly from WordPress.org"""
-        try:
-            url = f"https://downloads.wordpress.org/theme/{theme_slug}.zip"
-            zip_path = f"/tmp/{theme_slug}.zip"
-
-            # Download with curl
-            result = subprocess.run([
-                'curl', '-L', '-o', zip_path, url, '--max-time', '30'
-            ], capture_output=True, timeout=45)
-
-            if result.returncode == 0 and os.path.exists(zip_path):
-                # Extract theme
-                subprocess.run([
-                    'unzip', '-q', zip_path, '-d', f"{self.wp_content_dir}/themes/"
-                ], check=True, capture_output=True)
-
-                # Cleanup
-                os.remove(zip_path)
-                Log.debug(self.app, f"Downloaded theme {theme_slug} via direct download")
-                return True
-
-        except Exception as e:
-            Log.debug(self.app, f"Direct theme download failed for {theme_slug}: {e}")
-            # Cleanup
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-
-        return False
-
-    def copy_theme_from_existing(self, theme_slug):
-        """Copy theme from existing WordPress installation if available"""
-        possible_locations = [
-            f"/var/www/html/wp-content/themes/{theme_slug}",
-            f"/usr/share/wordpress/wp-content/themes/{theme_slug}",
-            f"/var/lib/wordpress/wp-content/themes/{theme_slug}"
-        ]
-
-        for location in possible_locations:
-            if os.path.exists(location):
-                try:
-                    shutil.copytree(location, f"{self.wp_content_dir}/themes/{theme_slug}")
-                    Log.debug(self.app, f"Copied theme {theme_slug} from {location}")
-                    return True
-                except Exception as e:
-                    Log.debug(self.app, f"Failed to copy theme from {location}: {e}")
-
-        return False
-
-    def create_minimal_theme(self, theme_slug):
-        """Create a minimal fallback theme"""
-        theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
-        os.makedirs(theme_dir, exist_ok=True)
-
-        # Create style.css
-        style_css = f"""/*
-Theme Name: {theme_slug.title()}
-Description: Minimal fallback theme for WordOps Multitenancy
-Version: 1.0
-*/
-
-body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    line-height: 1.6;
-    margin: 0;
-    padding: 20px;
-    background: #f8f9fa;
-}}
-
-.container {{
-    max-width: 800px;
-    margin: 0 auto;
-    background: white;
-    padding: 40px;
-    border-radius: 8px;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-}}
-
-h1, h2 {{ color: #333; }}
-"""
-
-        # Create index.php
-        index_php = """<?php get_header(); ?>
-<div class="container">
-    <h1><?php bloginfo('name'); ?></h1>
-    <p><?php bloginfo('description'); ?></p>
-
-    <?php if (have_posts()) : while (have_posts()) : the_post(); ?>
-        <article>
-            <h2><a href="<?php the_permalink(); ?>"><?php the_title(); ?></a></h2>
-            <div><?php the_content(); ?></div>
-        </article>
-    <?php endwhile; endif; ?>
-</div>
-<?php get_footer(); ?>"""
-
-        # Create header.php and footer.php
-        header_php = """<!DOCTYPE html>
-<html <?php language_attributes(); ?>>
-<head>
-    <meta charset="<?php bloginfo('charset'); ?>">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <?php wp_head(); ?>
-</head>
-<body <?php body_class(); ?>>"""
-
-        footer_php = """    <?php wp_footer(); ?>
-</body>
-</html>"""
-
-        # Write files
-        files = {
-            'style.css': style_css,
-            'index.php': index_php,
-            'header.php': header_php,
-            'footer.php': footer_php
-        }
-
-        for filename, content in files.items():
-            with open(f"{theme_dir}/{filename}", 'w') as f:
-                f.write(content)
-
-        Log.debug(self.app, f"Created minimal fallback theme: {theme_slug}")
-    
     def create_baseline_config(self, config):
         """Create baseline configuration file"""
         baseline = {
