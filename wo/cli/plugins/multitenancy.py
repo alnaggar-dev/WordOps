@@ -422,10 +422,8 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Switching to new release...")
             infra.switch_release(new_release)
             
-            # Clear all caches
-            Log.info(self, "Clearing caches for all sites...")
-            for site in shared_sites:
-                MTFunctions.clear_cache(self, site['domain'], site.get('cache_type', 'none'))
+            # Clear all caches globally (fast - ~2 seconds for any number of sites)
+            MTFunctions.clear_all_caches(self)
             
             # Update database
             MTDatabase.update_release(self, new_release)
@@ -480,11 +478,8 @@ class WOMultitenancyController(CementBaseController):
             infra = SharedInfrastructure(self, shared_root)
             infra.switch_release(previous_release)
             
-            # Clear all caches
-            shared_sites = MTDatabase.get_shared_sites(self)
-            Log.info(self, "Clearing caches...")
-            for site in shared_sites:
-                MTFunctions.clear_cache(self, site['domain'], site.get('cache_type', 'none'))
+            # Clear all caches globally (fast - ~2 seconds for any number of sites)
+            MTFunctions.clear_all_caches(self)
             
             # Update database
             MTDatabase.update_release(self, previous_release)
