@@ -1646,7 +1646,7 @@ add_action('init', function() {
             Log.debug(self.app, "Could not set ownership")
         
         # Set directory permissions
-        for root, dirs, files in os.walk(self.shared_root):
+        for root, dirs, files in os.walk(self.shared_root, followlinks=False):
             for d in dirs:
                 os.chmod(os.path.join(root, d), 0o755)
             for f in files:

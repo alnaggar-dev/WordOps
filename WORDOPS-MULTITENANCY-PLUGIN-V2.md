@@ -719,6 +719,21 @@ sudo find /opt/wo/lib/python3.*/*site-packages/wo -name __pycache__ -type d -exe
 wo multitenancy --help | cat
 ```
 
+### Initialization fails with "No such file or directory: '/var/www/shared/releases/wp-XXXXXXXX/wp-includes/wp-includes'"
+
+**Symptoms:** `wo multitenancy init --force` command fails with nested wp-includes path error.
+
+**Root Cause:** The `set_permissions()` function in `SharedInfrastructure` class was following symlinks during directory traversal, causing it to:
+1. Walk into the `/var/www/shared/releases/wp-XXX/wp-content` symlink
+2. Follow it to `/var/www/shared/wp-content`
+3. Encounter nested symlink structures creating recursive/invalid paths
+
+**Fix:** Added `followlinks=False` parameter to `os.walk()` in the `set_permissions()` method.
+
+**Location:** `wo/cli/plugins/multitenancy_functions.py:1649`
+
+**Version Fixed:** v8.2.1 (January 2025)
+
 ### Startup errors during initialization
 
 - If you see an `IndentationError` or `AttributeError: 'WOApp' object has no attribute 'app'` during initial load, update to the latest fork version:
@@ -1272,6 +1287,47 @@ sudo ln -s wp/wp-includes /var/www/DOMAIN/htdocs/wp-includes
 
 **Version Fixed:** v8.0 (September 30, 2025)
 
+#### 9. Symlink Traversal in Permission Setting
+
+**Issue:** `wo multitenancy init --force` fails with error: `[Errno 2] No such file or directory: '/var/www/shared/releases/wp-XXXXXXXX/wp-includes/wp-includes'`
+
+**Root Cause:** The `set_permissions()` method used `os.walk()` without the `followlinks=False` parameter. By default, `os.walk()` follows symlinks, which caused it to:
+1. Walk into `/var/www/shared/releases/wp-XXX/wp-content` (which is a symlink)
+2. Follow the symlink to `/var/www/shared/wp-content`
+3. Find subdirectories like `wp-includes` (from plugins)
+4. Create recursive/nested invalid paths like `wp-includes/wp-includes`
+
+**Implementation:**
+```python
+def set_permissions(self):
+    """Set proper permissions on shared infrastructure"""
+
+    # Set ownership
+    try:
+        subprocess.run([
+            'chown', '-R', 'www-data:www-data', self.shared_root
+        ], check=True, capture_output=True)
+    except:
+        Log.debug(self.app, "Could not set ownership")
+
+    # Set directory permissions (do not follow symlinks)
+    for root, dirs, files in os.walk(self.shared_root, followlinks=False):
+        for d in dirs:
+            os.chmod(os.path.join(root, d), 0o755)
+        for f in files:
+            os.chmod(os.path.join(root, f), 0o644)
+```
+
+**Why This is Critical:**
+- Prevents initialization failures due to recursive symlink traversal
+- Ensures permissions are only set on actual directories, not symlink targets
+- Avoids infinite loops when symlinks create circular references
+- Critical for proper shared infrastructure setup
+
+**Location:** `multitenancy_functions.py:1649`
+
+**Version Fixed:** v8.2.1 (January 2025)
+
 ### Files Created by This Plugin
 
 ```
@@ -1305,6 +1361,8 @@ When testing or modifying this plugin, verify:
 11. ✅ **FastCGI cache directives are included when using --wpfc flag**
 12. ✅ Cache headers (`X-fastcgi-cache`) are present in HTTP responses
 13. ✅ FastCGI cache purge location is configured
+14. ✅ **os.walk() uses followlinks=False** to prevent symlink traversal issues
+15. ✅ Initialization completes without "wp-includes/wp-includes" errors
 
 ---
 
@@ -1354,12 +1412,17 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 
 ---
 
-**Last Updated:** October 1, 2025
-**Plugin Version:** 8.1
+**Last Updated:** January 2025
+**Plugin Version:** 8.2.1
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
-**Recent Changes (v8.1):**
+**Recent Changes (v8.2.1):**
+- ✅ Fixed symlink traversal issue in `set_permissions()` method
+- ✅ Added `followlinks=False` to `os.walk()` to prevent recursive symlink errors
+- ✅ Resolved initialization failures with "wp-includes/wp-includes" path errors
+
+**Previous Changes (v8.1):**
 - ✅ Fixed FastCGI cache configuration support
 - ✅ Added cache directives when `--wpfc` flag is used
 - ✅ Added FastCGI cache purge location
