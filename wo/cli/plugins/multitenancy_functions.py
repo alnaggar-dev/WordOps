@@ -454,9 +454,10 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
     
     @staticmethod
     def generate_nginx_config(app, domain, php_version, cache_type, site_root):
-        """Generate nginx configuration for shared WordPress site using WordOps templates.
+        """Generate nginx configuration using WordOps modular includes.
 
-        Falls back to a minimal config if template rendering fails.
+        This replaces the previous hardcoded approach with WordOps' standard
+        include-based configuration, maintaining only multitenant-specific additions.
         """
         nginx_conf = f"/etc/nginx/sites-available/{domain}"
 
@@ -466,52 +467,11 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             shutil.copy2(nginx_conf, backup_conf)
             Log.debug(app, f"Backed up existing nginx config to {backup_conf}")
 
-        # Build data structure expected by WordOps virtualconf.mustache
-        data = {
-            'site_name': domain,
-            'www_domain': f"www.{domain}",
-            'static': False,
-            'basic': False,
-            'wp': True,
-            'wpfc': cache_type == 'wpfc',
-            'wpredis': cache_type == 'wpredis',
-            'wpsc': cache_type == 'wpsc',
-            'wprocket': cache_type == 'wprocket',
-            'wpce': cache_type == 'wpce',
-            'multisite': False,
-            'wpsubdir': False,
-            'webroot': site_root,
-        }
-
-        # Default to basic (no page cache) when not using a specific cache
-        if cache_type not in ['wpfc', 'wpredis', 'wpsc', 'wprocket', 'wpce']:
-            data['basic'] = True
-
-        # Map PHP version (e.g., 8.2) to WordOps key (e.g., php82)
-        try:
-            wo_php_key = None
-            for key, val in WOVar.wo_php_versions.items():
-                if val == php_version:
-                    wo_php_key = key
-                    break
-            if not wo_php_key:
-                wo_php_key = f"php{php_version.replace('.', '')}"
-            data['wo_php'] = wo_php_key
-
-            # Add PHP version flags
-            for version_key in WOVar.wo_php_versions.keys():
-                data[version_key] = (version_key == wo_php_key)
-
-        except Exception:
-            wo_php_key = f"php{php_version.replace('.', '')}"
-            data['wo_php'] = wo_php_key
-            # Set all PHP versions to False except current
-            for version_key in ['php74', 'php80', 'php81', 'php82', 'php83', 'php84']:
-                data[version_key] = (version_key == wo_php_key)
-
-        # Always use fallback config for multitenancy to ensure compatibility
-        Log.debug(app, f"Generating fallback nginx config for {domain} (multitenancy optimized)")
-        config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version, cache_type)
+        # Generate configuration using modular includes
+        Log.debug(app, f"Generating modular nginx config for {domain}")
+        config_content = MTFunctions.generate_modular_nginx_config(
+            domain, site_root, php_version, cache_type
+        )
 
         try:
             # Ensure all directories exist before writing config
@@ -547,97 +507,72 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             raise Exception(f"Nginx configuration generation failed: {e}")
     
     @staticmethod
-    def generate_basic_nginx_config(domain, site_root, php_version, cache_type="basic"):
-        """Generate basic nginx configuration"""
-        # Use proper PHP-FPM socket function
-        php_sock = MTFunctions.get_php_fpm_socket(php_version)
+    def generate_modular_nginx_config(domain, site_root, php_version, cache_type="basic"):
+        """Generate nginx configuration using WordOps modular includes.
 
-        # Build cache-specific directives
-        cache_directives = ""
-        purge_location = ""
+        This uses WordOps' standard include files instead of hardcoded configuration,
+        adding only multitenant-specific directives for the /wp symlink handling.
 
-        if cache_type == "wpfc":
-            cache_directives = """
-        # FastCGI cache configuration
-        fastcgi_cache_bypass $skip_cache;
-        fastcgi_no_cache $skip_cache;
-        fastcgi_cache WORDPRESS;
-        add_header X-fastcgi-cache $upstream_cache_status;"""
+        Benefits:
+        - Consistency with standard WordOps sites
+        - Automatic updates when WordOps improves nginx configs
+        - All features included (WebP, security, DoS protection, etc.)
+        - Minimal code maintenance
+        """
+        from datetime import datetime
 
-        purge_location = """
-        # FastCGI cache purge
-        location ~ /purge(/.*)
-        {   
-        fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";
-        access_log off;
-    }"""
+        # Determine PHP upstream name (e.g., php83)
+        php_upstream = php_version.replace('.', '')
 
-        return f"""server {{
-    listen 80;
-    listen [::]:80;
+        # Start building the configuration
+        config = f"""# WordOps Multitenant Site Configuration
+# Domain: {domain}
+# PHP Version: {php_version}
+# Cache Type: {cache_type}
+# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+server {{
     server_name {domain} www.{domain};
 
-    root {site_root}/htdocs;
-    index index.php index.html;
-
-    access_log {site_root}/logs/access.log;
+    access_log {site_root}/logs/access.log rt_cache;
     error_log {site_root}/logs/error.log;
 
-    # ACME challenge for Let's Encrypt
-    location /.well-known/acme-challenge/ {{
-        root /var/www/html;
-        try_files $uri =404;
-    }}
+    root {site_root}/htdocs;
+    index index.php index.html index.htm;
 
-    # WordPress shared core specific
+    # Multitenant-specific: Handle /wp symlink directory
+    # This location block is the ONLY difference from standard WordOps sites
     location /wp {{
         try_files $uri $uri/ /wp/index.php?$args;
     }}
 
-    location / {{
-        try_files $uri $uri/ /index.php?$args;
-    }}
+"""
 
-    # Handle PHP files
-    location ~ \\.php$ {{
-        try_files $uri =404;
-        fastcgi_split_path_info ^(.+\\.php)(/.+)$;
-        fastcgi_pass unix:/var/run/php/{php_sock}.sock;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info;{cache_directives}
-    }}
-{purge_location}
+        # Include appropriate cache configuration based on cache_type
+        if cache_type == "wpfc":
+            config += f"    include common/wpfc-php{php_upstream}.conf;\n"
+        elif cache_type == "wpredis":
+            config += f"    include common/redis-php{php_upstream}.conf;\n"
+        elif cache_type == "wpsc":
+            config += f"    include common/wpsc-php{php_upstream}.conf;\n"
+        elif cache_type == "wprocket":
+            config += f"    include common/wprocket-php{php_upstream}.conf;\n"
+        elif cache_type == "wpce":
+            config += f"    include common/wpce-php{php_upstream}.conf;\n"
+        else:
+            # Basic WordPress without page caching
+            config += f"    include common/php{php_upstream}.conf;\n"
 
-    # Deny access to hidden files (but allow .well-known)
-    location ~ /\\.(?!well-known) {{
-        deny all;
-        access_log off;
-        log_not_found off;
-    }}
-
-    # Deny access to wp-config.php
-    location ~* wp-config\\.php {{
-        deny all;
-    }}
-
-    # Static files caching
-    location ~* \\.(jpg|jpeg|gif|png|webp|svg|woff|woff2|ttf|css|js|ico|xml)$ {{
-        access_log off;
-        log_not_found off;
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }}
-
-    # Deny access to sensitive files
-    location ~* \\.(log|sql|conf)$ {{
-        deny all;
-    }}
+        # Include common WordPress and security configurations
+        config += f"""    include common/wpcommon-php{php_upstream}.conf;
+    include common/locations-wo.conf;
 
     # Include SSL and custom configurations
     include {site_root}/conf/nginx/*.conf;
-}}"""
+}}
+"""
+
+        return config
     
     @staticmethod
     def install_wordpress(app, domain, site_htdocs, admin_user, admin_email):

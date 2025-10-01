@@ -134,12 +134,15 @@ graph TD
 
 ### Why No Custom Nginx Templates Are Needed
 
-The plugin uses WordOps' existing nginx templates (wpfc.mustache, wpredis.mustache, etc.) because:
+The plugin uses WordOps' modular nginx includes instead of custom templates:
 
-1. **Symlinks are transparent to nginx** - Nginx follows symlinks normally
-2. **Document root structure remains standard** - `/var/www/domain/htdocs` is preserved
-3. **All paths resolve correctly** - The `/wp` symlink makes WordPress appear in the expected location
-4. **Cache configurations work unchanged** - FastCGI, Redis, etc. all work as designed
+1. **Modular includes architecture** - Uses WordOps' standard `common/` includes (wpfc-php83.conf, wpcommon-php83.conf, etc.)
+2. **Symlinks are transparent to nginx** - Nginx follows symlinks normally
+3. **Document root structure remains standard** - `/var/www/domain/htdocs` is preserved
+4. **All paths resolve correctly** - The `/wp` symlink makes WordPress appear in the expected location
+5. **Cache configurations work unchanged** - FastCGI, Redis, etc. all work as designed
+6. **Automatic feature updates** - When WordOps improves nginx configs, multitenant sites benefit automatically
+7. **Minimal configuration delta** - Only adds a single location block for `/wp` symlink handling
 
 ---
 
@@ -1025,9 +1028,11 @@ Plugins in the shared directory are read-only from the web. Updates must be done
 
 ### Key Design Decisions
 
-1. **No Custom Nginx Templates** ✅
-   - Uses WordOps' existing templates (wpfc.mustache, wpredis.mustache, etc.)
-   - The symlink structure works transparently with standard configurations
+1. **Modular Nginx Configuration** ✅
+   - Uses WordOps' modular include system (common/wpfc-php83.conf, common/wpcommon-php83.conf, etc.)
+   - Generates minimal configuration with includes instead of hardcoded blocks
+   - Only adds multitenant-specific `/wp` location block
+   - Benefits from WordOps nginx improvements automatically
 
 2. **Native WordOps Integration** ✅
    - Uses `setupdatabase()` for database creation
@@ -1328,6 +1333,102 @@ def set_permissions(self):
 
 **Version Fixed:** v8.2.1 (January 2025)
 
+#### 10. Modular Nginx Configuration with Includes
+
+**Issue:** Previous implementation used hardcoded nginx configuration blocks, duplicating logic that WordOps already provides in its modular include system.
+
+**Benefits of Modular Approach:**
+1. **Automatic feature updates** - When WordOps improves nginx configs (adds WebP support, security headers, DoS protection, etc.), multitenant sites benefit automatically
+2. **Consistency** - Multitenant sites use identical configuration to standard WordOps sites
+3. **Maintainability** - Minimal code to maintain (only the `/wp` location block is unique)
+4. **Reliability** - Uses battle-tested WordOps configurations instead of custom implementations
+
+**Implementation:**
+```python
+@staticmethod
+def generate_modular_nginx_config(domain, site_root, php_version, cache_type="basic"):
+    """Generate nginx configuration using WordOps modular includes."""
+    php_upstream = php_version.replace('.', '')
+
+    config = f"""server {{
+    server_name {domain} www.{domain};
+    access_log {site_root}/logs/access.log rt_cache;
+    error_log {site_root}/logs/error.log;
+    root {site_root}/htdocs;
+    index index.php index.html index.htm;
+
+    # Multitenant-specific: Handle /wp symlink directory
+    location /wp {{
+        try_files $uri $uri/ /wp/index.php?$args;
+    }}
+
+"""
+
+    # Include cache-specific configuration
+    if cache_type == "wpfc":
+        config += f"    include common/wpfc-php{php_upstream}.conf;\n"
+    elif cache_type == "wpredis":
+        config += f"    include common/redis-php{php_upstream}.conf;\n"
+    # ... other cache types ...
+    else:
+        config += f"    include common/php{php_upstream}.conf;\n"
+
+    # Include common WordPress configurations
+    config += f"""    include common/wpcommon-php{php_upstream}.conf;
+    include common/locations-wo.conf;
+    include {site_root}/conf/nginx/*.conf;
+}}
+"""
+    return config
+```
+
+**What Gets Included:**
+- `common/wpfc-php83.conf` - FastCGI cache configuration for PHP 8.3
+- `common/wpcommon-php83.conf` - Common WordPress directives (PHP handling, security, etc.)
+- `common/locations-wo.conf` - Standard locations (deny rules, static file caching, etc.)
+- `{site_root}/conf/nginx/*.conf` - SSL and custom configurations
+
+**Why This is Critical:**
+- Eliminates configuration drift between standard and multitenant sites
+- Reduces maintenance burden (no need to update hardcoded blocks)
+- Ensures all WordOps features work identically on multitenant sites
+- Makes the plugin more future-proof
+
+**Configuration Comparison:**
+
+*Old approach (hardcoded):*
+```nginx
+server {
+    listen 80;
+    # ... hundreds of lines of hardcoded directives ...
+    location ~ \.php$ {
+        # ... hardcoded PHP handling ...
+        fastcgi_cache WORDPRESS;  # Only for wpfc
+    }
+    # ... more hardcoded security rules ...
+}
+```
+
+*New approach (modular):*
+```nginx
+server {
+    server_name example.com;
+    root /var/www/example.com/htdocs;
+
+    location /wp {
+        try_files $uri $uri/ /wp/index.php?$args;
+    }
+
+    include common/wpfc-php83.conf;      # ← All cache logic
+    include common/wpcommon-php83.conf;  # ← All WordPress logic
+    include common/locations-wo.conf;    # ← All security rules
+}
+```
+
+**Location:** `multitenancy_functions.py:509-575`
+
+**Version Implemented:** v8.3 (October 2025)
+
 ### Files Created by This Plugin
 
 ```
@@ -1341,6 +1442,7 @@ def set_permissions(self):
 ### What This Plugin Does NOT Create
 
 - ❌ Custom nginx templates (uses WordOps existing ones)
+- ❌ Hardcoded nginx configuration blocks (uses modular includes instead)
 - ❌ Custom PHP configurations (uses WordOps defaults)
 - ❌ Modified WordOps core files (pure plugin)
 
@@ -1358,11 +1460,12 @@ When testing or modifying this plugin, verify:
 8. ✅ **wp-includes symlink is created** (critical for CSS/JS loading)
 9. ✅ WordPress admin dashboard displays with proper styling
 10. ✅ Browser console shows no 404 errors for wp-includes assets
-11. ✅ **FastCGI cache directives are included when using --wpfc flag**
-12. ✅ Cache headers (`X-fastcgi-cache`) are present in HTTP responses
-13. ✅ FastCGI cache purge location is configured
-14. ✅ **os.walk() uses followlinks=False** to prevent symlink traversal issues
-15. ✅ Initialization completes without "wp-includes/wp-includes" errors
+11. ✅ **Nginx config uses modular includes** (not hardcoded blocks)
+12. ✅ Cache headers (`X-fastcgi-cache`) are present in HTTP responses for wpfc sites
+13. ✅ Verify `common/wpfc-php83.conf` include is present when using --wpfc
+14. ✅ Verify `common/wpcommon-php83.conf` and `common/locations-wo.conf` includes are present
+15. ✅ **os.walk() uses followlinks=False** to prevent symlink traversal issues
+16. ✅ Initialization completes without "wp-includes/wp-includes" errors
 
 ---
 
@@ -1412,12 +1515,20 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 
 ---
 
-**Last Updated:** January 2025
-**Plugin Version:** 8.2.1
+**Last Updated:** October 2025
+**Plugin Version:** 8.3
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
-**Recent Changes (v8.2.1):**
+**Recent Changes (v8.3):**
+- ✅ **Refactored nginx configuration to use modular includes**
+- ✅ Replaced hardcoded nginx blocks with WordOps' standard include system
+- ✅ Now uses `common/wpfc-php83.conf`, `common/wpcommon-php83.conf`, etc.
+- ✅ Automatic feature updates when WordOps improves nginx configs
+- ✅ Minimal configuration delta - only adds `/wp` location block
+- ✅ Improved consistency with standard WordOps sites
+
+**Previous Changes (v8.2.1):**
 - ✅ Fixed symlink traversal issue in `set_permissions()` method
 - ✅ Added `followlinks=False` to `os.walk()` to prevent recursive symlink errors
 - ✅ Resolved initialization failures with "wp-includes/wp-includes" path errors
