@@ -710,13 +710,6 @@ server {{
         try:
             Log.debug(app, f"Starting SSL setup for {domain}")
 
-            # Backup current nginx configuration before SSL modifications
-            nginx_conf = f"/etc/nginx/sites-available/{domain}"
-            if os.path.exists(nginx_conf):
-                backup_conf = f"{nginx_conf}.ssl_backup.{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                shutil.copy2(nginx_conf, backup_conf)
-                Log.debug(app, f"Backed up nginx config before SSL setup: {backup_conf}")
-
             # Prepare acme domains list
             acme_domains = [domain, f'www.{domain}']
 
@@ -772,11 +765,9 @@ server {{
                                 return False
                         else:
                             Log.error(app, f"Nginx configuration invalid after SSL setup for {domain}")
-                            MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
                             return False
                     else:
                         Log.error(app, f"Nginx configuration invalid after certificate deployment for {domain}")
-                        MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
                         return False
                 else:
                     Log.error(app, f"Failed to deploy SSL certificates for {domain}")
@@ -788,34 +779,8 @@ server {{
         except Exception as e:
             Log.debug(app, f"SSL setup error: {e}")
             Log.warn(app, f"Could not configure SSL for {domain}: {str(e)}")
-            # Attempt to restore backup on error
-            MTFunctions.restore_nginx_backup(app, domain, 'ssl_backup')
             return False
 
-    @staticmethod
-    def restore_nginx_backup(app, domain, backup_type):
-        """Restore nginx configuration from backup"""
-        try:
-            nginx_conf = f"/etc/nginx/sites-available/{domain}"
-            backup_files = [f for f in os.listdir('/etc/nginx/sites-available/')
-                           if f.startswith(f"{domain}.{backup_type}.")]
-
-            if backup_files:
-                latest_backup = sorted(backup_files)[-1]
-                backup_path = f"/etc/nginx/sites-available/{latest_backup}"
-                shutil.copy2(backup_path, nginx_conf)
-                Log.debug(app, f"Restored nginx config from backup: {backup_path}")
-
-                # Reload nginx with restored configuration
-                WOService.reload_service(app, 'nginx')
-                return True
-            else:
-                Log.debug(app, f"No {backup_type} backup found for {domain}")
-                return False
-        except Exception as e:
-            Log.debug(app, f"Failed to restore nginx backup for {domain}: {e}")
-            return False
-    
     @staticmethod
     def cleanup_failed_site(app, domain, site_root):
         """Cleanup partially created site on failure"""
