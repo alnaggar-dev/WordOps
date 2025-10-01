@@ -263,6 +263,7 @@ wo multitenancy init [--force]
 3. Seeds baseline plugins and themes
 4. Creates MU-plugin for baseline enforcement
 5. Sets up configuration files
+6. Auto-cleanup old releases (keeps 3 by default)
 
 ### wo multitenancy create
 
@@ -847,19 +848,17 @@ If WordPress sites show blank pages after creation:
 
 **Root Cause:** WordPress requires at least one theme to be installed and activated.
 
-**Solution:** The plugin implements a multi-tier theme download system:
-1. WP-CLI download (most reliable)
-2. Direct download from WordPress.org
-3. Copy from existing WordPress installation
-4. Fallback: create minimal theme
+**Solution:** The plugin uses WP-CLI to download themes:
+1. WP-CLI download (most reliable method)
 
 The plugin automatically:
 - Downloads baseline themes during initialization
 - Activates themes during site creation
 - Auto-installs themes if missing during activation
-- Falls back through multiple methods if download fails
 
 This is handled automatically by `download_theme()` and `ensure_and_activate_theme()` functions.
+
+**Note:** Since v8.3.2, the plugin uses a simplified single-method approach instead of the previous multi-tier fallback system, resulting in cleaner and more maintainable code.
 
 ### Permission Issues
 
@@ -1136,33 +1135,29 @@ def safe_nginx_reload(app, domain):
 - `multitenancy_functions.py:792` (SSL setup)
 - `multitenancy.py:334` (after SSL deployment)
 
-#### 5. Multi-Tier Theme Download System
+#### 5. Simplified Theme Download System
 
 **Issue:** WordPress sites show blank pages if no theme is installed.
 
 **Implementation:**
 ```python
 def download_theme(self, theme_slug):
-    """Download theme with multiple fallback methods"""
-    # Method 1: WP-CLI (most reliable)
-    if self.download_theme_wp_cli(theme_slug):
-        return
+    """Download theme from WordPress.org"""
+    theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
-    # Method 2: Direct download from WordPress.org
-    if self.download_theme_direct(theme_slug):
-        return
-
-    # Method 3: Copy from existing installation
-    if self.copy_theme_from_existing(theme_slug):
-        return
-
-    # Method 4: Create minimal fallback theme
-    self.create_minimal_theme(theme_slug)
+    if not os.path.exists(theme_dir):
+        Log.debug(self.app, f"Downloading theme: {theme_slug}")
+        self.download_theme_wp_cli(theme_slug)
 ```
 
-**Why:** Network issues, API rate limits, or missing dependencies can cause any single method to fail. Multiple fallbacks ensure themes are always available.
+**Why:** Simplified to use only WP-CLI method which is the most reliable. Removed fallback methods that added complexity without significant benefit.
 
-**Location:** `multitenancy_functions.py:1158-1341`
+**Location:** `multitenancy_functions.py:1171-1177`
+
+**Change History:**
+- v8.3.2 (October 2025): Simplified from 4-tier fallback system to single WP-CLI method
+- Removed methods: `download_theme_direct()`, `copy_theme_from_existing()`, `create_minimal_theme()`
+- Result: -139 lines of code, cleaner implementation
 
 #### 6. Theme Activation with Auto-Install
 
@@ -1333,7 +1328,42 @@ def set_permissions(self):
 
 **Version Fixed:** v8.2.1 (January 2025)
 
-#### 10. Modular Nginx Configuration with Includes
+#### 10. Auto-Cleanup During Initialization
+
+**Issue:** Old releases would accumulate during repeated initialization attempts, wasting disk space.
+
+**Implementation:**
+```python
+# In init() method after setting permissions:
+# Auto-cleanup old releases
+Log.info(self, "Cleaning up old releases...")
+release_manager = ReleaseManager(self, shared_root)
+keep_releases = int(config.get('keep_releases', 3))
+release_manager.cleanup_old_releases(keep_releases)
+```
+
+**Why This is Critical:**
+- Prevents disk space waste from multiple initialization attempts
+- Maintains clean release history from the start
+- Ensures `keep_releases` configuration is respected even during init
+- Properly handles integer conversion with `int()` wrapper
+
+**What Gets Cleaned:**
+- Old releases beyond the `keep_releases` count (default: 3)
+- Current release is always preserved regardless of count
+- Only affects releases in `/var/www/shared/releases/`
+
+**Configuration:**
+```ini
+[multitenancy]
+keep_releases = 3  # Number of releases to keep
+```
+
+**Location:** `multitenancy.py:144-148`
+
+**Version Implemented:** v8.3.2 (October 2025)
+
+#### 11. Modular Nginx Configuration with Includes
 
 **Issue:** Previous implementation used hardcoded nginx configuration blocks, duplicating logic that WordOps already provides in its modular include system.
 
@@ -1466,6 +1496,8 @@ When testing or modifying this plugin, verify:
 14. ✅ Verify `common/wpcommon-php83.conf` and `common/locations-wo.conf` includes are present
 15. ✅ **os.walk() uses followlinks=False** to prevent symlink traversal issues
 16. ✅ Initialization completes without "wp-includes/wp-includes" errors
+17. ✅ **Auto-cleanup runs during init** to prevent release accumulation
+18. ✅ `keep_releases` parameter is properly wrapped with `int()` to prevent type errors
 
 ---
 
@@ -1516,11 +1548,18 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 ---
 
 **Last Updated:** October 2025
-**Plugin Version:** 8.3
+**Plugin Version:** 8.3.2
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
 
-**Recent Changes (v8.3):**
+**Recent Changes (v8.3.2):**
+- ✅ **Added auto-cleanup during initialization** - Old releases are now automatically cleaned up during `init()`
+- ✅ **Fixed keep_releases parameter handling** - Properly wrapped with `int()` to prevent type errors
+- ✅ **Simplified theme download system** - Removed 3 fallback methods, kept only WP-CLI approach
+- ✅ **Code reduction** - Removed 139 lines of code for better maintainability
+- ✅ Cleaner, more focused implementation
+
+**Previous Changes (v8.3):**
 - ✅ **Refactored nginx configuration to use modular includes**
 - ✅ Replaced hardcoded nginx blocks with WordOps' standard include system
 - ✅ Now uses `common/wpfc-php83.conf`, `common/wpcommon-php83.conf`, etc.
