@@ -525,7 +525,7 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         php_upstream = php_version.replace('.', '')
 
         # Start building the configuration
-        config = f"""# WordOps Multitenant Site Configuration
+        config = f"""# Multitenant Site Configuration
 # Domain: {domain}
 # PHP Version: {php_version}
 # Cache Type: {cache_type}
