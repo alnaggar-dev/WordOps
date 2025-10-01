@@ -900,56 +900,6 @@ server {{
             return False
     
     @staticmethod
-    def backup_site(app, domain, site_root):
-        """Create backup of a site"""
-        backup_dir = f"{site_root}/backups"
-        os.makedirs(backup_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        backup_path = f"{backup_dir}/backup-{timestamp}.tar.gz"
-        
-        with tarfile.open(backup_path, 'w:gz') as tar:
-            tar.add(f"{site_root}/htdocs", arcname='htdocs')
-            # wp-config.php is now inside htdocs, so it's included in the htdocs backup
-        
-        return backup_path
-    
-    @staticmethod
-    def update_wp_config_for_shared(app, site_root, site_htdocs):
-        """Update wp-config.php when converting to shared"""
-        # In multi-tenancy, wp-config.php is in htdocs
-        wp_config_path = f"{site_htdocs}/wp-config.php"
-        
-        if not os.path.exists(wp_config_path):
-            Log.error(app, f"wp-config.php not found at {wp_config_path}")
-            return
-        
-        # Read current config
-        with open(wp_config_path, 'r') as f:
-            config = f.read()
-        
-        # Update ABSPATH to point to shared WordPress core
-        # Change from __DIR__ to __DIR__ . '/wp/'
-        config = config.replace(
-            "define( 'ABSPATH'", 
-            "// define( 'ABSPATH' // OLD"
-        )
-        
-        # Add new ABSPATH before wp-settings.php
-        if "define( 'ABSPATH', __DIR__ . '/wp/' )" not in config:
-            config = config.replace(
-                "require_once ABSPATH . 'wp-settings.php';",
-                "define( 'ABSPATH', __DIR__ . '/wp/' );\n\n/* That's all, stop editing! Happy publishing. */\n\n// Note: wp-settings.php is loaded by the router"
-            )
-        
-        # Remove wp-settings.php loading (router handles it)
-        config = config.replace("require_once ABSPATH . 'wp-settings.php';", "")
-        
-        # Write updated config
-        with open(wp_config_path, 'w') as f:
-            f.write(config)
-    
-    @staticmethod
     def perform_health_check(app, shared_root):
         """Perform health check on shared infrastructure"""
         checks = {}

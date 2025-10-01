@@ -345,14 +345,6 @@ List all sites using shared WordPress core.
 wo multitenancy list
 ```
 
-### wo multitenancy convert
-
-Convert an existing WordPress site to use shared core.
-
-```bash
-wo multitenancy convert <domain> [--force]
-```
-
 ### wo multitenancy baseline
 
 Display current baseline configuration.
@@ -591,7 +583,6 @@ class WOMultitenancyController(CementBaseController):
 - `rollback()` - Rollback to previous release
 - `status()` - Display status and health
 - `list()` - List shared sites
-- `convert()` - Convert existing site
 - `baseline()` - Manage baseline
 - `remove()` - Remove infrastructure
 
@@ -1015,27 +1006,12 @@ All standard WordOps security headers apply unchanged.
 
 ## Migration Guide
 
-### Converting Existing WordOps Site
+The multi-tenancy plugin is designed for fresh site creation using the shared infrastructure from day one. Converting existing WordPress sites to use shared core is not supported, as the plugin architecture assumes sites are created with the proper symlink structure and configuration from the start.
 
-```bash
-# Simple conversion
-sudo wo multitenancy convert existing-site.com
-
-# What happens:
-# 1. Full backup created
-# 2. WordPress core replaced with symlinks
-# 3. Uploads preserved
-# 4. Database unchanged
-```
-
-### Bulk Migration
-
-```bash
-#!/bin/bash
-for site in site1.com site2.com site3.com; do
-    sudo wo multitenancy convert $site
-done
-```
+**Recommended Approach:**
+- Create new sites using `wo multitenancy create` for multi-tenant architecture
+- Migrate content from existing sites manually if needed using WordPress export/import tools
+- Keep existing sites on standard WordOps installation
 
 ---
 
