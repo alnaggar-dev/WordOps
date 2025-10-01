@@ -511,7 +511,7 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
         # Always use fallback config for multitenancy to ensure compatibility
         Log.debug(app, f"Generating fallback nginx config for {domain} (multitenancy optimized)")
-        config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version)
+        config_content = MTFunctions.generate_basic_nginx_config(domain, site_root, php_version, cache_type)
 
         try:
             # Ensure all directories exist before writing config
@@ -547,11 +547,30 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
             raise Exception(f"Nginx configuration generation failed: {e}")
     
     @staticmethod
-    def generate_basic_nginx_config(domain, site_root, php_version):
+    def generate_basic_nginx_config(domain, site_root, php_version, cache_type="basic"):
         """Generate basic nginx configuration"""
         # Use proper PHP-FPM socket function
         php_sock = MTFunctions.get_php_fpm_socket(php_version)
-        
+
+        # Build cache-specific directives
+        cache_directives = ""
+        purge_location = ""
+
+        if cache_type == "wpfc":
+            cache_directives = """
+        # FastCGI cache configuration
+        fastcgi_cache_bypass $skip_cache;
+        fastcgi_no_cache $skip_cache;
+        fastcgi_cache WORDPRESS;
+        add_header X-fastcgi-cache $upstream_cache_status;"""
+
+            purge_location = """
+    # FastCGI cache purge
+    location ~ /purge(/.*) {{
+        fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";
+        access_log off;
+    }}"""
+
         return f"""server {{
     listen 80;
     listen [::]:80;
@@ -586,8 +605,9 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
         fastcgi_index index.php;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info;
+        fastcgi_param PATH_INFO $fastcgi_path_info;{cache_directives}
     }}
+{purge_location}
 
     # Deny access to hidden files (but allow .well-known)
     location ~ /\\.(?!well-known) {{

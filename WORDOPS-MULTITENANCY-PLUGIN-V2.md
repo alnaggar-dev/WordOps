@@ -1168,7 +1168,75 @@ def ensure_and_activate_theme(app, domain, site_htdocs, theme):
 
 **Location:** `multitenancy_functions.py:658-702`
 
-#### 7. WordPress Core Assets Symlink (wp-includes)
+#### 7. FastCGI Cache Configuration
+
+**Issue:** Sites created with `--wpfc` flag were missing FastCGI cache directives in nginx configuration, causing cache to not function despite being requested.
+
+**Root Cause:** The `generate_basic_nginx_config()` function was not accepting or using the `cache_type` parameter, so it always generated basic configuration without cache-specific directives.
+
+**Implementation:**
+```python
+@staticmethod
+def generate_basic_nginx_config(domain, site_root, php_version, cache_type="basic"):
+    """Generate basic nginx configuration"""
+    php_sock = MTFunctions.get_php_fpm_socket(php_version)
+
+    # Build cache-specific directives
+    cache_directives = ""
+    purge_location = ""
+
+    if cache_type == "wpfc":
+        cache_directives = """
+        # FastCGI cache configuration
+        fastcgi_cache_bypass $skip_cache;
+        fastcgi_no_cache $skip_cache;
+        fastcgi_cache WORDPRESS;
+        add_header X-fastcgi-cache $upstream_cache_status;"""
+
+        purge_location = """
+    # FastCGI cache purge
+    location ~ /purge(/.*) {{
+        fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";
+        access_log off;
+    }}"""
+```
+
+**Integration in nginx template:**
+```python
+# Handle PHP files
+location ~ \.php$ {{
+    try_files $uri =404;
+    fastcgi_split_path_info ^(.+\.php)(/.+)$;
+    fastcgi_pass unix:/var/run/php/{php_sock}.sock;
+    fastcgi_index index.php;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_param PATH_INFO $fastcgi_path_info;{cache_directives}
+}}
+{purge_location}
+```
+
+**Why This is Critical:**
+- Without cache directives, `--wpfc` sites don't use FastCGI cache at all
+- Cache headers (`X-fastcgi-cache`) are missing, making debugging difficult
+- Purge endpoint is not configured, breaking cache invalidation
+- Sites appear to work but performance is severely degraded
+
+**Verification:**
+```bash
+# Test cache is working
+curl -I https://example.com | grep -i fastcgi
+# Should show: x-fastcgi-cache: HIT
+
+# Check nginx config includes cache directives
+grep -A5 "fastcgi_cache" /etc/nginx/sites-available/example.com
+```
+
+**Location:** `multitenancy_functions.py:550-610`
+
+**Version Fixed:** v8.1 (October 1, 2025)
+
+#### 8. WordPress Core Assets Symlink (wp-includes)
 
 **Issue:** WordPress loads CSS, JavaScript, and images from `/wp-includes/` directory, but if this symlink is missing, all core assets return 404 errors causing unstyled pages and broken functionality.
 
@@ -1234,6 +1302,9 @@ When testing or modifying this plugin, verify:
 8. ✅ **wp-includes symlink is created** (critical for CSS/JS loading)
 9. ✅ WordPress admin dashboard displays with proper styling
 10. ✅ Browser console shows no 404 errors for wp-includes assets
+11. ✅ **FastCGI cache directives are included when using --wpfc flag**
+12. ✅ Cache headers (`X-fastcgi-cache`) are present in HTTP responses
+13. ✅ FastCGI cache purge location is configured
 
 ---
 
@@ -1284,9 +1355,15 @@ Developed as a native WordOps plugin for efficient WordPress multi-tenancy.
 ---
 
 **Last Updated:** October 1, 2025
-**Plugin Version:** 8.0
+**Plugin Version:** 8.1
 **Compatible with:** WordOps 3.20.0+
 **Status:** Production Ready
+
+**Recent Changes (v8.1):**
+- ✅ Fixed FastCGI cache configuration support
+- ✅ Added cache directives when `--wpfc` flag is used
+- ✅ Added FastCGI cache purge location
+- ✅ Improved cache debugging with `X-fastcgi-cache` headers
 
 ---
 
