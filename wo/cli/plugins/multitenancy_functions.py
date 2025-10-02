@@ -1194,6 +1194,470 @@ die($error_msg);
             except Exception as e:
                 Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
 
+
+    # ==========================================
+    # PHASE 3: GitHub Download Support
+    # ==========================================
+    
+    def download_plugin_from_github(self, github_repo, plugin_slug, branch=None, tag=None):
+        """
+        Download a plugin from a GitHub repository
+        
+        This method downloads a plugin from GitHub and extracts it to the shared plugins directory.
+        It supports both branch and tag-based downloads, with automatic fallback from main to master.
+        
+        Args:
+            github_repo (str): GitHub repository in 'user/repo' format
+            plugin_slug (str): Local directory name for the plugin
+            branch (str, optional): Specific branch to download (e.g., 'develop', 'main')
+            tag (str, optional): Specific tag/release to download (e.g., 'v1.2.3', '1.0.0')
+                                Tags take precedence over branches if both are specified
+        
+        Returns:
+            bool: True if download and extraction successful, False otherwise
+        
+        Example:
+            infra.download_plugin_from_github('user/my-plugin', 'my-plugin', tag='v1.5.0')
+        """
+        try:
+            plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
+            
+            # Check if plugin already exists on disk
+            if os.path.exists(plugin_dir):
+                Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
+                return True
+            
+            # Construct the appropriate GitHub archive URL
+            # GitHub archive URLs follow this pattern:
+            # - For tags: https://github.com/user/repo/archive/refs/tags/TAG.zip
+            # - For branches: https://github.com/user/repo/archive/refs/heads/BRANCH.zip
+            if tag:
+                # Download specific tag/release version
+                url = f"https://github.com/{github_repo}/archive/refs/tags/{tag}.zip"
+                Log.debug(self.app, f"Downloading from GitHub tag: {tag}")
+            elif branch:
+                # Download specific branch
+                url = f"https://github.com/{github_repo}/archive/refs/heads/{branch}.zip"
+                Log.debug(self.app, f"Downloading from GitHub branch: {branch}")
+            else:
+                # Try 'main' branch first (GitHub's default for new repos)
+                url = f"https://github.com/{github_repo}/archive/refs/heads/main.zip"
+                Log.debug(self.app, f"Downloading from GitHub (trying 'main' branch)")
+            
+            # Create temporary directory for download and extraction
+            temp_dir = f"/tmp/wo_github_{plugin_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
+            zip_file = f"{temp_dir}/{plugin_slug}.zip"
+            
+            # Download the zip file using curl with follow redirects (-L)
+            download_cmd = ['curl', '-L', '-o', zip_file, url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # If download failed and we were trying 'main', fallback to 'master'
+            if result.returncode != 0 and not branch and not tag:
+                Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
+                url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                download_cmd = ['curl', '-L', '-o', zip_file, url]
+                result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # Verify download was successful
+            if result.returncode != 0 or not os.path.exists(zip_file):
+                Log.debug(self.app, f"Failed to download from GitHub: {github_repo}")
+                # Cleanup temp directory
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Extract the downloaded zip file
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            result = subprocess.run(unzip_cmd, capture_output=True)
+            
+            if result.returncode != 0:
+                Log.debug(self.app, "Failed to extract GitHub archive")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Find the extracted directory
+            # GitHub creates a directory named like: repo-branch or repo-tag
+            # We need to find it and rename it to the plugin_slug
+            extracted = None
+            for item in os.listdir(temp_dir):
+                item_path = f"{temp_dir}/{item}"
+                # Skip __MACOSX and the zip file itself
+                if os.path.isdir(item_path) and item not in ['__MACOSX', plugin_slug]:
+                    extracted = item_path
+                    break
+            
+            if not extracted:
+                Log.debug(self.app, "No directory found in GitHub archive")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Move the extracted directory to the plugins directory with correct name
+            shutil.move(extracted, plugin_dir)
+            
+            # Cleanup temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            
+            Log.debug(self.app, f"Successfully downloaded plugin from GitHub: {github_repo}")
+            return True
+            
+        except Exception as e:
+            Log.debug(self.app, f"GitHub plugin download failed: {e}")
+            # Ensure cleanup on error
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return False
+    
+    def download_plugin_from_url(self, url, plugin_slug):
+        """
+        Download a plugin from a direct URL
+        
+        This method downloads a plugin zip file from any URL and extracts it.
+        Useful for premium plugins, custom builds, or plugins not on WordPress.org/GitHub.
+        
+        Args:
+            url (str): Direct URL to the plugin zip file
+            plugin_slug (str): Local directory name for the plugin
+        
+        Returns:
+            bool: True if download and extraction successful, False otherwise
+        
+        Example:
+            infra.download_plugin_from_url('https://example.com/my-plugin.zip', 'my-plugin')
+        """
+        try:
+            plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
+            
+            # Check if plugin already exists
+            if os.path.exists(plugin_dir):
+                Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
+                return True
+            
+            # Create temporary directory for download
+            temp_dir = f"/tmp/wo_url_{plugin_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
+            zip_file = f"{temp_dir}/{plugin_slug}.zip"
+            
+            Log.debug(self.app, f"Downloading plugin from URL: {url}")
+            
+            # Download the file using curl with follow redirects
+            download_cmd = ['curl', '-L', '-o', zip_file, url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # Verify download was successful
+            if result.returncode != 0 or not os.path.exists(zip_file):
+                Log.debug(self.app, f"Failed to download from URL: {url}")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Verify it's actually a zip file (check magic bytes)
+            with open(zip_file, 'rb') as f:
+                magic = f.read(4)
+                # ZIP files start with 'PK\x03\x04' or 'PK\x05\x06' (empty archive)
+                if not (magic[:2] == b'PK'):
+                    Log.debug(self.app, "Downloaded file is not a valid ZIP archive")
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                    return False
+            
+            # Extract the zip file
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            result = subprocess.run(unzip_cmd, capture_output=True)
+            
+            if result.returncode != 0:
+                Log.debug(self.app, "Failed to extract plugin zip")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Find the extracted directory
+            # Most plugins extract to a single directory, but some might have different structures
+            extracted = None
+            for item in os.listdir(temp_dir):
+                item_path = f"{temp_dir}/{item}"
+                # Skip the zip file and __MACOSX
+                if os.path.isdir(item_path) and item not in ['__MACOSX']:
+                    extracted = item_path
+                    break
+            
+            if not extracted:
+                # Maybe it's a single-file plugin or flat structure
+                # In this case, create a directory and move all PHP files there
+                Log.debug(self.app, "No plugin directory found, checking for flat structure")
+                php_files = [f for f in os.listdir(temp_dir) if f.endswith('.php')]
+                if php_files:
+                    # Create plugin directory and move contents
+                    os.makedirs(plugin_dir, exist_ok=True)
+                    for item in os.listdir(temp_dir):
+                        if item != plugin_slug + '.zip':
+                            src = f"{temp_dir}/{item}"
+                            dst = f"{plugin_dir}/{item}"
+                            if os.path.isfile(src):
+                                shutil.move(src, dst)
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                    Log.debug(self.app, f"Downloaded plugin from URL (flat structure)")
+                    return True
+                else:
+                    Log.debug(self.app, "No valid plugin structure found in archive")
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                    return False
+            
+            # Move extracted directory to plugins directory
+            shutil.move(extracted, plugin_dir)
+            
+            # Cleanup temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            
+            Log.debug(self.app, f"Successfully downloaded plugin from URL")
+            return True
+            
+        except Exception as e:
+            Log.debug(self.app, f"URL plugin download failed: {e}")
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return False
+    
+    def download_theme_from_github(self, github_repo, theme_slug, branch=None, tag=None):
+        """
+        Download a theme from a GitHub repository
+        
+        Similar to download_plugin_from_github but for themes.
+        Downloads and extracts to the shared themes directory.
+        
+        Args:
+            github_repo (str): GitHub repository in 'user/repo' format
+            theme_slug (str): Local directory name for the theme
+            branch (str, optional): Specific branch to download
+            tag (str, optional): Specific tag/release to download (takes precedence)
+        
+        Returns:
+            bool: True if download and extraction successful, False otherwise
+        """
+        try:
+            theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
+            
+            # Check if theme already exists
+            if os.path.exists(theme_dir):
+                Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
+                return True
+            
+            # Construct GitHub URL (same logic as plugins)
+            if tag:
+                url = f"https://github.com/{github_repo}/archive/refs/tags/{tag}.zip"
+                Log.debug(self.app, f"Downloading theme from GitHub tag: {tag}")
+            elif branch:
+                url = f"https://github.com/{github_repo}/archive/refs/heads/{branch}.zip"
+                Log.debug(self.app, f"Downloading theme from GitHub branch: {branch}")
+            else:
+                url = f"https://github.com/{github_repo}/archive/refs/heads/main.zip"
+                Log.debug(self.app, f"Downloading theme from GitHub (trying 'main' branch)")
+            
+            # Create temporary directory
+            temp_dir = f"/tmp/wo_github_theme_{theme_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
+            zip_file = f"{temp_dir}/{theme_slug}.zip"
+            
+            # Download
+            download_cmd = ['curl', '-L', '-o', zip_file, url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # Fallback to master if main failed
+            if result.returncode != 0 and not branch and not tag:
+                Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
+                url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                download_cmd = ['curl', '-L', '-o', zip_file, url]
+                result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # Verify download
+            if result.returncode != 0 or not os.path.exists(zip_file):
+                Log.debug(self.app, f"Failed to download theme from GitHub: {github_repo}")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Extract
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            result = subprocess.run(unzip_cmd, capture_output=True)
+            
+            if result.returncode != 0:
+                Log.debug(self.app, "Failed to extract GitHub theme archive")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Find extracted directory
+            extracted = None
+            for item in os.listdir(temp_dir):
+                item_path = f"{temp_dir}/{item}"
+                if os.path.isdir(item_path) and item not in ['__MACOSX', theme_slug]:
+                    extracted = item_path
+                    break
+            
+            if not extracted:
+                Log.debug(self.app, "No directory found in GitHub theme archive")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Move to themes directory
+            shutil.move(extracted, theme_dir)
+            
+            # Cleanup
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            
+            Log.debug(self.app, f"Successfully downloaded theme from GitHub: {github_repo}")
+            return True
+            
+        except Exception as e:
+            Log.debug(self.app, f"GitHub theme download failed: {e}")
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return False
+    
+    def download_theme_from_url(self, url, theme_slug):
+        """
+        Download a theme from a direct URL
+        
+        Downloads a theme zip file from any URL and extracts it to shared themes directory.
+        
+        Args:
+            url (str): Direct URL to the theme zip file
+            theme_slug (str): Local directory name for the theme
+        
+        Returns:
+            bool: True if download and extraction successful, False otherwise
+        """
+        try:
+            theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
+            
+            # Check if theme already exists
+            if os.path.exists(theme_dir):
+                Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
+                return True
+            
+            # Create temporary directory
+            temp_dir = f"/tmp/wo_url_theme_{theme_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
+            zip_file = f"{temp_dir}/{theme_slug}.zip"
+            
+            Log.debug(self.app, f"Downloading theme from URL: {url}")
+            
+            # Download
+            download_cmd = ['curl', '-L', '-o', zip_file, url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            
+            # Verify download
+            if result.returncode != 0 or not os.path.exists(zip_file):
+                Log.debug(self.app, f"Failed to download theme from URL: {url}")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Verify it's a zip file
+            with open(zip_file, 'rb') as f:
+                magic = f.read(4)
+                if not (magic[:2] == b'PK'):
+                    Log.debug(self.app, "Downloaded file is not a valid ZIP archive")
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                    return False
+            
+            # Extract
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            result = subprocess.run(unzip_cmd, capture_output=True)
+            
+            if result.returncode != 0:
+                Log.debug(self.app, "Failed to extract theme zip")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Find extracted directory
+            extracted = None
+            for item in os.listdir(temp_dir):
+                item_path = f"{temp_dir}/{item}"
+                if os.path.isdir(item_path) and item not in ['__MACOSX']:
+                    extracted = item_path
+                    break
+            
+            if not extracted:
+                Log.debug(self.app, "No theme directory found in archive")
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return False
+            
+            # Move to themes directory
+            shutil.move(extracted, theme_dir)
+            
+            # Cleanup
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            
+            Log.debug(self.app, f"Successfully downloaded theme from URL")
+            return True
+            
+        except Exception as e:
+            Log.debug(self.app, f"URL theme download failed: {e}")
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return False
+    
+    # ==========================================
+    # PHASE 3: Helper Methods
+    # ==========================================
+    
+    @staticmethod
+    def get_plugin_version(plugin_dir, plugin_slug):
+        """
+        Extract version number from plugin's main PHP file
+        
+        WordPress plugins declare their version in a header comment like:
+        * Version: 1.2.3
+        
+        This method searches for that header and extracts the version.
+        
+        Args:
+            plugin_dir (str): Full path to plugin directory
+            plugin_slug (str): Plugin slug (used to find main PHP file)
+        
+        Returns:
+            str: Version string like "(v1.2.3)" or empty string if not found
+        """
+        try:
+            # Common patterns for main plugin file
+            candidates = [
+                f"{plugin_dir}/{plugin_slug}.php",
+                f"{plugin_dir}/index.php",
+                f"{plugin_dir}/plugin.php"
+            ]
+            
+            # Try each candidate file
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    # Read first 2KB of file (headers are always at the top)
+                    with open(candidate, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(2000)
+                        
+                        # Look for "Version: X.Y.Z" in the plugin header
+                        import re
+                        match = re.search(r'Version:\s*([\d.]+)', content, re.IGNORECASE)
+                        if match:
+                            return f"(v{match.group(1)})"
+            
+            return ""
+            
+        except Exception:
+            return ""
+
     def create_baseline_config(self, config):
         """Create baseline configuration file"""
         baseline = {
@@ -1375,467 +1839,3 @@ add_action('init', function() {
         for plugin in config.get('baseline_plugins', []):
             self.download_plugin(plugin)
     
-    def set_permissions(self):
-        """Set proper permissions on shared infrastructure"""
-        
-        # Set ownership
-        try:
-            subprocess.run([
-                'chown', '-R', 'www-data:www-data', self.shared_root
-            ], check=True, capture_output=True)
-        except:
-            Log.debug(self.app, "Could not set ownership")
-        
-        # Set directory permissions
-        for root, dirs, files in os.walk(self.shared_root, followlinks=False):
-            for d in dirs:
-                os.chmod(os.path.join(root, d), 0o755)
-            for f in files:
-                os.chmod(os.path.join(root, f), 0o644)
-
-
-    def initialize_git_tracking(self):
-        """Initialize git repository for baseline tracking"""
-        try:
-            # Check if git is installed
-            result = subprocess.run(
-                ['git', '--version'],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                Log.debug(self.app, "Git not installed, skipping baseline tracking")
-                return False
-            
-            # Initialize git repo if not exists
-            git_dir = f"{self.shared_root}/.git"
-            if not os.path.exists(git_dir):
-                subprocess.run(
-                    ['git', 'init'],
-                    cwd=self.shared_root,
-                    capture_output=True,
-                    check=True
-                )
-                
-                # Configure git (local only)
-                subprocess.run(
-                    ['git', 'config', 'user.name', 'WordOps Multi-tenancy'],
-                    cwd=self.shared_root,
-                    capture_output=True
-                )
-                subprocess.run(
-                    ['git', 'config', 'user.email', 'multitenancy@wordops.local'],
-                    cwd=self.shared_root,
-                    capture_output=True
-                )
-                
-                # Create .gitignore
-                gitignore_path = f"{self.shared_root}/.gitignore"
-                with open(gitignore_path, 'w') as f:
-                    f.write("""# Ignore everything except baseline config
-*
-!.gitignore
-!config/
-!config/baseline.json
-""")
-                
-                # Initial commit
-                subprocess.run(
-                    ['git', 'add', '.gitignore', 'config/baseline.json'],
-                    cwd=self.shared_root,
-                    capture_output=True
-                )
-                subprocess.run(
-                    ['git', 'commit', '-m', 'Initial baseline configuration'],
-                    cwd=self.shared_root,
-                    capture_output=True
-                )
-                
-                Log.debug(self.app, "Initialized git tracking for baseline")
-                return True
-            
-            return True
-            
-        except Exception as e:
-            Log.debug(self.app, f"Could not initialize git tracking: {e}")
-            return False
-
-    def git_commit_baseline(self, message):
-        """Commit baseline.json changes to git"""
-        try:
-            git_dir = f"{self.shared_root}/.git"
-            if not os.path.exists(git_dir):
-                Log.debug(self.app, "Git not initialized, skipping commit")
-                return False
-            
-            # Stage baseline.json
-            subprocess.run(
-                ['git', 'add', 'config/baseline.json'],
-                cwd=self.shared_root,
-                capture_output=True,
-                check=True
-            )
-            
-            # Commit with message
-            subprocess.run(
-                ['git', 'commit', '-m', message],
-                cwd=self.shared_root,
-                capture_output=True,
-                check=True
-            )
-            
-            Log.debug(self.app, f"Git commit: {message}")
-            return True
-            
-        except subprocess.CalledProcessError:
-            # No changes to commit (this is okay)
-            return True
-        except Exception as e:
-            Log.debug(self.app, f"Git commit failed: {e}")
-            return False
-
-
-class ReleaseManager:
-    """Manage WordPress releases"""
-    
-    def __init__(self, app, shared_root):
-        self.app = app
-        self.shared_root = shared_root
-        self.releases_dir = f"{shared_root}/releases"
-        self.backups_dir = f"{shared_root}/backups"
-    
-    def list_releases(self):
-        """List all available releases"""
-        releases = []
-        
-        if os.path.exists(self.releases_dir):
-            for item in os.listdir(self.releases_dir):
-                if item.startswith('wp-') and os.path.isdir(f"{self.releases_dir}/{item}"):
-                    releases.append(item)
-        
-        return sorted(releases, reverse=True)
-    
-    def get_current_release(self):
-        """Get current active release"""
-        current_link = f"{self.shared_root}/current"
-        
-        if os.path.islink(current_link):
-            target = os.readlink(current_link)
-            return os.path.basename(target)
-        
-        return None
-    
-    def get_previous_release(self, current_release):
-        """Get the previous release for rollback"""
-        releases = self.list_releases()
-        
-        if current_release in releases:
-            current_index = releases.index(current_release)
-            if current_index < len(releases) - 1:
-                return releases[current_index + 1]
-        
-        return None
-    
-    def backup_current(self):
-        """Backup current release information"""
-        current = self.get_current_release()
-        if current:
-            timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-            backup_file = f"{self.backups_dir}/release-{timestamp}.txt"
-            
-            os.makedirs(self.backups_dir, exist_ok=True)
-            
-            with open(backup_file, 'w') as f:
-                f.write(current)
-            
-            Log.debug(self.app, f"Backed up release info: {backup_file}")
-    
-    def cleanup_old_releases(self, keep_count=3):
-        """Remove old releases keeping only the specified count"""
-        releases = self.list_releases()
-        current = self.get_current_release()
-        
-        if len(releases) > keep_count:
-            to_remove = releases[keep_count:]
-            
-            for release in to_remove:
-                # Never remove current release
-                if release != current:
-                    release_path = f"{self.releases_dir}/{release}"
-                    if os.path.exists(release_path):
-                        shutil.rmtree(release_path)
-                        Log.debug(self.app, f"Removed old release: {release}")
-
-class BaselineApplicator:
-    """Helper class for applying baseline configuration to sites"""
-    
-    @staticmethod
-    def find_plugin_main_file(site_path, plugin_slug):
-        """Find the main PHP file for a plugin"""
-        plugin_dir = f"{site_path}/wp-content/plugins/{plugin_slug}"
-        
-        if not os.path.exists(plugin_dir):
-            return None
-        
-        # Common patterns
-        candidates = [
-            f"{plugin_slug}/{plugin_slug}.php",
-            f"{plugin_slug}/index.php",
-            f"{plugin_slug}/plugin.php",
-            f"{plugin_slug}.php"  # Single-file plugin
-        ]
-        
-        for candidate in candidates:
-            full_path = f"{site_path}/wp-content/plugins/{candidate}"
-            if os.path.exists(full_path):
-                return candidate
-        
-        return None
-    
-    @staticmethod
-    def restore_plugins_from_json(app, site_path, plugins_json):
-        """Restore active_plugins option from JSON string"""
-        try:
-            restore_cmd = [
-                'wp', 'option', 'update', 'active_plugins', plugins_json,
-                '--format=json',
-                '--path=' + site_path,
-                '--allow-root'
-            ]
-            
-            subprocess.run(
-                restore_cmd,
-                capture_output=True,
-                timeout=30,
-                check=True
-            )
-            
-            Log.debug(app, f"Restored plugins for {site_path}")
-            
-        except Exception as e:
-            Log.debug(app, f"Failed to restore plugins: {e}")
-    
-    @staticmethod
-    def apply_baseline_to_site(app, domain, site_path, baseline):
-        """Apply baseline configuration to a single site via WP-CLI"""
-        
-        result = {'success': False, 'error': None}
-        
-        try:
-            # Get current active plugins (for rollback)
-            get_plugins_cmd = [
-                'wp', 'option', 'get', 'active_plugins',
-                '--format=json',
-                '--path=' + site_path,
-                '--allow-root'
-            ]
-            
-            plugins_result = subprocess.run(
-                get_plugins_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if plugins_result.returncode != 0:
-                result['error'] = "Could not read current plugins"
-                return result
-            
-            current_plugins = plugins_result.stdout.strip()
-            
-            # Activate each baseline plugin
-            for plugin_slug in baseline.get('plugins', []):
-                # Find plugin main file
-                plugin_file = BaselineApplicator.find_plugin_main_file(
-                    site_path, 
-                    plugin_slug
-                )
-                
-                if not plugin_file:
-                    result['error'] = f"Plugin {plugin_slug} not found on disk"
-                    return result
-                
-                # Activate plugin
-                activate_cmd = [
-                    'wp', 'plugin', 'activate', plugin_file,
-                    '--path=' + site_path,
-                    '--allow-root'
-                ]
-                
-                activate_result = subprocess.run(
-                    activate_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if activate_result.returncode != 0:
-                    result['error'] = f"Failed to activate {plugin_slug}: " + \
-                                    activate_result.stderr
-                    # Rollback - restore original plugins
-                    BaselineApplicator.restore_plugins_from_json(
-                        app, 
-                        site_path, 
-                        current_plugins
-                    )
-                    return result
-            
-            # Switch theme if needed
-            theme_slug = baseline.get('theme')
-            if theme_slug:
-                theme_cmd = [
-                    'wp', 'theme', 'activate', theme_slug,
-                    '--path=' + site_path,
-                    '--allow-root'
-                ]
-                
-                theme_result = subprocess.run(
-                    theme_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if theme_result.returncode != 0:
-                    result['error'] = f"Failed to activate theme {theme_slug}"
-                    return result
-            
-            result['success'] = True
-            return result
-            
-        except subprocess.TimeoutExpired:
-            result['error'] = "WP-CLI command timeout"
-            return result
-        except Exception as e:
-            result['error'] = str(e)
-            return result
-    
-    @staticmethod
-    def apply_baseline_to_sites(app, config, baseline_version):
-        """Apply current baseline to all sites via WP-CLI"""
-        from wo.cli.plugins.multitenancy_db import MTDatabase
-        
-        # Get baseline config
-        shared_root = config.get('shared_root', '/var/www/shared')
-        baseline_file = f"{shared_root}/config/baseline.json"
-        
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-
-        # *** PHASE 2: TEST ON STAGING SITE FIRST ***
-        staging_site = MTDatabase.get_staging_site(app)
-        
-        if staging_site:
-            Log.info(app, f"Testing on staging site: {staging_site['domain']}...")
-            
-            result = BaselineApplicator.apply_baseline_to_site(
-                app,
-                staging_site['domain'],
-                staging_site['site_path'],
-                baseline
-            )
-            
-            if not result['success']:
-                Log.error(app, "=" * 60)
-                Log.error(app, f"❌ STAGING TEST FAILED: {result['error']}")
-                Log.error(app, "=" * 60)
-                Log.error(app, "Aborting production rollout!")
-                Log.error(app, f"Fix the issue on staging site: {staging_site['domain']}")
-                Log.error(app, "Then try again.")
-                return
-            
-            Log.info(app, "✅ Staging test PASSED")
-            Log.info(app, "")
-        else:
-            Log.warn(app, "⚠️  No staging site found")
-            Log.warn(app, "   Skipping pre-production test (NOT RECOMMENDED)")
-            Log.warn(app, "   Create one with: wo multitenancy staging create <domain>")
-            Log.warn(app, "")
-            
-            # Ask for confirmation
-            if not hasattr(app.pargs, 'force') or not app.pargs.force:
-                try:
-                    confirm = input("Continue without staging test? [y/N]: ").strip().lower()
-                    if confirm != 'y':
-                        Log.info(app, "Aborted by user")
-                        return
-                except:
-                    pass  # If input fails (non-interactive), continue
-        
-        
-        # Get all production sites (not staging, not quarantined)
-        from wo.core.database import db_session
-        from wo.cli.plugins.multitenancy_db import MultitenancySite
-        
-        session = db_session
-        sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
-        
-        production_sites = [
-            {
-                'domain': s.domain,
-                'site_path': s.site_path,
-                'is_staging': s.is_staging,
-                'is_quarantined': s.is_quarantined
-            }
-            for s in sites 
-            if not getattr(s, 'is_staging', False) 
-            and not getattr(s, 'is_quarantined', False)
-        ]
-        
-        if not production_sites:
-            Log.error(app, "No production sites found")
-            return
-        
-        Log.info(app, f"Applying baseline v{baseline_version} to {len(production_sites)} sites...")
-        
-        success_count = 0
-        quarantine_count = 0
-        
-        for site in production_sites:
-            domain = site['domain']
-            site_path = site['site_path']
-            
-            # Apply baseline to this site
-            result = BaselineApplicator.apply_baseline_to_site(
-                app, 
-                domain, 
-                site_path, 
-                baseline
-            )
-            
-            if result['success']:
-                # Update baseline version in DB
-                site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
-                if site_obj:
-                    site_obj.baseline_version = baseline_version
-                    site_obj.updated_at = datetime.now()
-                    session.commit()
-                
-                success_count += 1
-                Log.debug(app, f"Applied to {domain}")
-            else:
-                # Quarantine the site
-                MTDatabase.mark_site_quarantined(
-                    app, 
-                    domain, 
-                    result['error']
-                )
-                quarantine_count += 1
-                Log.warn(app, f"Quarantined {domain}: {result['error']}")
-        
-        # Clear global cache
-        Log.info(app, "Clearing cache globally...")
-        from wo.core.shellexec import WOShellExec
-        WOShellExec.cmd_exec(app, "wo clean --all", errormsg="", log=False)
-        
-        # Report results
-        Log.info(app, "")
-        Log.info(app, "=" * 60)
-        Log.info(app, f"✅ Successfully applied to {success_count}/{len(production_sites)} sites")
-        
-        if quarantine_count > 0:
-            Log.warn(app, f"⚠️  {quarantine_count} site(s) quarantined due to errors")
-            Log.info(app, "Run 'wo multitenancy baseline validate' to review")
-        
-        Log.info(app, "=" * 60)

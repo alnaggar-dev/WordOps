@@ -87,6 +87,14 @@ class WOMultitenancyController(CementBaseController):
             (['theme_slug'], dict(help='Theme slug', nargs='?')),
             (['--apply-now'], dict(help='Apply changes immediately', action='store_true')),
             (['--set-default'], dict(help='Set as default theme', action='store_true')),
+            # Phase 3: GitHub and URL download support
+            (['--github'], dict(help='GitHub repository (user/repo)', dest='github')),
+            (['--branch'], dict(help='GitHub branch name', dest='branch')),
+            (['--tag'], dict(help='GitHub tag/release name', dest='tag')),
+            (['--url'], dict(help='Direct download URL', dest='url')),
+            # Phase 3: Rollback support
+            (['--to-version'], dict(help='Baseline version to rollback to', type=int, dest='to_version')),
+            (['--to-commit'], dict(help='Git commit hash to rollback to', dest='to_commit')),
         ]
         usage = "wo multitenancy <command> [options]"
 
@@ -894,18 +902,775 @@ class WOMultitenancyController(CementBaseController):
 
     @expose(help="Add plugin to baseline")
     def add_plugin(self):
-        """Add a plugin to the baseline"""
+        """
+        Add a plugin to the baseline configuration
+        
+        This command downloads a plugin from WordPress.org, GitHub, or a direct URL,
+        adds it to the baseline configuration, and optionally applies it to all sites.
+        
+        Usage:
+            wo multitenancy baseline add-plugin <slug>                    # From WordPress.org
+            wo multitenancy baseline add-plugin <slug> --github=user/repo # From GitHub
+            wo multitenancy baseline add-plugin <slug> --url=https://...  # From direct URL
+            wo multitenancy baseline add-plugin <slug> --apply-now        # Apply immediately
+        """
+        pargs = self.app.pargs
+        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
+        apply_now = pargs.apply_now
+        
+        # Phase 3: Get source-specific arguments
+        github_repo = pargs.github
+        branch = pargs.branch
+        tag = pargs.tag
+        url = pargs.url
+        
+        # Validate arguments
+        if not plugin_slug:
+            Log.error(self, "Plugin slug is required")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
+        
+        # Validate: only one source method allowed
+        source_count = sum([bool(github_repo), bool(url)])
+        if source_count > 1:
+            Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
+        
+        # Validate: branch/tag only valid with GitHub
+        if (branch or tag) and not github_repo:
+            Log.error(self, "--branch and --tag can only be used with --github")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Determine and display source
+        if github_repo:
+            source_info = f"from GitHub: {github_repo}"
+            if tag:
+                source_info += f" (tag: {tag})"
+            elif branch:
+                source_info += f" (branch: {branch})"
+        elif url:
+            source_info = f"from URL: {url}"
+        else:
+            source_info = "from WordPress.org"
+        
+        Log.info(self, f"Adding plugin: {plugin_slug} {source_info}")
+        
+        # Download plugin using appropriate method
+        infra = SharedInfrastructure(self, shared_root)
+        
+        if github_repo:
+            # Download from GitHub
+            success = infra.download_plugin_from_github(
+                github_repo, 
+                plugin_slug, 
+                branch=branch, 
+                tag=tag
+            )
+        elif url:
+            # Download from direct URL
+            success = infra.download_plugin_from_url(url, plugin_slug)
+        else:
+            # Download from WordPress.org (default)
+            infra.download_plugin(plugin_slug)
+            success = True  # download_plugin doesn't return bool, check directory instead
+        
+        # Verify plugin was downloaded
+        plugin_dir = f"{shared_root}/wp-content/plugins/{plugin_slug}"
+        if not os.path.exists(plugin_dir):
+            Log.error(self, f"Failed to download plugin: {plugin_slug}")
+            Log.error(self, "")
+            Log.error(self, "Possible causes:")
+            Log.error(self, "  - Plugin doesn't exist at the source")
+            Log.error(self, "  - Network connectivity issue")
+            Log.error(self, "  - Invalid GitHub repo or URL")
+            Log.error(self, "  - Disk space full")
+            return
+        
+        Log.info(self, f"✅ Downloaded {plugin_slug}")
+        
+        # Update baseline.json
+        baseline_file = f"{shared_root}/config/baseline.json"
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        # Check if already in baseline
+        if plugin_slug in baseline.get('plugins', []):
+            Log.error(self, f"Plugin {plugin_slug} already in baseline")
+        
+        # Increment version and add plugin
+        old_version = baseline.get('version', 1)
+        new_version = old_version + 1
+        
+        baseline['version'] = new_version
+        baseline['generated'] = datetime.now().isoformat()
+        baseline['plugins'].append(plugin_slug)
+        
+        # Write updated baseline
+        with open(baseline_file, 'w') as f:
+            json.dump(baseline, f, indent=2)
+        
+        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
+        
+        # Git commit
+        commit_msg = f"Baseline v{new_version}: Added plugin {plugin_slug}"
+        if infra.git_commit_baseline(commit_msg):
+            Log.info(self, f"✅ Git: {commit_msg}")
+        
+        # Apply to sites if requested
+        if apply_now:
+            Log.info(self, "")
+            Log.info(self, "Applying to all sites...")
+            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
+        else:
+            Log.info(self, "")
+            Log.info(self, "Plugin added to baseline.")
+            Log.info(self, "Sites will pick up changes on next admin visit,")
+            Log.info(self, "or run: wo multitenancy baseline apply")
+
+
+    @expose(help="Add theme to baseline")
+    def add_theme(self):
+        """
+        Add a theme to the baseline configuration
+        
+        This command downloads a theme from WordPress.org, GitHub, or a direct URL,
+        adds it to the baseline configuration, and optionally sets it as the default theme.
+        
+        Usage:
+            wo multitenancy baseline add-theme <slug>                    # From WordPress.org
+            wo multitenancy baseline add-theme <slug> --github=user/repo # From GitHub
+            wo multitenancy baseline add-theme <slug> --url=https://...  # From direct URL
+            wo multitenancy baseline add-theme <slug> --set-default      # Set as default
+            wo multitenancy baseline add-theme <slug> --apply-now        # Apply immediately
+        """
+        pargs = self.app.pargs
+        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
+        set_default = pargs.set_default
+        apply_now = pargs.apply_now
+        
+        # Phase 3: Get source-specific arguments
+        github_repo = pargs.github
+        branch = pargs.branch
+        tag = pargs.tag
+        url = pargs.url
+        
+        # Validate arguments
+        if not theme_slug:
+            Log.error(self, "Theme slug is required")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        # Validate: only one source method allowed
+        source_count = sum([bool(github_repo), bool(url)])
+        if source_count > 1:
+            Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
+        
+        # Validate: branch/tag only valid with GitHub
+        if (branch or tag) and not github_repo:
+            Log.error(self, "--branch and --tag can only be used with --github")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Determine and display source
+        if github_repo:
+            source_info = f"from GitHub: {github_repo}"
+            if tag:
+                source_info += f" (tag: {tag})"
+            elif branch:
+                source_info += f" (branch: {branch})"
+        elif url:
+            source_info = f"from URL: {url}"
+        else:
+            source_info = "from WordPress.org"
+        
+        Log.info(self, f"Adding theme: {theme_slug} {source_info}")
+        
+        # Download theme using appropriate method
+        infra = SharedInfrastructure(self, shared_root)
+        
+        if github_repo:
+            # Download from GitHub
+            success = infra.download_theme_from_github(
+                github_repo, 
+                theme_slug, 
+                branch=branch, 
+                tag=tag
+            )
+        elif url:
+            # Download from direct URL
+            success = infra.download_theme_from_url(url, theme_slug)
+        else:
+            # Download from WordPress.org (default)
+            infra.download_theme(theme_slug)
+            success = True  # download_theme doesn't return bool, check directory instead
+        
+        # Verify theme was downloaded
+        theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
+        if not os.path.exists(theme_dir):
+            Log.error(self, f"Failed to download theme: {theme_slug}")
+            Log.error(self, "")
+            Log.error(self, "Possible causes:")
+            Log.error(self, "  - Theme doesn't exist at the source")
+            Log.error(self, "  - Network connectivity issue")
+            Log.error(self, "  - Invalid GitHub repo or URL")
+            Log.error(self, "  - Disk space full")
+            return
+        
+        Log.info(self, f"✅ Downloaded {theme_slug}")
+        
+        # Update baseline.json
+        baseline_file = f"{shared_root}/config/baseline.json"
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        old_version = baseline.get('version', 1)
+        new_version = old_version + 1
+        
+        baseline['version'] = new_version
+        baseline['generated'] = datetime.now().isoformat()
+        
+        if set_default:
+            old_theme = baseline.get('theme', 'none')
+            baseline['theme'] = theme_slug
+            Log.info(self, f"✅ Set as default theme (was: {old_theme})")
+        
+        # Write updated baseline
+        with open(baseline_file, 'w') as f:
+            json.dump(baseline, f, indent=2)
+        
+        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
+        
+        # Git commit
+        if set_default:
+            commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
+        else:
+            commit_msg = f"Baseline v{new_version}: Added theme {theme_slug}"
+        
+        if infra.git_commit_baseline(commit_msg):
+            Log.info(self, f"✅ Git: {commit_msg}")
+        
+        # Apply to sites if requested
+        if apply_now and set_default:
+            Log.info(self, "")
+            Log.info(self, "Applying to all sites...")
+            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
+        else:
+            Log.info(self, "")
+            Log.info(self, "Theme added to baseline.")
+            if set_default:
+                Log.info(self, "Sites will use this theme on next admin visit,")
+                Log.info(self, "or run: wo multitenancy baseline apply")
+
+
+    @expose(help="Remove plugin from baseline")
+    def remove_plugin(self):
+        """Remove a plugin from the baseline"""
         pargs = self.app.pargs
         plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
         apply_now = pargs.apply_now
         
         if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
+            Log.error(self, "Multi-tenancy not initialized")
         
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         
-        Log.info(self, f"Adding plugin: {plugin_slug}")
+        Log.info(self, f"Removing plugin: {plugin_slug}")
         
-        # Download plugin
+        # Update baseline.json
+        baseline_file = f"{shared_root}/config/baseline.json"
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        # Check if plugin is in baseline
+        if plugin_slug not in baseline.get('plugins', []):
+            Log.error(self, f"Plugin {plugin_slug} not in baseline")
+        
+        old_version = baseline.get('version', 1)
+        new_version = old_version + 1
+        
+        baseline['version'] = new_version
+        baseline['generated'] = datetime.now().isoformat()
+        baseline['plugins'].remove(plugin_slug)
+        
+        # Write updated baseline
+        with open(baseline_file, 'w') as f:
+            json.dump(baseline, f, indent=2)
+        
+        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
+        
+        # Git commit
         infra = SharedInfrastructure(self, shared_root)
+        commit_msg = f"Baseline v{new_version}: Removed plugin {plugin_slug}"
+        if infra.git_commit_baseline(commit_msg):
+            Log.info(self, f"✅ Git: {commit_msg}")
+        
+        Log.info(self, "")
+        Log.info(self, f"Plugin {plugin_slug} removed from baseline.")
+        Log.info(self, "Note: Plugin files kept for potential rollback.")
+        
+        if apply_now:
+            Log.warn(self, "Immediate deactivation not yet implemented in Phase 1")
+            Log.info(self, "Sites will stop using plugin on next baseline sync")
+
+    @expose(help="Remove theme from baseline")
+    def remove_theme(self):
+        """Remove a theme from baseline default"""
+        pargs = self.app.pargs
+        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Update baseline.json
+        baseline_file = f"{shared_root}/config/baseline.json"
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        # Check if this is the current default theme
+        current_theme = baseline.get('theme')
+        if current_theme != theme_slug:
+            Log.error(self, f"Theme {theme_slug} is not the current default theme (current: {current_theme})")
+        
+        Log.warn(self, f"Removing default theme: {theme_slug}")
+        Log.warn(self, "You should set a new default theme first!")
+        Log.error(self, "Use: wo multitenancy baseline add-theme <new-theme> --set-default")
+
+    @expose(help="Apply current baseline to all sites")
+    def apply(self):
+        """Apply baseline to all sites immediately"""
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        baseline_file = f"{shared_root}/config/baseline.json"
+        
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        baseline_version = baseline.get('version', 1)
+        
+        Log.info(self, f"Applying baseline v{baseline_version} to all sites...")
+        BaselineApplicator.apply_baseline_to_sites(self, config, baseline_version)
+
+    @expose(help="Remove multi-tenancy infrastructure (dangerous)")
+    def remove(self):
+        """Remove multi-tenancy infrastructure"""
+        pargs = self.app.pargs
+        
+        if not MTDatabase.is_initialized(self):
+            Log.info(self, "Multi-tenancy not initialized")
+            return
+        
+        shared_sites = MTDatabase.get_shared_sites(self)
+        
+        if shared_sites and not pargs.force:
+            Log.error(self, f"Cannot remove: {len(shared_sites)} sites still using shared core")
+            Log.error(self, "Remove or convert all shared sites first")
+            return
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        Log.warn(self, "This will remove all shared WordPress infrastructure!")
+        if not pargs.force:
+            confirm = input("Type 'REMOVE' to confirm: ")
+            if confirm != 'REMOVE':
+                Log.info(self, "Removal cancelled")
+                return
+        
+        try:
+            # Remove shared directory
+            if os.path.exists(shared_root):
+                shutil.rmtree(shared_root)
+                Log.info(self, f"Removed {shared_root}")
+            
+            # Clean up database
+            MTDatabase.cleanup(self)
+            Log.info(self, "Cleaned up database")
+            
+            Log.info(self, "✅ Multi-tenancy infrastructure removed")
+            
+        except Exception as e:
+            Log.error(self, f"Removal failed: {str(e)}")
+
+
+    # ==========================================
+    # PHASE 3: Additional Baseline Commands
+    # ==========================================
+    
+    @expose(help="Set default theme for all sites")
+    def set_theme(self):
+        """
+        Set the default theme in baseline configuration
+        
+        This standalone command sets a theme as the default for all sites.
+        The theme must already exist in the shared themes directory.
+        
+        Usage:
+            wo multitenancy baseline set-theme <slug>
+            wo multitenancy baseline set-theme <slug> --apply-now
+        """
+        pargs = self.app.pargs
+        theme_slug = pargs.theme_slug or pargs.site_name
+        apply_now = pargs.apply_now
+        
+        if not theme_slug:
+            Log.error(self, "Theme slug is required")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Validate theme exists on disk
+        theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
+        if not os.path.exists(theme_dir):
+            Log.error(self, f"Theme not found: {theme_slug}")
+            Log.error(self, f"Add it first with: wo multitenancy baseline add-theme {theme_slug}")
+        
+        Log.info(self, f"Setting default theme: {theme_slug}")
+        
+        # Update baseline.json
+        baseline_file = f"{shared_root}/config/baseline.json"
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        old_theme = baseline.get('theme', 'none')
+        old_version = baseline.get('version', 1)
+        new_version = old_version + 1
+        
+        # Update baseline with new theme
+        baseline['version'] = new_version
+        baseline['theme'] = theme_slug
+        baseline['generated'] = datetime.now().isoformat()
+        
+        # Write updated baseline
+        with open(baseline_file, 'w') as f:
+            json.dump(baseline, f, indent=2)
+        
+        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
+        Log.info(self, f"   Theme: {old_theme} → {theme_slug}")
+        
+        # Git commit
+        infra = SharedInfrastructure(self, shared_root)
+        commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
+        if infra.git_commit_baseline(commit_msg):
+            Log.info(self, f"✅ Git: {commit_msg}")
+        
+        # Apply to sites if requested
+        if apply_now:
+            Log.info(self, "")
+            Log.info(self, "Applying to all sites...")
+            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
+        else:
+            Log.info(self, "")
+            Log.info(self, "Theme set in baseline.")
+            Log.info(self, "Sites will use this theme on next admin visit,")
+            Log.info(self, "or run: wo multitenancy baseline apply")
+    
+    @expose(help="Show baseline change history")
+    def history(self):
+        """
+        Display git log of baseline configuration changes
+        
+        This command shows the version history of baseline.json,
+        including what was changed and when.
+        
+        Usage:
+            wo multitenancy baseline history
+        """
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        git_dir = f"{shared_root}/.git"
+        if not os.path.exists(git_dir):
+            Log.error(self, "Git tracking not initialized")
+            Log.error(self, "History is only available for systems initialized with git support")
+        
+        Log.info(self, "Baseline Change History:")
+        Log.info(self, "=" * 60)
+        
+        try:
+            # Get git log for baseline.json (last 20 commits)
+            result = subprocess.run(
+                ['git', 'log', '--oneline', '--decorate', '-20', 
+                 'config/baseline.json'],
+                cwd=shared_root,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            if result.stdout:
+                # Display the git log output
+                Log.info(self, result.stdout.strip())
+            else:
+                Log.info(self, "No history yet")
+            
+            Log.info(self, "=" * 60)
+            Log.info(self, "")
+            Log.info(self, "View full history: cd /var/www/shared && git log config/baseline.json")
+            Log.info(self, "View specific commit: git show <commit-hash>")
+            Log.info(self, "Compare versions: git diff <commit1> <commit2> config/baseline.json")
+            
+        except subprocess.CalledProcessError as e:
+            Log.error(self, f"Failed to get history: {e}")
+        except Exception as e:
+            Log.error(self, f"Error accessing git history: {e}")
+    
+    @expose(help="Rollback baseline to previous version")
+    def baseline_rollback(self):
+        """
+        Rollback baseline configuration to a previous version
+        
+        This command reverts baseline.json to a previous version using git.
+        You can rollback by version number or git commit hash.
+        
+        IMPORTANT: This is different from 'wo multitenancy rollback' which 
+        rolls back WordPress core files.
+        
+        Usage:
+            wo multitenancy baseline baseline-rollback --to-version=5
+            wo multitenancy baseline baseline-rollback --to-commit=abc123
+            wo multitenancy baseline baseline-rollback --to-version=5 --apply-now
+        """
+        pargs = self.app.pargs
+        to_version = pargs.to_version
+        to_commit = pargs.to_commit
+        apply_now = pargs.apply_now
+        
+        # Validate arguments
+        if not to_version and not to_commit:
+            Log.error(self, "Specify --to-version=N or --to-commit=HASH")
+            Log.error(self, "")
+            Log.error(self, "Examples:")
+            Log.error(self, "  wo multitenancy baseline baseline-rollback --to-version=5")
+            Log.error(self, "  wo multitenancy baseline baseline-rollback --to-commit=abc123")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        baseline_file = f"{shared_root}/config/baseline.json"
+        
+        # Check git exists
+        git_dir = f"{shared_root}/.git"
+        if not os.path.exists(git_dir):
+            Log.error(self, "Git tracking not initialized")
+            Log.error(self, "Cannot rollback without git history")
+        
+        # Read current baseline
+        with open(baseline_file, 'r') as f:
+            current = json.load(f)
+        
+        current_version = current.get('version', 0)
+        
+        Log.warn(self, "Baseline Rollback")
+        Log.warn(self, f"Current version: {current_version}")
+        Log.warn(self, "")
+        
+        try:
+            # If version specified, find the corresponding commit
+            if to_version:
+                # Search git log for the version
+                result = subprocess.run(
+                    ['git', 'log', '--all', '--grep', f'Baseline v{to_version}:', 
+                     '--format=%H', '-1', 'config/baseline.json'],
+                    cwd=shared_root,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                to_commit = result.stdout.strip()
+                
+                if not to_commit:
+                    Log.error(self, f"Version {to_version} not found in git history")
+                    Log.error(self, "")
+                    Log.error(self, "View available versions:")
+                    Log.error(self, "  wo multitenancy baseline history")
+            
+            # Show what we're rolling back to
+            result = subprocess.run(
+                ['git', 'show', '--stat', '--oneline', to_commit, '--', 'config/baseline.json'],
+                cwd=shared_root,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            Log.info(self, "Rolling back to:")
+            # Show first few lines of git show output
+            output_lines = result.stdout.split('\n')[:10]
+            for line in output_lines:
+                Log.info(self, f"  {line}")
+            
+            if len(result.stdout.split('\n')) > 10:
+                Log.info(self, "  ...")
+            
+            Log.info(self, "")
+            
+            # Confirm with user (unless forced)
+            if not pargs.force:
+                confirm = input("Proceed with rollback? [y/N]: ").strip().lower()
+                if confirm != 'y':
+                    Log.info(self, "Rollback cancelled")
+                    return
+            
+            # Perform rollback by checking out the specific file from that commit
+            subprocess.run(
+                ['git', 'checkout', to_commit, '--', 'config/baseline.json'],
+                cwd=shared_root,
+                capture_output=True,
+                check=True
+            )
+            
+            # Read the rolled-back baseline
+            with open(baseline_file, 'r') as f:
+                rolled_back = json.load(f)
+            
+            rollback_version = rolled_back.get('version', 0)
+            
+            # Create a new commit documenting the rollback
+            subprocess.run(
+                ['git', 'add', 'config/baseline.json'],
+                cwd=shared_root,
+                capture_output=True
+            )
+            subprocess.run(
+                ['git', 'commit', '-m', 
+                 f'Rollback: Restored baseline to v{rollback_version}'],
+                cwd=shared_root,
+                capture_output=True
+            )
+            
+            Log.info(self, f"✅ Rolled back to version {rollback_version}")
+            
+            # Apply if requested
+            if apply_now:
+                Log.info(self, "")
+                Log.info(self, "Applying rollback to all sites...")
+                BaselineApplicator.apply_baseline_to_sites(self, config, rollback_version)
+            else:
+                Log.info(self, "")
+                Log.info(self, "Baseline rolled back in configuration.")
+                Log.info(self, f"Sites are still on v{current_version}.")
+                Log.info(self, "Run: wo multitenancy baseline apply")
+            
+        except subprocess.CalledProcessError as e:
+            Log.error(self, f"Rollback failed: {e}")
+            Log.error(self, "The baseline.json may be in an inconsistent state")
+            Log.error(self, "You can restore it with: cd /var/www/shared && git checkout HEAD config/baseline.json")
+        except Exception as e:
+            Log.error(self, f"Error during rollback: {e}")
+    
+    @expose(help="Remove quarantine status and retry baseline")
+    def unquarantine(self):
+        """
+        Unquarantine a site and retry baseline application
+        
+        This command removes the quarantine flag from a site and attempts
+        to apply the current baseline again. Use this after fixing issues
+        that caused the site to be quarantined.
+        
+        Usage:
+            wo multitenancy baseline unquarantine <domain>
+        """
+        pargs = self.app.pargs
+        domain = pargs.site_name
+        
+        if not domain:
+            Log.error(self, "Domain is required")
+            Log.error(self, "Usage: wo multitenancy baseline unquarantine <domain>")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+        
+        # Check if site exists and is quarantined
+        from wo.core.database import db_session
+        from wo.cli.plugins.multitenancy_db import MultitenancySite
+        session = db_session
+        
+        site = session.query(MultitenancySite).filter_by(domain=domain).first()
+        
+        if not site:
+            Log.error(self, f"Site not found: {domain}")
+            Log.error(self, "Check spelling or run: wo multitenancy list")
+        
+        if not site.is_quarantined:
+            Log.info(self, f"Site {domain} is not quarantined")
+            Log.info(self, "No action needed.")
+            return
+        
+        # Show quarantine details
+        Log.info(self, f"Unquarantining: {domain}")
+        Log.info(self, f"Previous error: {site.quarantine_reason}")
+        Log.info(self, f"Quarantined on: {site.quarantine_date}")
+        Log.info(self, "")
+        
+        # Remove quarantine status
+        MTDatabase.unquarantine_site(self, domain)
+        Log.info(self, "✅ Quarantine status removed")
+        
+        # Get current baseline
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        baseline_file = f"{shared_root}/config/baseline.json"
+        
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+        
+        baseline_version = baseline.get('version', 0)
+        
+        # Retry baseline application
+        Log.info(self, f"Retrying baseline v{baseline_version}...")
+        Log.info(self, "")
+        
+        result = BaselineApplicator.apply_baseline_to_site(
+            self,
+            domain,
+            site.site_path,
+            baseline
+        )
+        
+        if result['success']:
+            # Update version in database
+            site.baseline_version = baseline_version
+            session.commit()
+            
+            Log.info(self, "")
+            Log.info(self, f"✅ Successfully applied baseline to {domain}")
+            Log.info(self, "Site is now up to date and no longer quarantined")
+        else:
+            # Re-quarantine with new error
+            MTDatabase.mark_site_quarantined(self, domain, result['error'])
+            Log.error(self, "")
+            Log.error(self, f"Failed again: {result['error']}")
+            Log.error(self, "Site has been re-quarantined")
+            Log.error(self, "")
+            Log.error(self, "Troubleshooting steps:")
+            Log.error(self, f"  1. Check the site is accessible: curl -I http://{domain}")
+            Log.error(self, f"  2. Check WP-CLI works: wp --info --path={site.site_path}")
+            Log.error(self, f"  3. Check plugin files exist in /var/www/shared/wp-content/plugins/")
+            Log.error(self, "  4. Check site error logs for more details")
+
+
+
+def load(app):
+    """Load the multi-tenancy plugin"""
+    app.handler.register(WOMultitenancyController)
+    app.hook.register('post_setup', wo_multitenancy_hook)
