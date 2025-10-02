@@ -1722,6 +1722,47 @@ class BaselineApplicator:
         
         with open(baseline_file, 'r') as f:
             baseline = json.load(f)
+
+        # *** PHASE 2: TEST ON STAGING SITE FIRST ***
+        staging_site = MTDatabase.get_staging_site(app)
+        
+        if staging_site:
+            Log.info(app, f"Testing on staging site: {staging_site['domain']}...")
+            
+            result = BaselineApplicator.apply_baseline_to_site(
+                app,
+                staging_site['domain'],
+                staging_site['site_path'],
+                baseline
+            )
+            
+            if not result['success']:
+                Log.error(app, "=" * 60)
+                Log.error(app, f"❌ STAGING TEST FAILED: {result['error']}")
+                Log.error(app, "=" * 60)
+                Log.error(app, "Aborting production rollout!")
+                Log.error(app, f"Fix the issue on staging site: {staging_site['domain']}")
+                Log.error(app, "Then try again.")
+                return
+            
+            Log.info(app, "✅ Staging test PASSED")
+            Log.info(app, "")
+        else:
+            Log.warn(app, "⚠️  No staging site found")
+            Log.warn(app, "   Skipping pre-production test (NOT RECOMMENDED)")
+            Log.warn(app, "   Create one with: wo multitenancy staging create <domain>")
+            Log.warn(app, "")
+            
+            # Ask for confirmation
+            if not hasattr(app.pargs, 'force') or not app.pargs.force:
+                try:
+                    confirm = input("Continue without staging test? [y/N]: ").strip().lower()
+                    if confirm != 'y':
+                        Log.info(app, "Aborted by user")
+                        return
+                except:
+                    pass  # If input fails (non-interactive), continue
+        
         
         # Get all production sites (not staging, not quarantined)
         from wo.core.database import db_session

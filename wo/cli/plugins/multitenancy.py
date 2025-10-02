@@ -26,7 +26,7 @@ from wo.core.sslutils import SSL
 from wo.core.variables import WOVar
 from wo.core.acme import WOAcme
 from wo.cli.plugins.multitenancy_functions import (
-    MTFunctions, SharedInfrastructure, ReleaseManager
+    MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator
 )
 from wo.cli.plugins.multitenancy_db import MTDatabase
 
@@ -636,6 +636,262 @@ class WOMultitenancyController(CementBaseController):
         else:
             Log.error(self, "Baseline configuration not found")
 
+    @expose(help="Validate baseline configuration and site status")
+    def validate(self):
+        """Validate baseline integrity and site compliance"""
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+            return
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        baseline_file = f"{shared_root}/config/baseline.json"
+        
+        Log.info(self, "Validating Baseline Configuration...")
+        Log.info(self, "=" * 60)
+        
+        # 1. Check baseline.json exists and is valid JSON
+        try:
+            with open(baseline_file, 'r') as f:
+                baseline = json.load(f)
+            Log.info(self, "✅ Baseline JSON valid")
+        except FileNotFoundError:
+            Log.error(self, "❌ Baseline file not found")
+            return
+        except json.JSONDecodeError as e:
+            Log.error(self, f"❌ Baseline JSON invalid: {e}")
+            return
+        
+        baseline_version = baseline.get('version', 0)
+        Log.info(self, f"   Current version: {baseline_version}")
+        Log.info(self, "")
+        
+        # 2. Check plugins exist on disk
+        plugins = baseline.get('plugins', [])
+        Log.info(self, "Plugin Validation:")
+        
+        missing_plugins = []
+        for plugin_slug in plugins:
+            plugin_dir = f"{shared_root}/wp-content/plugins/{plugin_slug}"
+            
+            if os.path.exists(plugin_dir):
+                Log.info(self, f"   ✅ {plugin_slug}")
+            else:
+                Log.warn(self, f"   ❌ {plugin_slug} - NOT FOUND ON DISK")
+                missing_plugins.append(plugin_slug)
+        
+        if not plugins:
+            Log.info(self, "   No baseline plugins configured")
+        
+        Log.info(self, "")
+        
+        # 3. Check theme exists
+        theme_slug = baseline.get('theme')
+        if theme_slug:
+            Log.info(self, "Theme Validation:")
+            theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
+            
+            if os.path.exists(theme_dir):
+                Log.info(self, f"   ✅ {theme_slug}")
+            else:
+                Log.warn(self, f"   ❌ {theme_slug} - NOT FOUND ON DISK")
+            
+            Log.info(self, "")
+        
+        # 4. Check site baseline versions
+        from wo.core.database import db_session
+        from wo.cli.plugins.multitenancy_db import MultitenancySite
+        
+        session = db_session
+        sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
+        production_sites = [s for s in sites if not getattr(s, 'is_staging', False)]
+        
+        outdated_sites = []
+        for site in production_sites:
+            site_version = getattr(site, 'baseline_version', 0)
+            if site_version < baseline_version:
+                outdated_sites.append((site.domain, site_version))
+        
+        if outdated_sites:
+            Log.warn(self, f"⚠️  {len(outdated_sites)} site(s) behind baseline:")
+            for domain, version in outdated_sites[:10]:  # Show first 10
+                Log.warn(self, f"   - {domain} (version {version}, should be {baseline_version})")
+            
+            if len(outdated_sites) > 10:
+                Log.warn(self, f"   ... and {len(outdated_sites) - 10} more")
+            
+            Log.info(self, "")
+            Log.info(self, "   Run: wo multitenancy baseline apply")
+        else:
+            Log.info(self, f"✅ All {len(production_sites)} production sites up to date")
+            Log.info(self, "")
+        
+        # 5. Check quarantined sites
+        quarantined = MTDatabase.get_quarantined_sites(self)
+        
+        if quarantined:
+            Log.warn(self, f"⚠️  {len(quarantined)} quarantined site(s):")
+            for site in quarantined:
+                Log.warn(self, f"   - {site['domain']}")
+                Log.warn(self, f"     Reason: {site['quarantine_reason']}")
+                if site.get('quarantine_date'):
+                    Log.warn(self, f"     Date: {site['quarantine_date']}")
+            
+            Log.info(self, "")
+            Log.info(self, "   Fix issues manually, then remove quarantine:")
+            Log.info(self, "   wo multitenancy baseline unquarantine <domain>")
+            Log.info(self, "")
+        
+        # 6. Summary
+        Log.info(self, "=" * 60)
+        
+        if missing_plugins:
+            Log.error(self, f"❌ VALIDATION FAILED: {len(missing_plugins)} plugin(s) missing from disk")
+            Log.error(self, "   This will cause activation failures!")
+            Log.error(self, "   Fix: Install missing plugins or remove from baseline")
+        elif outdated_sites or quarantined:
+            Log.warn(self, "⚠️  ATTENTION NEEDED: Some sites require updates")
+        else:
+            Log.info(self, "✅ VALIDATION PASSED: Baseline is healthy")
+        
+        Log.info(self, "=" * 60)
+
+
+
+
+    @expose(help="Create staging site for testing baseline changes")
+    def staging(self):
+        """Create or manage staging site"""
+        pargs = self.app.pargs
+        domain = pargs.site_name
+        
+        if not domain:
+            Log.error(self, "Usage: wo multitenancy staging <domain>")
+            return
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+            return
+        
+        # Check if staging site already exists
+        existing = MTDatabase.get_staging_site(self)
+        if existing:
+            Log.error(self, f"Staging site already exists: {existing['domain']}")
+            Log.error(self, "Delete it first: wo site delete {existing['domain']}")
+            return
+        
+        Log.info(self, f"Creating staging site: {domain}")
+        Log.info(self, "This will create a regular site and mark it as staging...")
+        Log.info(self, "")
+        
+        # Create site using existing create command logic
+        # Simply call the create method with shared flag
+        original_site_name = pargs.site_name
+        pargs.shared = True
+        
+        try:
+            self.create()
+            
+            # Mark as staging in database
+            from wo.core.database import db_session
+            from wo.cli.plugins.multitenancy_db import MultitenancySite
+            
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            if site:
+                site.is_staging = True
+                site.updated_at = datetime.now()
+                session.commit()
+                
+                Log.info(self, "")
+                Log.info(self, "✅ Marked as staging site")
+                Log.info(self, "")
+                Log.info(self, "Use this site to test baseline changes before production.")
+                Log.info(self, "Test with: wo multitenancy baseline add-plugin <plugin> --apply-now")
+            else:
+                Log.warn(self, "Site created but could not mark as staging")
+                
+        except Exception as e:
+            Log.error(self, f"Failed to create staging site: {e}")
+        finally:
+            pargs.site_name = original_site_name
+    @expose(help="Delete a multitenancy site and its tracking")
+    def delete(self):
+        """Delete a site from multitenancy system"""
+        pargs = self.app.pargs
+        domain = pargs.site_name
+        
+        if not domain:
+            Log.error(self, "Usage: wo multitenancy delete <domain>")
+            return
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+            return
+        
+        # Check if site exists in tracking
+        from wo.core.database import db_session
+        from wo.cli.plugins.multitenancy_db import MultitenancySite
+        
+        session = db_session
+        site = session.query(MultitenancySite).filter_by(domain=domain).first()
+        
+        if not site:
+            Log.error(self, f"Site {domain} not found in multitenancy tracking")
+            Log.info(self, "Use: wo site delete {domain} for regular sites")
+            return
+        
+        is_staging = getattr(site, 'is_staging', False)
+        
+        # Confirm deletion
+        if not pargs.force:
+            site_type = "STAGING" if is_staging else "PRODUCTION"
+            Log.warn(self, f"This will delete {site_type} site: {domain}")
+            confirm = input("Continue? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                Log.info(self, "Aborted")
+                return
+        
+        Log.info(self, f"Deleting site: {domain}")
+        
+        # Delete the site using regular WO command
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['wo', 'site', 'delete', domain, '--no-prompt'],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            
+            if result.returncode != 0:
+                Log.error(self, f"Failed to delete site: {result.stderr}")
+                return
+            
+            Log.info(self, "✅ Site files and database deleted")
+            
+        except Exception as e:
+            Log.error(self, f"Error deleting site: {e}")
+            return
+        
+        # Remove from multitenancy tracking
+        try:
+            session.delete(site)
+            session.commit()
+            Log.info(self, "✅ Removed from multitenancy tracking")
+            
+            if is_staging:
+                Log.info(self, "")
+                Log.info(self, "Staging site deleted. You can create a new one with:")
+                Log.info(self, "  wo multitenancy staging <domain>")
+            
+        except Exception as e:
+            Log.error(self, f"Error removing from tracking: {e}")
+            Log.warn(self, "Site deleted but tracking entry remains")
+            Log.warn(self, f"Manually clean up with: sqlite3 /var/lib/wo/dbase.db \"DELETE FROM multitenancy_sites WHERE domain = '{domain}';\"")
+
+
     @expose(help="Add plugin to baseline")
     def add_plugin(self):
         """Add a plugin to the baseline"""
@@ -653,259 +909,3 @@ class WOMultitenancyController(CementBaseController):
         
         # Download plugin
         infra = SharedInfrastructure(self, shared_root)
-        infra.download_plugin(plugin_slug)
-        
-        # Verify plugin was downloaded
-        plugin_dir = f"{shared_root}/wp-content/plugins/{plugin_slug}"
-        if not os.path.exists(plugin_dir):
-            Log.error(self, f"Failed to download plugin: {plugin_slug}")
-        
-        Log.info(self, f"✅ Downloaded {plugin_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if already in baseline
-        if plugin_slug in baseline.get('plugins', []):
-            Log.error(self, f"Plugin {plugin_slug} already in baseline")
-        
-        # Increment version and add plugin
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        baseline['plugins'].append(plugin_slug)
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        commit_msg = f"Baseline v{new_version}: Added plugin {plugin_slug}"
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-        
-        # Apply to sites if requested
-        if apply_now:
-            Log.info(self, "")
-            Log.info(self, "Applying to all sites...")
-            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
-        else:
-            Log.info(self, "")
-            Log.info(self, "Plugin added to baseline.")
-            Log.info(self, "Sites will pick up changes on next admin visit,")
-            Log.info(self, "or run: wo multitenancy baseline apply")
-
-    @expose(help="Add theme to baseline")
-    def add_theme(self):
-        """Add a theme to the baseline"""
-        pargs = self.app.pargs
-        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
-        set_default = pargs.set_default
-        apply_now = pargs.apply_now
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        Log.info(self, f"Adding theme: {theme_slug}")
-        
-        # Download theme
-        infra = SharedInfrastructure(self, shared_root)
-        infra.download_theme(theme_slug)
-        
-        # Verify theme was downloaded
-        theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
-        if not os.path.exists(theme_dir):
-            Log.error(self, f"Failed to download theme: {theme_slug}")
-        
-        Log.info(self, f"✅ Downloaded {theme_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        
-        if set_default:
-            old_theme = baseline.get('theme', 'none')
-            baseline['theme'] = theme_slug
-            Log.info(self, f"✅ Set as default theme (was: {old_theme})")
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        if set_default:
-            commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
-        else:
-            commit_msg = f"Baseline v{new_version}: Added theme {theme_slug}"
-        
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-        
-        # Apply to sites if requested
-        if apply_now and set_default:
-            Log.info(self, "")
-            Log.info(self, "Applying to all sites...")
-            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
-        else:
-            Log.info(self, "")
-            Log.info(self, "Theme added to baseline.")
-
-    @expose(help="Remove plugin from baseline")
-    def remove_plugin(self):
-        """Remove a plugin from the baseline"""
-        pargs = self.app.pargs
-        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
-        apply_now = pargs.apply_now
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        Log.info(self, f"Removing plugin: {plugin_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if plugin is in baseline
-        if plugin_slug not in baseline.get('plugins', []):
-            Log.error(self, f"Plugin {plugin_slug} not in baseline")
-        
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        baseline['plugins'].remove(plugin_slug)
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        infra = SharedInfrastructure(self, shared_root)
-        commit_msg = f"Baseline v{new_version}: Removed plugin {plugin_slug}"
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-        
-        Log.info(self, "")
-        Log.info(self, f"Plugin {plugin_slug} removed from baseline.")
-        Log.info(self, "Note: Plugin files kept for potential rollback.")
-        
-        if apply_now:
-            Log.warn(self, "Immediate deactivation not yet implemented in Phase 1")
-            Log.info(self, "Sites will stop using plugin on next baseline sync")
-
-    @expose(help="Remove theme from baseline")
-    def remove_theme(self):
-        """Remove a theme from baseline default"""
-        pargs = self.app.pargs
-        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if this is the current default theme
-        current_theme = baseline.get('theme')
-        if current_theme != theme_slug:
-            Log.error(self, f"Theme {theme_slug} is not the current default theme (current: {current_theme})")
-        
-        Log.warn(self, f"Removing default theme: {theme_slug}")
-        Log.warn(self, "You should set a new default theme first!")
-        Log.error(self, "Use: wo multitenancy baseline add-theme <new-theme> --set-default")
-
-    @expose(help="Apply current baseline to all sites")
-    def apply(self):
-        """Apply baseline to all sites immediately"""
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        baseline_file = f"{shared_root}/config/baseline.json"
-        
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        baseline_version = baseline.get('version', 1)
-        
-        Log.info(self, f"Applying baseline v{baseline_version} to all sites...")
-        BaselineApplicator.apply_baseline_to_sites(self, config, baseline_version)
-
-    @expose(help="Remove multi-tenancy infrastructure (dangerous)")
-    def remove(self):
-        """Remove multi-tenancy infrastructure"""
-        pargs = self.app.pargs
-        
-        if not MTDatabase.is_initialized(self):
-            Log.info(self, "Multi-tenancy not initialized")
-            return
-        
-        shared_sites = MTDatabase.get_shared_sites(self)
-        
-        if shared_sites and not pargs.force:
-            Log.error(self, f"Cannot remove: {len(shared_sites)} sites still using shared core")
-            Log.error(self, "Remove or convert all shared sites first")
-            return
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        Log.warn(self, "This will remove all shared WordPress infrastructure!")
-        if not pargs.force:
-            confirm = input("Type 'REMOVE' to confirm: ")
-            if confirm != 'REMOVE':
-                Log.info(self, "Removal cancelled")
-                return
-        
-        try:
-            # Remove shared directory
-            if os.path.exists(shared_root):
-                shutil.rmtree(shared_root)
-                Log.info(self, f"Removed {shared_root}")
-            
-            # Clean up database
-            MTDatabase.cleanup(self)
-            Log.info(self, "Cleaned up database")
-            
-            Log.info(self, "✅ Multi-tenancy infrastructure removed")
-            
-        except Exception as e:
-            Log.error(self, f"Removal failed: {str(e)}")
-
-
-def load(app):
-    """Load the multi-tenancy plugin"""
-    app.handler.register(WOMultitenancyController)
-    app.hook.register('post_setup', wo_multitenancy_hook)

@@ -66,9 +66,67 @@ class MTDatabase:
             
             Log.debug(app, "Multi-tenancy database tables initialized")
             
+            # *** PHASE 2 MIGRATION: Add new columns if they don't exist ***
+            from sqlalchemy import text, inspect
+            
+            try:
+                inspector = inspect(db_session.bind)
+                existing_columns = [col['name'] for col in inspector.get_columns('multitenancy_sites')]
+                
+                migration_needed = False
+                
+                if 'is_staging' not in existing_columns:
+                    migration_needed = True
+                    Log.info(app, "Running Phase 2 database migration...")
+                    
+                    # Add columns one by one with proper error handling
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites 
+                            ADD COLUMN is_staging BOOLEAN DEFAULT 0
+                        """))
+                        Log.debug(app, "Added is_staging column")
+                    except Exception:
+                        pass  # Column might already exist
+                    
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites 
+                            ADD COLUMN is_quarantined BOOLEAN DEFAULT 0
+                        """))
+                        Log.debug(app, "Added is_quarantined column")
+                    except Exception:
+                        pass
+                    
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites 
+                            ADD COLUMN quarantine_reason TEXT
+                        """))
+                        Log.debug(app, "Added quarantine_reason column")
+                    except Exception:
+                        pass
+                    
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites 
+                            ADD COLUMN quarantine_date DATETIME
+                        """))
+                        Log.debug(app, "Added quarantine_date column")
+                    except Exception:
+                        pass
+                    
+                    db_session.commit()
+                    Log.info(app, "✅ Phase 2 database migration completed")
+                    Log.info(app, "   Added: is_staging, is_quarantined, quarantine_reason, quarantine_date")
+                
+            except Exception as migration_error:
+                Log.debug(app, f"Migration check/execution: {migration_error}")
+                # Don't fail initialization if migration fails
+            
         except Exception as e:
             Log.debug(app, f"Failed to initialize multi-tenancy tables: {e}")
-    
+
     @staticmethod
     def is_initialized(app):
         """Check if multi-tenancy is initialized"""
