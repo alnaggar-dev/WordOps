@@ -1839,3 +1839,471 @@ add_action('init', function() {
         for plugin in config.get('baseline_plugins', []):
             self.download_plugin(plugin)
     
+    def set_permissions(self):
+        """Set proper permissions on shared infrastructure"""
+        
+        # Set ownership
+        try:
+            subprocess.run([
+                'chown', '-R', 'www-data:www-data', self.shared_root
+            ], check=True, capture_output=True)
+        except:
+            Log.debug(self.app, "Could not set ownership")
+        
+        # Set directory permissions
+        for root, dirs, files in os.walk(self.shared_root, followlinks=False):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o755)
+            for f in files:
+                os.chmod(os.path.join(root, f), 0o644)
+
+
+    def initialize_git_tracking(self):
+        """Initialize git repository for baseline tracking"""
+        try:
+            # Check if git is installed
+            result = subprocess.run(
+                ['git', '--version'],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                Log.debug(self.app, "Git not installed, skipping baseline tracking")
+                return False
+            
+            # Initialize git repo if not exists
+            git_dir = f"{self.shared_root}/.git"
+            if not os.path.exists(git_dir):
+                subprocess.run(
+                    ['git', 'init'],
+                    cwd=self.shared_root,
+                    capture_output=True,
+                    check=True
+                )
+                
+                # Configure git (local only)
+                subprocess.run(
+                    ['git', 'config', 'user.name', 'WordOps Multi-tenancy'],
+                    cwd=self.shared_root,
+                    capture_output=True
+                )
+                subprocess.run(
+                    ['git', 'config', 'user.email', 'multitenancy@wordops.local'],
+                    cwd=self.shared_root,
+                    capture_output=True
+                )
+                
+                # Create .gitignore
+                gitignore_path = f"{self.shared_root}/.gitignore"
+                with open(gitignore_path, 'w') as f:
+                    f.write("""# Ignore everything except baseline config
+*
+!.gitignore
+!config/
+!config/baseline.json
+""")
+                
+                # Initial commit
+                subprocess.run(
+                    ['git', 'add', '.gitignore', 'config/baseline.json'],
+                    cwd=self.shared_root,
+                    capture_output=True
+                )
+                subprocess.run(
+                    ['git', 'commit', '-m', 'Initial baseline configuration'],
+                    cwd=self.shared_root,
+                    capture_output=True
+                )
+                
+                Log.debug(self.app, "Initialized git tracking for baseline")
+                return True
+            
+            return True
+            
+        except Exception as e:
+            Log.debug(self.app, f"Could not initialize git tracking: {e}")
+            return False
+
+    def git_commit_baseline(self, message):
+        """Commit baseline.json changes to git"""
+        try:
+            git_dir = f"{self.shared_root}/.git"
+            if not os.path.exists(git_dir):
+                Log.debug(self.app, "Git not initialized, skipping commit")
+                return False
+            
+            # Stage baseline.json
+            subprocess.run(
+                ['git', 'add', 'config/baseline.json'],
+                cwd=self.shared_root,
+                capture_output=True,
+                check=True
+            )
+            
+            # Commit with message
+            subprocess.run(
+                ['git', 'commit', '-m', message],
+                cwd=self.shared_root,
+                capture_output=True,
+                check=True
+            )
+            
+            Log.debug(self.app, f"Git commit: {message}")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            # Check if it's just "no changes to commit" (which is OK)
+            error_msg = e.stderr.decode("utf-8", errors="ignore") if e.stderr else ""
+            if "nothing to commit" in error_msg or "no changes added" in error_msg:
+                Log.debug(self.app, "Git: No changes to commit")
+                return True
+            else:
+                Log.warn(self.app, f"⚠️  Git commit failed: {error_msg}")
+                Log.warn(self.app, "Changes not tracked in git history")
+                return False
+    
+    def __init__(self, app, shared_root):
+        self.app = app
+        self.shared_root = shared_root
+        self.releases_dir = f"{shared_root}/releases"
+        self.backups_dir = f"{shared_root}/backups"
+    
+    def list_releases(self):
+        """List all available releases"""
+        releases = []
+        
+        if os.path.exists(self.releases_dir):
+            for item in os.listdir(self.releases_dir):
+                if item.startswith('wp-') and os.path.isdir(f"{self.releases_dir}/{item}"):
+                    releases.append(item)
+        
+        return sorted(releases, reverse=True)
+    
+    def get_current_release(self):
+        """Get current active release"""
+        current_link = f"{self.shared_root}/current"
+        
+        if os.path.islink(current_link):
+            target = os.readlink(current_link)
+            return os.path.basename(target)
+        
+        return None
+    
+    def get_previous_release(self, current_release):
+        """Get the previous release for rollback"""
+        releases = self.list_releases()
+        
+        if current_release in releases:
+            current_index = releases.index(current_release)
+            if current_index < len(releases) - 1:
+                return releases[current_index + 1]
+        
+        return None
+    
+    def backup_current(self):
+        """Backup current release information"""
+        current = self.get_current_release()
+        if current:
+            timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+            backup_file = f"{self.backups_dir}/release-{timestamp}.txt"
+            
+            os.makedirs(self.backups_dir, exist_ok=True)
+            
+            with open(backup_file, 'w') as f:
+                f.write(current)
+            
+            Log.debug(self.app, f"Backed up release info: {backup_file}")
+    
+    def cleanup_old_releases(self, keep_count=3):
+        """Remove old releases keeping only the specified count"""
+        releases = self.list_releases()
+        current = self.get_current_release()
+        
+        if len(releases) > keep_count:
+            to_remove = releases[keep_count:]
+            
+            for release in to_remove:
+                # Never remove current release
+                if release != current:
+                    release_path = f"{self.releases_dir}/{release}"
+                    if os.path.exists(release_path):
+                        shutil.rmtree(release_path)
+                        Log.debug(self.app, f"Removed old release: {release}")
+
+class BaselineApplicator:
+    """Helper class for applying baseline configuration to sites"""
+    
+    @staticmethod
+    def find_plugin_main_file(site_path, plugin_slug):
+        """Find the main PHP file for a plugin"""
+        plugin_dir = f"{site_path}/wp-content/plugins/{plugin_slug}"
+        
+        if not os.path.exists(plugin_dir):
+            return None
+        
+        # Common patterns
+        candidates = [
+            f"{plugin_slug}/{plugin_slug}.php",
+            f"{plugin_slug}/index.php",
+            f"{plugin_slug}/plugin.php",
+            f"{plugin_slug}.php"  # Single-file plugin
+        ]
+        
+        for candidate in candidates:
+            full_path = f"{site_path}/wp-content/plugins/{candidate}"
+            if os.path.exists(full_path):
+                return candidate
+        
+        return None
+    
+    @staticmethod
+    def restore_plugins_from_json(app, site_path, plugins_json):
+        """Restore active_plugins option from JSON string"""
+        try:
+            restore_cmd = [
+                'wp', 'option', 'update', 'active_plugins', plugins_json,
+                '--format=json',
+                '--path=' + site_path,
+                '--allow-root'
+            ]
+            
+            subprocess.run(
+                restore_cmd,
+                capture_output=True,
+                timeout=30,
+                check=True
+            )
+            
+            Log.debug(app, f"Restored plugins for {site_path}")
+            
+        except Exception as e:
+            Log.debug(app, f"Failed to restore plugins: {e}")
+    
+    @staticmethod
+    def apply_baseline_to_site(app, domain, site_path, baseline):
+        """Apply baseline configuration to a single site via WP-CLI"""
+        
+        result = {'success': False, 'error': None}
+        
+        try:
+            # Get current active plugins (for rollback)
+            get_plugins_cmd = [
+                'wp', 'option', 'get', 'active_plugins',
+                '--format=json',
+                '--path=' + site_path,
+                '--allow-root'
+            ]
+            
+            plugins_result = subprocess.run(
+                get_plugins_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if plugins_result.returncode != 0:
+                result['error'] = "Could not read current plugins"
+                return result
+            
+            current_plugins = plugins_result.stdout.strip()
+            
+            # Activate each baseline plugin
+            for plugin_slug in baseline.get('plugins', []):
+                # Find plugin main file
+                plugin_file = BaselineApplicator.find_plugin_main_file(
+                    site_path, 
+                    plugin_slug
+                )
+                
+                if not plugin_file:
+                    result['error'] = f"Plugin {plugin_slug} not found on disk"
+                    return result
+                
+                # Activate plugin
+                activate_cmd = [
+                    'wp', 'plugin', 'activate', plugin_file,
+                    '--path=' + site_path,
+                    '--allow-root'
+                ]
+                
+                activate_result = subprocess.run(
+                    activate_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if activate_result.returncode != 0:
+                    result['error'] = f"Failed to activate {plugin_slug}: " + \
+                                    activate_result.stderr
+                    # Rollback - restore original plugins
+                    BaselineApplicator.restore_plugins_from_json(
+                        app, 
+                        site_path, 
+                        current_plugins
+                    )
+                    return result
+            
+            # Switch theme if needed
+            theme_slug = baseline.get('theme')
+            if theme_slug:
+                theme_cmd = [
+                    'wp', 'theme', 'activate', theme_slug,
+                    '--path=' + site_path,
+                    '--allow-root'
+                ]
+                
+                theme_result = subprocess.run(
+                    theme_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if theme_result.returncode != 0:
+                    result['error'] = f"Failed to activate theme {theme_slug}"
+                    return result
+            
+            result['success'] = True
+            return result
+            
+        except subprocess.TimeoutExpired:
+            result['error'] = "WP-CLI command timeout"
+            return result
+        except Exception as e:
+            result['error'] = str(e)
+            return result
+    
+    @staticmethod
+    def apply_baseline_to_sites(app, config, baseline_version):
+        """Apply current baseline to all sites via WP-CLI"""
+        from wo.cli.plugins.multitenancy_db import MTDatabase
+        
+        # Get baseline config
+        shared_root = config.get('shared_root', '/var/www/shared')
+        baseline_file = f"{shared_root}/config/baseline.json"
+        
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+
+        # *** PHASE 2: TEST ON STAGING SITE FIRST ***
+        staging_site = MTDatabase.get_staging_site(app)
+        
+        if staging_site:
+            Log.info(app, f"Testing on staging site: {staging_site['domain']}...")
+            
+            result = BaselineApplicator.apply_baseline_to_site(
+                app,
+                staging_site['domain'],
+                staging_site['site_path'],
+                baseline
+            )
+            
+            if not result['success']:
+                Log.error(app, "=" * 60)
+                Log.error(app, f"❌ STAGING TEST FAILED: {result['error']}")
+                Log.error(app, "=" * 60)
+                Log.error(app, "Aborting production rollout!")
+                Log.error(app, f"Fix the issue on staging site: {staging_site['domain']}")
+                Log.error(app, "Then try again.")
+                return
+            
+            Log.info(app, "✅ Staging test PASSED")
+            Log.info(app, "")
+        else:
+            Log.warn(app, "⚠️  No staging site found")
+            Log.warn(app, "   Skipping pre-production test (NOT RECOMMENDED)")
+            Log.warn(app, "   Create one with: wo multitenancy staging create <domain>")
+            Log.warn(app, "")
+            
+            # Ask for confirmation
+            if not hasattr(app.pargs, 'force') or not app.pargs.force:
+                try:
+                    confirm = input("Continue without staging test? [y/N]: ").strip().lower()
+                    if confirm != 'y':
+                        Log.info(app, "Aborted by user")
+                        return
+                except:
+                    pass  # If input fails (non-interactive), continue
+        
+        
+        # Get all production sites (not staging, not quarantined)
+        from wo.core.database import db_session
+        from wo.cli.plugins.multitenancy_db import MultitenancySite
+        
+        session = db_session
+        sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
+        
+        production_sites = [
+            {
+                'domain': s.domain,
+                'site_path': s.site_path,
+                'is_staging': s.is_staging,
+                'is_quarantined': s.is_quarantined
+            }
+            for s in sites 
+            if not getattr(s, 'is_staging', False) 
+            and not getattr(s, 'is_quarantined', False)
+        ]
+        
+        if not production_sites:
+            Log.error(app, "No production sites found")
+            return
+        
+        Log.info(app, f"Applying baseline v{baseline_version} to {len(production_sites)} sites...")
+        
+        success_count = 0
+        quarantine_count = 0
+        
+        for idx, site in enumerate(production_sites, 1):
+            domain = site['domain']
+            site_path = site['site_path']
+            
+            # Show progress indicator
+            progress = f"[{idx}/{len(production_sites)}]"
+            Log.info(app, f"{progress} Applying to {domain}...")
+            
+            # Apply baseline to this site
+            result = BaselineApplicator.apply_baseline_to_site(
+                app, 
+                domain, 
+                site_path, 
+                baseline
+            )
+            
+            if result['success']:
+                # Update baseline version in DB
+                site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
+                if site_obj:
+                    site_obj.baseline_version = baseline_version
+                    site_obj.updated_at = datetime.now()
+                    session.commit()
+                
+                success_count += 1
+                Log.debug(app, f"Applied to {domain}")
+            else:
+                # Quarantine the site
+                MTDatabase.mark_site_quarantined(
+                    app, 
+                    domain, 
+                    result['error']
+                )
+                quarantine_count += 1
+                Log.warn(app, f"Quarantined {domain}: {result['error']}")
+        
+        # Clear global cache
+        Log.info(app, "Clearing cache globally...")
+        from wo.core.shellexec import WOShellExec
+        WOShellExec.cmd_exec(app, "wo clean --all", errormsg="", log=False)
+        
+        # Report results
+        Log.info(app, "")
+        Log.info(app, "=" * 60)
+        Log.info(app, f"✅ Successfully applied to {success_count}/{len(production_sites)} sites")
+        
+        if quarantine_count > 0:
+            Log.warn(app, f"⚠️  {quarantine_count} site(s) quarantined due to errors")
+            Log.info(app, "Run 'wo multitenancy baseline validate' to review")
+        
+        Log.info(app, "=" * 60)

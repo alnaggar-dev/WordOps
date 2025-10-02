@@ -1550,6 +1550,897 @@ When testing or modifying this plugin, verify:
 
 ---
 
+
+---
+
+## User Guide & Workflows
+
+This section provides comprehensive guides for common workflows and day-to-day operations with the WordOps Multi-tenancy baseline management system.
+
+### Quick Start Guide
+
+#### Initial Setup (First Time)
+
+```bash
+# 1. Initialize multi-tenancy infrastructure
+wo multitenancy init
+
+# 2. Create your first site
+wo multitenancy create example.com --php83 --wpfc --letsencrypt
+
+# 3. Optional: Create a staging site for testing
+wo multitenancy staging staging.example.com --php83 --wpfc
+
+# 4. View status
+wo multitenancy status
+```
+
+**Expected Timeline:** 5-10 minutes for initial setup
+
+#### Adding a Plugin to All Sites
+
+```bash
+# From WordPress.org (most common)
+wo multitenancy baseline add-plugin classic-editor --apply-now
+
+# From GitHub
+wo multitenancy baseline add-plugin my-plugin --github=user/repo --apply-now
+
+# From GitHub with specific version
+wo multitenancy baseline add-plugin my-plugin --github=user/repo --tag=v1.5.0 --apply-now
+
+# From direct URL
+wo multitenancy baseline add-plugin my-plugin --url=https://example.com/plugin.zip --apply-now
+```
+
+**What Happens:**
+1. Plugin downloaded to `/var/www/shared/wp-content/plugins/`
+2. Baseline configuration updated (version incremented)
+3. Git commit created for audit trail
+4. **(If --apply-now)** Tested on staging site first
+5. **(If --apply-now)** Applied to all production sites
+6. Progress shown: `[1/25] wp1.example.com... ✅`
+7. Cache cleared globally
+
+**Expected Output:**
+```
+Adding plugin: classic-editor from WordPress.org
+✅ Downloaded classic-editor (v1.6.5)
+✅ Updated baseline.json (v5 → v6)
+✅ Git: Baseline v6: Added plugin classic-editor
+
+Testing on staging site: staging.example.com...
+✅ Staging test PASSED
+
+Applying baseline v6 to 24 sites...
+[1/24] wp1.example.com... ✅
+[2/24] wp2.example.com... ✅
+[3/24] wp3.example.com... ✅
+...
+[24/24] wp24.example.com... ✅
+
+✅ Successfully applied to 24/24 sites
+✅ Cache cleared globally
+```
+
+#### Adding and Setting a Default Theme
+
+```bash
+# Add theme and set as default immediately
+wo multitenancy baseline add-theme twentytwentyfour --set-default --apply-now
+
+# Or add first, then set default later
+wo multitenancy baseline add-theme my-theme
+wo multitenancy baseline set-theme my-theme --apply-now
+```
+
+#### Testing Changes Before Production
+
+```bash
+# 1. Create staging site (if not already created)
+wo multitenancy staging staging.example.com --php83 --wpfc
+
+# 2. Add plugin WITHOUT --apply-now (baseline only)
+wo multitenancy baseline add-plugin new-plugin
+
+# 3. Manually test on staging site
+# Visit: https://staging.example.com/wp-admin
+
+# 4. If all looks good, apply to production
+wo multitenancy baseline apply
+
+# OR if issues found, remove the plugin
+wo multitenancy baseline remove-plugin new-plugin
+```
+
+#### Rolling Back After a Bad Update
+
+```bash
+# 1. Check what changed recently
+wo multitenancy baseline history
+
+# Example output:
+# f9b1d69 Baseline v8: Added plugin hello-dolly
+# 16b7ebc Baseline v7: Added plugin akismet
+# 231278b Baseline v6: Removed plugin hello-dolly
+
+# 2. Rollback to previous version
+wo multitenancy baseline baseline-rollback --to-version=7
+
+# Or rollback to specific commit
+wo multitenancy baseline baseline-rollback --to-commit=16b7ebc
+
+# 3. Apply the rollback immediately (optional)
+wo multitenancy baseline baseline-rollback --to-version=7 --apply-now --force
+```
+
+#### Handling Quarantined Sites
+
+```bash
+# 1. Check for quarantined sites
+wo multitenancy validate
+
+# Example output:
+# ⚠️  1 quarantined site(s):
+#    - wp7.example.com
+#      Reason: Failed to activate classic-editor
+#      Date: 2025-10-02 10:30:15
+
+# 2. Investigate the issue
+# Check site error logs:
+tail -50 /var/www/wp7.example.com/logs/error.log
+
+# Check WP-CLI connectivity:
+wp --info --path=/var/www/wp7.example.com/htdocs
+
+# 3. Fix the underlying issue (e.g., fix permissions, resolve conflicts)
+
+# 4. Remove quarantine and retry
+wo multitenancy baseline unquarantine wp7.example.com
+```
+
+#### Viewing Change History
+
+```bash
+# View last 20 baseline changes
+wo multitenancy baseline history
+
+# View full git history
+cd /var/www/shared && git log config/baseline.json
+
+# View specific commit details
+cd /var/www/shared && git show abc123
+
+# Compare two versions
+cd /var/www/shared && git diff abc123 def456 config/baseline.json
+```
+
+### Common Workflows
+
+#### Monthly Plugin Updates
+
+**Scenario:** Update all plugins to latest versions on the first Monday of each month.
+
+```bash
+# 1. Ensure staging site exists
+wo multitenancy staging staging.example.com --php83 --wpfc
+
+# 2. Download updated plugins (WordPress.org auto-gets latest)
+wo multitenancy baseline add-plugin classic-editor  # Re-download latest
+wo multitenancy baseline add-plugin akismet
+
+# 3. Apply to staging first, then production
+wo multitenancy baseline apply
+
+# 4. Monitor for issues
+wo multitenancy validate
+
+# 5. If issues, rollback
+wo multitenancy baseline baseline-rollback --to-version=N --apply-now --force
+```
+
+**Time Required:** 10-15 minutes  
+**Best Practice:** Test on staging the Friday before, apply on Monday
+
+#### Emergency Security Patch
+
+**Scenario:** Critical security patch needs immediate deployment across all sites.
+
+```bash
+# 1. Add the patched plugin version
+wo multitenancy baseline add-plugin vulnerable-plugin --apply-now --force
+
+# For GitHub-hosted plugins:
+wo multitenancy baseline add-plugin vulnerable-plugin \
+    --github=vendor/plugin --tag=v1.5.1-security --apply-now --force
+
+# 2. Verify deployment
+wo multitenancy validate
+
+# 3. Check all sites updated
+wo multitenancy list | grep baseline_version
+```
+
+**Time Required:** 5-10 minutes for 25 sites  
+**Critical:** The staging pre-check is automatically done even with `--force`
+
+#### Seasonal Theme Changes
+
+**Scenario:** Switch all sites to holiday theme in December, back to normal in January.
+
+```bash
+# November: Add holiday theme
+wo multitenancy baseline add-theme holiday-theme
+
+# December 1st: Switch to holiday theme
+wo multitenancy baseline set-theme holiday-theme --apply-now
+
+# January 2nd: Switch back
+wo multitenancy baseline set-theme twentytwentyfour --apply-now
+```
+
+**Time Required:** 2-3 minutes per theme switch
+
+#### New Site Onboarding
+
+**Scenario:** Add 5 new client sites to the multi-tenancy system.
+
+```bash
+# For each new site:
+wo multitenancy create client1.com --php83 --wpfc --letsencrypt
+wo multitenancy create client2.com --php83 --wpfc --letsencrypt
+wo multitenancy create client3.com --php83 --wpfc --letsencrypt
+wo multitenancy create client4.com --php83 --wpfc --letsencrypt
+wo multitenancy create client5.com --php83 --wpfc --letsencrypt
+
+# Sites automatically get current baseline configuration
+# Verify they're all at the correct version
+wo multitenancy validate
+```
+
+**Time Required:** 2-3 minutes per site  
+**Automatic:** New sites get the current baseline automatically
+
+#### Decommissioning Old Plugins
+
+**Scenario:** Remove unused plugins from all sites.
+
+```bash
+# 1. Identify unused plugins
+wo multitenancy baseline  # Review current plugins
+
+# 2. Remove from baseline
+wo multitenancy baseline remove-plugin old-plugin --apply-now
+
+# 3. Optionally delete plugin files (careful!)
+# rm -rf /var/www/shared/wp-content/plugins/old-plugin
+```
+
+**Note:** `remove-plugin` deactivates the plugin but doesn't delete files. This allows rollback if needed.
+
+#### Major WordPress Version Upgrade
+
+**Scenario:** Upgrade from WordPress 6.4 to 6.5.
+
+```bash
+# 1. Create staging site if not exists
+wo multitenancy staging staging.example.com --php83 --wpfc
+
+# 2. Update WordPress core
+wo multitenancy update --wordpress
+
+# This creates a new release and updates symlink:
+# /var/www/shared/current -> releases/wp-20251002-150000
+
+# 3. Verify staging site works
+# Visit: https://staging.example.com
+
+# 4. If issues, rollback
+wo multitenancy rollback
+
+# 5. If all good, verify all sites
+wo multitenancy validate
+```
+
+**Time Required:** 10-15 minutes including testing  
+**Automatic Rollback:** Available via `wo multitenancy rollback`
+
+#### Disaster Recovery
+
+**Scenario:** Something went wrong, need to restore quickly.
+
+```bash
+# Option 1: Rollback WordPress core
+wo multitenancy rollback
+
+# Option 2: Rollback baseline configuration
+wo multitenancy baseline baseline-rollback --to-version=N --apply-now --force
+
+# Option 3: Check what's quarantined
+wo multitenancy validate
+
+# Option 4: View recent changes
+wo multitenancy baseline history
+
+# Option 5: Nuclear option - restore from backup
+# (Assuming you have backups configured)
+```
+
+---
+
+## Troubleshooting Guide
+
+### Common Issues and Solutions
+
+#### Issue: "Multi-tenancy not initialized"
+
+**Symptom:**
+```
+ERROR: Multi-tenancy not initialized. Run: wo multitenancy init
+```
+
+**Diagnosis:**
+The shared infrastructure hasn't been created yet.
+
+**Solution:**
+```bash
+wo multitenancy init
+```
+
+**Verification:**
+```bash
+ls -la /var/www/shared
+wo multitenancy status
+```
+
+**Prevention:**
+Always run `wo multitenancy init` before creating any sites.
+
+---
+
+#### Issue: Plugin Download Fails
+
+**Symptom:**
+```
+Failed to download plugin: my-plugin
+
+Possible causes:
+  - Plugin doesn't exist at the source
+  - Network connectivity issue
+  - Invalid GitHub repo or URL
+  - Disk space full
+```
+
+**Diagnosis Steps:**
+1. **Check if plugin exists:**
+   ```bash
+   # For WordPress.org:
+   curl -I https://downloads.wordpress.org/plugin/my-plugin.zip
+   
+   # For GitHub:
+   curl -I https://github.com/user/repo/archive/refs/heads/main.zip
+   ```
+
+2. **Check network:**
+   ```bash
+   ping -c 3 downloads.wordpress.org
+   ```
+
+3. **Check disk space:**
+   ```bash
+   df -h /var/www
+   ```
+
+**Solutions:**
+
+**If plugin doesn't exist on WordPress.org:**
+```bash
+# Try GitHub instead:
+wo multitenancy baseline add-plugin my-plugin --github=user/repo
+
+# Or direct URL:
+wo multitenancy baseline add-plugin my-plugin --url=https://example.com/plugin.zip
+```
+
+**If network issue:**
+```bash
+# Check firewall:
+sudo ufw status
+
+# Try with timeout:
+curl --max-time 30 -I https://downloads.wordpress.org
+```
+
+**If disk full:**
+```bash
+# Check space:
+df -h
+
+# Clean old releases:
+cd /var/www/shared/releases
+ls -lt | tail -n +4  # Show releases older than 3 most recent
+```
+
+---
+
+#### Issue: Git History Not Working
+
+**Symptom:**
+```
+wo multitenancy baseline history
+Git tracking not initialized
+```
+
+**Diagnosis:**
+```bash
+ls -la /var/www/shared/.git
+```
+
+**Solution:**
+```bash
+cd /var/www/shared
+git init
+git config user.name "WordOps Multi-tenancy"
+git config user.email "multitenancy@wordops.local"
+git add config/baseline.json
+git commit -m "Initial baseline configuration"
+```
+
+**Prevention:**
+The `init` command should have done this. If you manually created `/var/www/shared`, you need to run these git commands.
+
+---
+
+#### Issue: Staging Site Test Fails
+
+**Symptom:**
+```
+Testing on staging site: staging.example.com...
+❌ STAGING TEST FAILED: Failed to activate classic-editor
+Aborting production rollout!
+```
+
+**Diagnosis:**
+This is actually GOOD - the staging site caught an issue before production!
+
+**Steps to Resolve:**
+1. **Check staging site directly:**
+   ```bash
+   wp plugin list --path=/var/www/staging.example.com/htdocs
+   ```
+
+2. **Check for conflicts:**
+   ```bash
+   # View staging site error log:
+   tail -50 /var/www/staging.example.com/logs/error.log
+   ```
+
+3. **Test activation manually:**
+   ```bash
+   wp plugin activate classic-editor --path=/var/www/staging.example.com/htdocs
+   ```
+
+4. **Common causes:**
+   - Plugin requires newer PHP version
+   - Plugin conflicts with another plugin
+   - Plugin files corrupted during download
+   - Insufficient memory
+
+**Solutions:**
+
+**If PHP version issue:**
+```bash
+# Check current PHP version:
+wp --info --path=/var/www/staging.example.com/htdocs
+
+# Recreate staging with newer PHP:
+wo multitenancy delete staging.example.com --force
+wo multitenancy staging staging.example.com --php84 --wpfc
+```
+
+**If plugin conflict:**
+```bash
+# Deactivate conflicting plugin:
+wo multitenancy baseline remove-plugin conflicting-plugin
+```
+
+**If corrupted download:**
+```bash
+# Remove and re-download:
+rm -rf /var/www/shared/wp-content/plugins/classic-editor
+wo multitenancy baseline add-plugin classic-editor
+```
+
+---
+
+#### Issue: Sites Get Quarantined
+
+**Symptom:**
+```
+wo multitenancy validate
+
+⚠️  3 site(s) quarantined:
+   - wp7.example.com
+     Reason: Failed to activate classic-editor
+     Date: 2025-10-02 10:30:15
+```
+
+**Diagnosis:**
+Sites failed to apply baseline and were automatically quarantined to prevent breaking.
+
+**Investigation Steps:**
+```bash
+# 1. Check site is accessible
+curl -I http://wp7.example.com
+
+# 2. Check WP-CLI works
+wp --info --path=/var/www/wp7.example.com/htdocs
+
+# 3. Check plugin files exist
+ls -la /var/www/shared/wp-content/plugins/classic-editor
+
+# 4. Check site error logs
+tail -100 /var/www/wp7.example.com/logs/error.log
+
+# 5. Try manual activation
+wp plugin activate classic-editor --path=/var/www/wp7.example.com/htdocs
+```
+
+**Common Causes & Solutions:**
+
+**Cause: Site-specific PHP error**
+```bash
+# Check PHP version:
+grep "php" /var/www/wp7.example.com/conf/nginx/*.conf
+
+# If wrong PHP version, recreate site:
+wo multitenancy delete wp7.example.com --force
+wo multitenancy create wp7.example.com --php83 --wpfc
+```
+
+**Cause: Database issue**
+```bash
+# Test database connection:
+wp db check --path=/var/www/wp7.example.com/htdocs
+
+# If database is corrupt:
+wp db repair --path=/var/www/wp7.example.com/htdocs
+```
+
+**Cause: Permissions issue**
+```bash
+# Fix permissions:
+chown -R www-data:www-data /var/www/wp7.example.com
+chmod -R 755 /var/www/wp7.example.com/htdocs
+```
+
+**After Fixing:**
+```bash
+# Remove quarantine and retry:
+wo multitenancy baseline unquarantine wp7.example.com
+```
+
+---
+
+#### Issue: Baseline Version Mismatch
+
+**Symptom:**
+```
+wo multitenancy validate
+
+⚠️  5 site(s) behind baseline:
+   - wp3.example.com (version 4, should be 8)
+   - wp5.example.com (version 4, should be 8)
+```
+
+**Diagnosis:**
+Sites haven't updated to the latest baseline version.
+
+**Possible Causes:**
+1. Sites were quarantined and never fixed
+2. Manual baseline changes made directly in site
+3. MU-plugin not loading
+4. Admin hasn't visited site yet (if relying on automatic enforcement)
+
+**Solution:**
+```bash
+# Force apply latest baseline to all sites:
+wo multitenancy baseline apply
+
+# Or to specific sites:
+wo multitenancy baseline unquarantine wp3.example.com
+wo multitenancy baseline unquarantine wp5.example.com
+```
+
+**Prevention:**
+- Use `--apply-now` flag when adding plugins/themes
+- Create staging site for pre-testing
+- Don't manually modify plugins on individual sites
+
+---
+
+#### Issue: WP-CLI Not Working
+
+**Symptom:**
+```
+Error: This does not seem to be a WordPress installation.
+```
+
+**Diagnosis:**
+```bash
+# Check if wp-config.php exists:
+ls -la /var/www/example.com/htdocs/wp-config.php
+
+# Check if WordPress symlink exists:
+ls -la /var/www/example.com/htdocs/wp
+
+# Check symlink target:
+readlink /var/www/example.com/htdocs/wp
+```
+
+**Solutions:**
+
+**If wp-config.php missing:**
+```bash
+# Recreate the site:
+wo multitenancy delete example.com --force
+wo multitenancy create example.com --php83 --wpfc
+```
+
+**If symlink broken:**
+```bash
+cd /var/www/example.com/htdocs
+rm -f wp
+ln -s /var/www/shared/current wp
+```
+
+**If WordPress core missing:**
+```bash
+# Re-download WordPress:
+wo multitenancy update --wordpress
+```
+
+---
+
+#### Issue: Permission Errors
+
+**Symptom:**
+```
+Warning: Unable to create directory wp-content/uploads/2025/10
+```
+
+**Diagnosis:**
+```bash
+# Check ownership:
+ls -la /var/www/example.com/htdocs/wp-content
+
+# Check permissions:
+stat /var/www/example.com/htdocs/wp-content
+```
+
+**Solution:**
+```bash
+# Fix ownership:
+chown -R www-data:www-data /var/www/example.com/htdocs
+
+# Fix permissions:
+chmod -R 755 /var/www/example.com/htdocs
+chmod 644 /var/www/example.com/htdocs/wp-config.php
+```
+
+**For uploads directory specifically:**
+```bash
+mkdir -p /var/www/example.com/htdocs/wp-content/uploads
+chown -R www-data:www-data /var/www/example.com/htdocs/wp-content/uploads
+chmod -R 755 /var/www/example.com/htdocs/wp-content/uploads
+```
+
+---
+
+#### Issue: Database Errors
+
+**Symptom:**
+```
+Error establishing a database connection
+```
+
+**Diagnosis:**
+```bash
+# Check if database exists:
+mysql -e "SHOW DATABASES LIKE 'wp_example_com';"
+
+# Check wp-config.php credentials:
+grep "DB_" /var/www/example.com/htdocs/wp-config.php
+
+# Test database connection:
+wp db check --path=/var/www/example.com/htdocs
+```
+
+**Solutions:**
+
+**If database doesn't exist:**
+```bash
+# Get credentials from wp-config.php, then:
+mysql -e "CREATE DATABASE wp_example_com CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+```
+
+**If wrong credentials:**
+```bash
+# Edit wp-config.php:
+nano /var/www/example.com/htdocs/wp-config.php
+
+# Or recreate site:
+wo multitenancy delete example.com --force
+wo multitenancy create example.com --php83 --wpfc
+```
+
+**If database is corrupt:**
+```bash
+wp db repair --path=/var/www/example.com/htdocs
+```
+
+---
+
+#### Issue: Performance Issues
+
+**Symptom:**
+Sites are slow or timing out.
+
+**Diagnosis:**
+```bash
+# Check server load:
+uptime
+
+# Check memory usage:
+free -h
+
+# Check disk I/O:
+iostat -x 1 5
+
+# Check PHP-FPM processes:
+systemctl status php8.3-fpm
+
+# Check cache status:
+redis-cli ping  # If using Redis
+```
+
+**Solutions:**
+
+**If high memory usage:**
+```bash
+# Increase PHP memory limit:
+sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php/8.3/fpm/php.ini
+systemctl restart php8.3-fpm
+```
+
+**If too many PHP-FPM processes:**
+```bash
+# Adjust PHP-FPM pool settings:
+nano /etc/php/8.3/fpm/pool.d/www.conf
+
+# Increase:
+pm.max_children = 50
+pm.start_servers = 10
+pm.min_spare_servers = 5
+pm.max_spare_servers = 15
+
+systemctl restart php8.3-fpm
+```
+
+**If cache not working:**
+```bash
+# Clear and rebuild cache:
+wo clean --all
+wo clean --redis
+wo clean --opcache
+```
+
+**If disk I/O bottleneck:**
+```bash
+# Check disk usage:
+df -h
+
+# Clean old releases:
+cd /var/www/shared/releases
+ls -lt | tail -n +4 | awk '{print $9}' | xargs rm -rf
+```
+
+---
+
+### Debug Mode & Logging
+
+#### Enable Debug Mode
+
+```bash
+# For single command:
+wo --debug multitenancy baseline add-plugin test-plugin
+
+# View debug logs:
+tail -f /var/log/wo/wordops.log
+```
+
+#### Check Different Log Types
+
+```bash
+# WordOps log:
+tail -100 /var/log/wo/wordops.log
+
+# Site error log:
+tail -100 /var/www/example.com/logs/error.log
+
+# Site access log:
+tail -100 /var/www/example.com/logs/access.log
+
+# Nginx error log:
+tail -100 /var/log/nginx/error.log
+
+# PHP-FPM log:
+tail -100 /var/log/php8.3-fpm.log
+
+# System log:
+journalctl -u nginx -n 100
+journalctl -u php8.3-fpm -n 100
+```
+
+#### Common Log Patterns
+
+**Plugin activation failure:**
+```
+PHP Fatal error: Uncaught Error: Call to undefined function
+```
+**Solution:** Plugin requires newer PHP version
+
+**Memory exhaustion:**
+```
+PHP Fatal error: Allowed memory size of X bytes exhausted
+```
+**Solution:** Increase `memory_limit` in php.ini
+
+**Database connection failure:**
+```
+Error establishing a database connection
+```
+**Solution:** Check database credentials in wp-config.php
+
+---
+
+### Getting Help
+
+If you're stuck after trying these troubleshooting steps:
+
+1. **Run comprehensive validation:**
+   ```bash
+   wo multitenancy validate
+   ```
+
+2. **Gather system information:**
+   ```bash
+   wo info
+   wo multitenancy status
+   ```
+
+3. **Check recent changes:**
+   ```bash
+   wo multitenancy baseline history
+   ```
+
+4. **Review logs:**
+   ```bash
+   tail -200 /var/log/wo/wordops.log
+   ```
+
+5. **Create a support request** with:
+   - Error messages (exact text)
+   - Commands run (exact syntax)
+   - Log excerpts (relevant portions)
+   - System info (from `wo info`)
+
+---
+
+## Examples & Real-World Scenarios
+
+This section provides complete, tested workflows for real-world use cases.
+
 ## Support and Resources
 
 ### Quick Reference
