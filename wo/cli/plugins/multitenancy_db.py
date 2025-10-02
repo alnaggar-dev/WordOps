@@ -46,6 +46,10 @@ class MultitenancySite(Base):
     baseline_version = Column(Integer, default=0)
     is_enabled = Column(Boolean, default=True)
     is_ssl = Column(Boolean, default=False)
+    is_staging = Column(Boolean, default=False)
+    is_quarantined = Column(Boolean, default=False)
+    quarantine_reason = Column(Text)
+    quarantine_date = Column(DateTime)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -413,3 +417,134 @@ class MTDatabase:
         except Exception as e:
             Log.debug(app, f"Failed to get stats: {e}")
             return {}
+
+    @staticmethod
+    def migrate_schema(app):
+        """Migrate database schema to add new columns if they don't exist"""
+        try:
+            from sqlalchemy import inspect
+            session = db_session
+            inspector = inspect(session.bind)
+            
+            # Get current columns
+            columns = [col['name'] for col in inspector.get_columns('multitenancy_sites')]
+            
+            # Check which columns need to be added
+            new_columns = []
+            if 'is_staging' not in columns:
+                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN is_staging BOOLEAN DEFAULT 0")
+            if 'is_quarantined' not in columns:
+                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN is_quarantined BOOLEAN DEFAULT 0")
+            if 'quarantine_reason' not in columns:
+                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN quarantine_reason TEXT")
+            if 'quarantine_date' not in columns:
+                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN quarantine_date DATETIME")
+            
+            # Execute migrations
+            if new_columns:
+                for sql in new_columns:
+                    session.execute(sql)
+                session.commit()
+                Log.debug(app, f"Migrated database: added {len(new_columns)} new columns")
+                return True
+            else:
+                Log.debug(app, "Database schema is up to date")
+                return False
+                
+        except Exception as e:
+            Log.debug(app, f"Schema migration error: {e}")
+            return False
+    
+    @staticmethod
+    def get_staging_site(app):
+        """Get the staging site"""
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(
+                is_staging=True,
+                is_enabled=True
+            ).first()
+            
+            if site:
+                return {
+                    'id': site.id,
+                    'domain': site.domain,
+                    'site_type': site.site_type,
+                    'cache_type': site.cache_type,
+                    'site_path': site.site_path,
+                    'php_version': site.php_version,
+                    'shared_release': site.shared_release,
+                    'baseline_version': site.baseline_version,
+                    'is_enabled': site.is_enabled,
+                    'is_ssl': site.is_ssl,
+                    'is_staging': site.is_staging,
+                    'is_quarantined': site.is_quarantined
+                }
+            return None
+            
+        except Exception as e:
+            Log.debug(app, f"Error getting staging site: {e}")
+            return None
+    
+    @staticmethod
+    def mark_site_quarantined(app, domain, reason):
+        """Mark a site as quarantined"""
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            
+            if site:
+                site.is_quarantined = True
+                site.quarantine_reason = reason
+                site.quarantine_date = datetime.now()
+                site.updated_at = datetime.now()
+                session.commit()
+                Log.debug(app, f"Quarantined site: {domain}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            Log.debug(app, f"Error quarantining site: {e}")
+            return False
+    
+    @staticmethod
+    def unquarantine_site(app, domain):
+        """Remove quarantine status from a site"""
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            
+            if site:
+                site.is_quarantined = False
+                site.quarantine_reason = None
+                site.quarantine_date = None
+                site.updated_at = datetime.now()
+                session.commit()
+                Log.debug(app, f"Unquarantined site: {domain}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            Log.debug(app, f"Error unquarantining site: {e}")
+            return False
+    
+    @staticmethod
+    def get_quarantined_sites(app):
+        """Get all quarantined sites"""
+        try:
+            session = db_session
+            sites = session.query(MultitenancySite).filter_by(
+                is_quarantined=True
+            ).order_by(MultitenancySite.quarantine_date.desc()).all()
+            
+            return [{
+                'domain': site.domain,
+                'quarantine_reason': site.quarantine_reason,
+                'quarantine_date': site.quarantine_date.isoformat() if site.quarantine_date else None
+            } for site in sites]
+            
+        except Exception as e:
+            Log.debug(app, f"Error getting quarantined sites: {e}")
+            return []
