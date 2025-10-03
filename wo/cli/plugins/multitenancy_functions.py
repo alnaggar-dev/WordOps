@@ -1858,6 +1858,10 @@ add_action('init', function() {
                 os.chmod(os.path.join(root, f), 0o644)
 
 
+
+class ReleaseManager:
+    """Manages WordPress core releases in the shared infrastructure"""
+    
     def initialize_git_tracking(self):
         """Initialize git repository for baseline tracking"""
         try:
