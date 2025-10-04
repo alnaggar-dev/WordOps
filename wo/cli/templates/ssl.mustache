@@ -11,9 +11,9 @@ quic_retry on;
 # QUIC performance and stability optimizations
 quic_gso on;
 
-# Listen on port 443 with HTTP/3 QUIC with reuseport for better performance
-listen 443 quic reuseport;
-listen [::]:443 quic reuseport;
+# Listen on port 443 with HTTP/3 QUIC
+listen 443 quic;
+listen [::]:443 quic;
 
 # listen on port 443 with HTTP/2
 listen 443 ssl;
