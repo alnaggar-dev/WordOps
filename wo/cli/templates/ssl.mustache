@@ -8,9 +8,13 @@ more_set_headers 'Alt-Svc h3=":$server_port"; ma=86400';
 # enable [QUIC address validation](https://datatracker.ietf.org/doc/html/rfc9000#name-address-validation)
 quic_retry on;
 
-# Listen on port 443 with HTTP/3 QUIC
-listen 443 quic;
-listen [::]:443 quic;
+# QUIC performance and stability optimizations
+quic_gso on;
+quic_mtu 1350;
+
+# Listen on port 443 with HTTP/3 QUIC with reuseport for better performance
+listen 443 quic reuseport;
+listen [::]:443 quic reuseport;
 
 # listen on port 443 with HTTP/2
 listen 443 ssl;
@@ -20,3 +24,11 @@ ssl_certificate     {{ssl_live_path}}/{{domain}}/fullchain.pem;
 ssl_certificate_key     {{ssl_live_path}}/{{domain}}/key.pem;
 ssl_trusted_certificate {{ssl_live_path}}/{{domain}}/ca.pem;
 ssl_stapling_verify on;
+
+# SSL optimizations for better QUIC performance
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:50m;
+ssl_session_tickets off;
+
+# Add headers to help with QUIC debugging
+more_set_headers "X-QUIC-Status: $http3" always;

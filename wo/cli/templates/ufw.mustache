@@ -35,6 +35,8 @@ wo_ufw_setup() {
     if ! grep -q "\-\-dport 443 -j" /etc/ufw/user.rules; then
         # https
         ufw allow https
+        # http/3 quic
+        ufw allow 443/udp
     fi
 
     # ntp

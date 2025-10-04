@@ -51,9 +51,9 @@ http {
 	# SSL Settings
 	##
 
-	# Enable 0-RTT support for TLS 1.3
-	proxy_set_header Early-Data $ssl_early_data;
-	ssl_early_data on;
+	# Disable 0-RTT to prevent QUIC replay issues
+	# proxy_set_header Early-Data $ssl_early_data;
+	# ssl_early_data on;
 
 	# enable http/2
 	http2 on;
