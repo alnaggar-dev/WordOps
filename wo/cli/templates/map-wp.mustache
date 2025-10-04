@@ -18,10 +18,10 @@ map $http_cookie $cookie_no_cache {
     default 0;
     "~*wordpress_[a-f0-9]+" 1;
     "~*wp-postpass" 1;
-    "~*wordpress_logged_in" 1;
+    #"~*wordpress_logged_in" 1;
     "~*wordpress_no_cache" 1;
     "~*comment_author" 1;
-    "~*woocommerce_items_in_cart" 1;
+    #"~*woocommerce_items_in_cart" 1;
     "~*edd_items_in_cart" 1;
     "~*woocommerce_cart_hash" 1;
     "~*wptouch_switch_toogle" 1;
@@ -49,6 +49,7 @@ map $request_uri $uri_no_cache {
     "~*/account/" 1;
     "~*/my-account/" 1;
     "~*/checkout/" 1;
+    "~*/order-received/" 1;
     "~*/addons/" 1;
     "~*/wc-api/.*" 1;
     "~*/logout/" 1;
