@@ -942,6 +942,288 @@ The MU-plugin (`wo-baseline-enforcer.php`) automatically:
 - Switches to required theme if different
 - Updates itself when baseline version changes
 
+
+
+### 6. Baseline Version Management & Auto-Increment
+
+The multitenancy system uses an **automatic version control system** to ensure all sites stay synchronized with the baseline configuration.
+
+#### How Baseline Versioning Works
+
+**Baseline Version (`baseline.json`):**
+- Each baseline configuration has a version number
+- **Version automatically increments when plugins or theme change**
+- All sites track their current baseline version
+- Stored in `/var/www/shared/config/baseline.json`
+
+**Site Version (`wo_mt_baseline_version` option):**
+- Each site stores its current baseline version in the WordPress database
+- MU-plugin checks baseline version on every WordPress init
+- If site version < baseline version, updates are applied automatically
+
+#### Automatic Version Increment Behavior
+
+When you run `wo multitenancy init --force` or modify the baseline:
+
+**First Time (No existing baseline.json):**
+```bash
+wo multitenancy init
+```
+- Creates `baseline.json` with version 1
+- No comparison needed (file doesn't exist yet)
+- All new sites start at version 1
+
+**No Configuration Changes:**
+```bash
+wo multitenancy init --force
+```
+- Compares current config with existing baseline
+- Plugins unchanged, theme unchanged
+- **Version stays the same** (efficient!)
+- Existing sites don't need to re-process
+- Output: `No changes detected, keeping version 1`
+
+**With Configuration Changes:**
+```bash
+# Edit config file
+nano /etc/wo/plugins.d/multitenancy.conf
+# Add: [github_plugins]
+#      new-plugin = user/new-plugin,branch,main
+
+wo multitenancy init --force
+```
+- Detects plugin list or theme changed
+- **Automatically increments version** (e.g., 1 → 2)
+- Existing sites auto-update on next load
+- Output: `✅ Baseline configuration changed - incrementing version to 2`
+
+#### How Sites Auto-Update (Zero-Touch Propagation)
+
+**Existing Sites Workflow:**
+When a site with version 1 loads and baseline is version 2:
+
+1. User visits site or WP-CLI command runs
+2. MU-plugin (`wo-baseline-enforcer.php`) runs on WordPress init
+3. Checks: site v1 < baseline v2?
+4. **Automatically activates new plugins/theme**
+5. Updates site version to 2 in database
+6. **No manual intervention needed!**
+
+**Real-World Example Workflow:**
+
+```bash
+# Day 1: Initial setup
+wo multitenancy init
+wo multitenancy create site1.com --php83 --wpfc
+wo multitenancy create site2.com --php83 --wpfc
+wo multitenancy create site3.com --php83 --wpfc
+# All sites at baseline version 1
+
+# Day 2: Add new plugin to config
+nano /etc/wo/plugins.d/multitenancy.conf
+# Add to [github_plugins]:
+#   analytics-plugin = mycompany/analytics,tag,v1.0.0
+
+wo multitenancy init --force
+# Output: ✅ Baseline configuration changed - incrementing version to 2
+# baseline.json now at version 2
+
+# Day 2 afternoon: Sites auto-update on next access
+# User visits site1.com
+# → MU-plugin: site v1 < baseline v2
+# → Activates analytics-plugin automatically
+# → Updates site1.com to v2
+
+# User visits site2.com
+# → Same automatic activation
+# → Updates site2.com to v2
+
+# User visits site3.com
+# → Same automatic activation
+# → Updates site3.com to v2
+
+# Result: All sites now at v2 with analytics-plugin active
+# No manual activation commands needed!
+```
+
+#### Monitoring Baseline Versions
+
+**Check baseline version:**
+```bash
+cat /var/www/shared/config/baseline.json | grep version
+# Output: "version": 2
+```
+
+**Check site's current version:**
+```bash
+wp option get wo_mt_baseline_version --path=/var/www/example.com/htdocs --allow-root
+# Output: 2
+```
+
+**Check all sites' versions (batch check):**
+```bash
+for site in /var/www/*/htdocs; do
+  domain=$(basename $(dirname $site))
+  if [ -f "$site/wp-config.php" ] && [ "$domain" != "shared" ]; then
+    version=$(wp option get wo_mt_baseline_version --path=$site --allow-root 2>/dev/null || echo "N/A")
+    echo "$domain: v$version"
+  fi
+done
+```
+
+**Force site to re-process baseline (troubleshooting):**
+```bash
+wp option update wo_mt_baseline_version 0 --path=/var/www/example.com/htdocs --allow-root
+# Site will auto-upgrade to current baseline on next load
+```
+
+#### Version Increment Triggers
+
+The baseline version **automatically increments** when:
+
+✅ **Plugin list changes:**
+- Added plugins (any source: WordPress.org, GitHub, or URL)
+- Removed plugins
+- Changed plugin configuration (different repo, tag, or URL)
+
+✅ **Theme changes:**
+- Changed `baseline_theme` value
+- Different theme specified
+
+❌ **Version stays the same** when:
+- Only running `--force` to re-download (no config change)
+- No changes to plugin list or theme
+- Only updating non-baseline settings
+- Re-downloading same plugins from same sources
+
+#### Baseline Configuration Structure
+
+```json
+{
+  "version": 2,
+  "generated": "2025-10-06T15:29:01.191857",
+  "plugins": [
+    "nginx-helper",
+    "woocommerce",
+    "plausible-analytics",
+    "safe-svg",
+    "object-cache-pro",
+    "woodmart-core"
+  ],
+  "plugin_sources": {
+    "nginx-helper": {
+      "type": "wordpress.org",
+      "last_updated": "2025-10-06T15:29:01"
+    },
+    "woodmart-core": {
+      "type": "github",
+      "repo": "ximich/woodmart-core",
+      "ref_type": "branch",
+      "ref": "main",
+      "last_updated": "2025-10-06T15:29:01"
+    },
+    "object-cache-pro": {
+      "type": "url",
+      "url": "https://example.com/downloads/object-cache-pro.zip",
+      "last_updated": "2025-10-06T15:29:01"
+    }
+  },
+  "theme": "woodmart-child",
+  "options": {
+    "blog_public": 1,
+    "default_comment_status": "closed",
+    "default_ping_status": "closed"
+  }
+}
+```
+
+**Key Fields:**
+- `version`: **Auto-incremented when configuration changes**
+- `plugins`: All plugins from all sources (WordPress.org + GitHub + URL)
+- `plugin_sources`: Metadata tracking where each plugin comes from
+- `theme`: Default theme to activate
+- `options`: Default WordPress options
+
+#### Benefits of Auto-Increment System
+
+✅ **Automatic Propagation:**
+- Changes apply to all sites automatically
+- No manual activation needed on each site
+- Sites update on next page load (zero-touch)
+
+✅ **Efficient:**
+- Only increments when actually needed
+- Sites don't re-process unchanged configurations
+- Minimal overhead (single database query per request)
+
+✅ **Consistent:**
+- All sites eventually reach the same version
+- No sites left behind
+- Guaranteed synchronization across infrastructure
+
+✅ **Trackable:**
+- Clear version progression (v1 → v2 → v3)
+- Easy to identify outdated sites
+- Audit trail of configuration changes
+- Version number in baseline.json shows change history
+
+✅ **Conflict-Free:**
+- First-time init starts at v1 (avoids errors)
+- Re-running init without changes doesn't increment
+- Only real configuration changes trigger version bump
+
+#### Implementation Details
+
+The auto-increment logic is implemented in the `create_baseline_config()` method:
+
+```python
+def create_baseline_config(config):
+    # Load existing baseline if present
+    existing_baseline = load_existing_baseline()
+    
+    # Build new baseline from current config
+    new_baseline = build_baseline_from_config(config)
+    
+    if existing_baseline:
+        # Compare configurations
+        if has_config_changed(existing_baseline, new_baseline):
+            # Increment version on change
+            new_baseline['version'] = existing_baseline['version'] + 1
+            Log.info("Baseline configuration changed - incrementing version to " + 
+                    str(new_baseline['version']))
+        else:
+            # Keep same version if no change
+            new_baseline['version'] = existing_baseline['version']
+            Log.info("No changes detected, keeping version " + 
+                    str(new_baseline['version']))
+    else:
+        # First time: start at version 1
+        new_baseline['version'] = 1
+        Log.info("Creating initial baseline configuration (version 1)")
+    
+    # Save baseline.json
+    save_baseline(new_baseline)
+```
+
+The MU-plugin (`wo-baseline-enforcer.php`) checks and applies updates:
+
+```php
+// Check if site needs baseline update
+$site_version = (int) get_option('wo_mt_baseline_version', 0);
+$baseline_version = (int) $baseline['version'];
+
+if ($site_version < $baseline_version) {
+    // Apply baseline: activate plugins, set theme
+    apply_baseline_to_site($baseline);
+    
+    // Update site version
+    update_option('wo_mt_baseline_version', $baseline_version);
+    
+    error_log("WO Baseline Enforcer: Updated site from v$site_version to v$baseline_version");
+}
+```
+
+
 ---
 
 ## API Reference
@@ -3329,3 +3611,4 @@ This plugin provides true WordPress multi-tenancy for WordOps with:
 - ✅ Native integration with WordOps
 
 The implementation is clean, efficient, and production-ready.
+

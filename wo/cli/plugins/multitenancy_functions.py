@@ -23,6 +23,7 @@ class MTFunctions:
     """Multi-tenancy utility functions"""
     
     @staticmethod
+    @staticmethod
     def load_config(app):
         """Load multi-tenancy configuration"""
         config_file = '/etc/wo/plugins.d/multitenancy.conf'
@@ -55,7 +56,7 @@ class MTFunctions:
             for key, value in defaults.items():
                 config.set('multitenancy', key, value)
         
-        # Convert to dictionary
+        # Convert to dictionary - include ALL sections
         result = {}
         if config.has_section('multitenancy'):
             result = dict(config.items('multitenancy'))
@@ -64,6 +65,48 @@ class MTFunctions:
         if 'baseline_plugins' in result:
             result['baseline_plugins'] = [p.strip() for p in result['baseline_plugins'].split(',')]
         
+        # Add GitHub plugins section
+        if config.has_section('github_plugins'):
+            github_plugins = {}
+            for key, value in config.items('github_plugins'):
+                # Skip items that don't look like GitHub repo definitions
+                if ',' in value and '/' in value:
+                    github_plugins[key] = value
+            if github_plugins:
+                result['github_plugins'] = github_plugins
+        
+        # Add GitHub themes section
+        if config.has_section('github_themes'):
+            github_themes = {}
+            for key, value in config.items('github_themes'):
+                # Skip items that don't look like GitHub repo definitions
+                if ',' in value and '/' in value:
+                    github_themes[key] = value
+            if github_themes:
+                result['github_themes'] = github_themes
+        
+        # Add URL plugins section
+        if config.has_section('url_plugins'):
+            url_plugins = {}
+            for key, value in config.items('url_plugins'):
+                # Check if it looks like a URL
+                if value.startswith('https://') and value.endswith('.zip'):
+                    url_plugins[key] = value
+            if url_plugins:
+                result['url_plugins'] = url_plugins
+        
+        # Add URL themes section
+        if config.has_section('url_themes'):
+            url_themes = {}
+            for key, value in config.items('url_themes'):
+                # Check if it looks like a URL
+                if value.startswith('https://') and value.endswith('.zip'):
+                    url_themes[key] = value
+            if url_themes:
+                result['url_themes'] = url_themes
+        
+        return result
+    
         return result
     
     @staticmethod
@@ -306,7 +349,8 @@ class MTFunctions:
             'wp-includes': f"{site_htdocs}/wp/wp-includes",
             'wp-cron.php': f"{site_htdocs}/wp/wp-cron.php",
             'xmlrpc.php': f"{site_htdocs}/wp/xmlrpc.php",
-            'wp-comments-post.php': f"{site_htdocs}/wp/wp-comments-post.php"
+            'wp-comments-post.php': f"{site_htdocs}/wp/wp-comments-post.php",
+            'wp-settings.php': f"{site_htdocs}/wp/wp-settings.php"
         }
 
         for link_name, target in wp_core_files.items():
@@ -384,10 +428,8 @@ $table_prefix = 'wp_';
 define( 'WP_CONTENT_DIR', __DIR__ . '/wp-content' );
 define( 'WP_CONTENT_URL', (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http') . '://{domain}/wp-content' );
 
-// ** WordPress Core Directory ** //
-if ( ! defined( 'ABSPATH' ) ) {{
-    define( 'ABSPATH', __DIR__ . '/wp/' );
-}}
+// ** WordPress Core Directory - FORCED for shared setup ** //
+define( 'ABSPATH', __DIR__ . '/wp/' );
 
 // ** File System Method ** //
 define( 'FS_METHOD', 'direct' );
@@ -418,10 +460,25 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_P
 
 /* That's all, stop editing! Happy publishing. */
 
-/**
- * Note: wp-settings.php is loaded by the router in shared WordPress core
- * Do not load it here to avoid double-loading
- */
+/** Absolute path to the WordPress directory. */
+if ( ! defined( 'ABSPATH' ) ) {{
+    define( 'ABSPATH', __DIR__ . '/wp/' );
+}}
+
+/** Sets up WordPress vars and included files. */
+/** WP-CLI loads wp-settings automatically, so skip for CLI */
+if ( ! defined( 'WP_CLI' ) ) {{
+    require_once ABSPATH . 'wp-settings.php';
+}}
+
+
+/* That's all, stop editing! Happy publishing. */
+
+/** Sets up WordPress vars and included files. */
+/** WP-CLI loads wp-settings automatically, so skip for CLI */
+if ( ! defined( 'WP_CLI' ) ) {{
+    require_once ABSPATH . 'wp-settings.php';
+}}
 """
         
         # Place wp-config.php in htdocs (webroot) like HandPressed does
@@ -1103,14 +1160,70 @@ die($error_msg);
     def seed_plugins_and_themes(self, config):
         """Download initial plugins and themes"""
         
-        # Download baseline plugins
+        # Download baseline plugins from WordPress.org
         plugins = config.get('baseline_plugins', ['nginx-helper', 'redis-cache'])
+        if isinstance(plugins, str):
+            plugins = [p.strip() for p in plugins.split(',')]
+        
         for plugin in plugins:
             self.download_plugin(plugin)
         
-        # Download baseline theme
+        # Download GitHub plugins
+        github_plugins = config.get('github_plugins', {})
+        if github_plugins:
+            for plugin_slug, repo_info in github_plugins.items():
+                if isinstance(repo_info, str):
+                    # Parse format: "user/repo,branch,name" or "user/repo,tag,name"
+                    parts = [p.strip() for p in repo_info.split(',')]
+                    if len(parts) >= 2:
+                        github_repo = parts[0]
+                        ref_type = parts[1]  # 'branch' or 'tag'
+                        ref_name = parts[2] if len(parts) > 2 else None
+                        
+                        if ref_type == 'branch' and ref_name:
+                            self.download_plugin_from_github(github_repo, plugin_slug, branch=ref_name)
+                        elif ref_type == 'tag' and ref_name:
+                            self.download_plugin_from_github(github_repo, plugin_slug, tag=ref_name)
+                        else:
+                            self.download_plugin_from_github(github_repo, plugin_slug)
+        
+        # Download baseline theme from WordPress.org
         theme = config.get('baseline_theme', 'twentytwentyfour')
-        self.download_theme(theme)
+        if theme:
+            self.download_theme(theme)
+        
+        # Download GitHub themes
+        github_themes = config.get('github_themes', {})
+        if github_themes:
+            for theme_slug, repo_info in github_themes.items():
+                if isinstance(repo_info, str):
+                    # Parse format: "user/repo,branch,name" or "user/repo,tag,name"
+                    parts = [p.strip() for p in repo_info.split(',')]
+                    if len(parts) >= 2:
+                        github_repo = parts[0]
+                        ref_type = parts[1]  # 'branch' or 'tag'
+                        ref_name = parts[2] if len(parts) > 2 else None
+                        
+                        if ref_type == 'branch' and ref_name:
+                            self.download_theme_from_github(github_repo, theme_slug, branch=ref_name)
+                        elif ref_type == 'tag' and ref_name:
+                            self.download_theme_from_github(github_repo, theme_slug, tag=ref_name)
+                        else:
+                            self.download_theme_from_github(github_repo, theme_slug)
+        
+        # Download URL plugins
+        url_plugins = config.get('url_plugins', {})
+        if url_plugins:
+            for plugin_slug, url in url_plugins.items():
+                if isinstance(url, str):
+                    self.download_plugin_from_url(url, plugin_slug)
+        
+        # Download URL themes
+        url_themes = config.get('url_themes', {})
+        if url_themes:
+            for theme_slug, url in url_themes.items():
+                if isinstance(url, str):
+                    self.download_theme_from_url(url, theme_slug)
     
     def download_plugin(self, plugin_slug):
         """Download a plugin from WordPress.org"""
@@ -1660,10 +1773,51 @@ die($error_msg);
 
     def create_baseline_config(self, config):
         """Create baseline configuration file"""
+        # Collect all plugins: baseline + GitHub + URL
+        all_plugins = list(config.get('baseline_plugins', ['nginx-helper']))
+        
+        # Add GitHub plugins
+        github_plugins = config.get('github_plugins', {})
+        if github_plugins:
+            for plugin_slug in github_plugins.keys():
+                if plugin_slug not in all_plugins:
+                    all_plugins.append(plugin_slug)
+        
+        # Add URL plugins
+        url_plugins = config.get('url_plugins', {})
+        if url_plugins:
+            for plugin_slug in url_plugins.keys():
+                if plugin_slug not in all_plugins:
+                    all_plugins.append(plugin_slug)
+        
+        # Determine baseline version (increment if config changed)
+        baseline_file = f"{self.config_dir}/baseline.json"
+        current_version = 1
+        
+        if os.path.exists(baseline_file):
+            try:
+                with open(baseline_file, 'r') as f:
+                    old_baseline = json.load(f)
+                    old_version = old_baseline.get('version', 1)
+                    old_plugins = old_baseline.get('plugins', [])
+                    old_theme = old_baseline.get('theme', '')
+                    
+                    # Check if configuration changed
+                    plugins_changed = set(old_plugins) != set(all_plugins)
+                    theme_changed = old_theme != config.get('baseline_theme', 'twentytwentyfour')
+                    
+                    if plugins_changed or theme_changed:
+                        current_version = old_version + 1
+                        Log.info(self.app, f"   Baseline configuration changed - incrementing version to {current_version}")
+                    else:
+                        current_version = old_version
+            except:
+                current_version = 1
+        
         baseline = {
-            'version': 1,
+            'version': current_version,
             'generated': datetime.now().isoformat(),
-            'plugins': config.get('baseline_plugins', ['nginx-helper']),
+            'plugins': all_plugins,
             'theme': config.get('baseline_theme', 'twentytwentyfour'),
             'options': {
                 'blog_public': 1,
@@ -1672,7 +1826,6 @@ die($error_msg);
             }
         }
         
-        baseline_file = f"{self.config_dir}/baseline.json"
         with open(baseline_file, 'w') as f:
             json.dump(baseline, f, indent=2)
         
