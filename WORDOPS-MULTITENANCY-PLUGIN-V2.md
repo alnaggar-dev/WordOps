@@ -245,6 +245,245 @@ enable_syslog = true                    # Enable syslog logging
 syslog_tag = wo-multitenancy           # Syslog tag
 ```
 
+
+### Custom Plugin and Theme Sources
+
+**📍 ALL plugin sources are defined in:** `/etc/wo/plugins.d/multitenancy.conf`
+
+WordOps multi-tenancy supports three plugin/theme sources:
+
+1. **WordPress.org** - Free public plugins (default)
+2. **GitHub** - Your custom/private plugins with version control
+3. **Direct URLs** - Premium/commercial plugins from any HTTPS source
+
+**Important:** You define plugins in the config file ONLY. Once you run `wo multitenancy init`, all plugins are automatically available to ALL sites. You don't specify plugin sources when creating individual sites.
+
+---
+
+#### Method 1: WordPress.org Plugins (Default)
+
+**Where:** In the `[multitenancy]` section  
+**Format:** Comma-separated list
+
+```ini
+[multitenancy]
+baseline_plugins = nginx-helper,redis-cache,wordfence
+baseline_theme = twentytwentyfour
+```
+
+---
+
+#### Method 2: GitHub-Hosted Plugins
+
+**Where:** In a NEW `[github_plugins]` section  
+**Format:** `slug = username/repository,ref_type,ref`
+
+```ini
+[github_plugins]
+# Format breakdown:
+# slug = repository,ref_type,ref
+#   │         │         │      └─ Tag name (v1.0.0) or branch name (main)
+#   │         │         └──────── "tag" or "branch"  
+#   │         └────────────────── GitHub username/repository
+#   └──────────────────────────── Plugin folder name
+
+# Production: Use tags (recommended - stable versions)
+my-custom-plugin = mycompany/my-custom-plugin,tag,v1.5.0
+analytics-plugin = mycompany/analytics,tag,v2.0.0
+
+# Development: Use branches (gets latest code)
+dev-plugin = mycompany/dev-plugin,branch,develop
+```
+
+**Use tags for production** (stable versions like v1.5.0, v2.0.0)  
+**Use branches for development** (latest code from main, develop, etc.)
+
+---
+
+#### Method 3: Direct URL Plugins
+
+**Where:** In a NEW `[url_plugins]` section  
+**Format:** `slug = https://url/to/plugin.zip`
+
+```ini
+[url_plugins]
+# Format: slug = direct_url_to_zip_file
+
+premium-plugin = https://example.com/downloads/premium-plugin-v3.0.zip
+wp-rocket = https://secure.mycompany.com/plugins/wp-rocket.zip
+custom-build = https://builds.mycompany.com/latest/plugin.zip
+```
+
+**Requirements:**
+- ✅ Must be HTTPS (not HTTP)
+- ✅ Must end with .zip
+- ✅ Must be accessible from your server
+
+---
+
+#### GitHub-Hosted Themes
+
+**Where:** In a NEW `[github_themes]` section (same format as GitHub plugins)
+
+```ini
+[github_themes]
+corporate-theme = mycompany/corporate-theme,tag,v1.0.0
+```
+
+---
+
+#### Direct URL Themes
+
+**Where:** In a NEW `[url_themes]` section
+
+```ini
+[url_themes]
+premium-theme = https://example.com/downloads/theme.zip
+```
+
+---
+
+#### Complete Configuration Example
+
+**File:** `/etc/wo/plugins.d/multitenancy.conf`
+
+```ini
+[multitenancy]
+enable_plugin = true
+shared_root = /var/www/shared
+
+# Method 1: WordPress.org plugins (comma-separated list)
+baseline_plugins = nginx-helper,redis-cache,contact-form-7
+baseline_theme = twentytwentyfour
+
+# Method 2: GitHub plugins (one per line in new section)
+[github_plugins]
+custom-security = mycompany/security-plugin,tag,v2.1.0
+analytics-plugin = mycompany/analytics,tag,v1.0.5
+dev-tools = username/dev-tools,branch,main
+
+# Method 3: Direct URL plugins (one per line in new section)
+[url_plugins]
+wp-rocket = https://secure.mycompany.com/plugins/wp-rocket.zip
+gravity-forms = https://builds.intranet.local/gravity-forms-latest.zip
+
+# GitHub themes (optional)
+[github_themes]
+company-theme = mycompany/wordpress-theme,tag,v3.2.0
+
+# URL themes (optional)
+[url_themes]
+premium-theme = https://example.com/downloads/theme.zip
+```
+
+**Workflow:**
+1. Edit: `nano /etc/wo/plugins.d/multitenancy.conf`
+2. Add your plugins in the appropriate sections above
+3. Run: `wo multitenancy init` (downloads all plugins from all sources)
+4. Done! All plugins are now available to ALL sites automatically
+
+**Note:** You don't specify plugin sources when creating sites. Just run:
+```bash
+wo multitenancy create example.com --php83 --wpfc
+```
+All plugins defined in the config are automatically available.
+
+---
+
+#### GitHub Integration
+
+**Public Repositories:**
+No authentication required. Simply specify the repository in your config.
+
+**Private Repositories:**
+For private repositories, set a GitHub Personal Access Token:
+
+1. Create a token at https://github.com/settings/tokens
+2. Grant `repo` scope (or `public_repo` for public repos only)
+3. Set environment variable:
+
+```bash
+# Add to /root/.bashrc or /etc/environment
+
+#### GitHub Integration
+
+**Public Repositories:**
+No authentication required. Simply specify the repository in your config.
+
+**Private Repositories:**
+For private repositories, set a GitHub Personal Access Token:
+
+1. Create a token at https://github.com/settings/tokens
+2. Grant `repo` scope (or `public_repo` for public repos only)
+3. Set environment variable:
+
+```bash
+# Add to /root/.bashrc or /etc/environment
+export GITHUB_TOKEN="ghp_your_token_here"
+```
+
+**Security Note:** Never commit tokens to config files. Always use environment variables.
+
+**Tag vs Branch:**
+
+- **Use Tags** (Recommended for production):
+  - Stable, versioned releases
+  - Predictable deployments
+  - Easy version tracking
+  - Example: `my-plugin = user/repo,tag,v1.5.0`
+
+- **Use Branches** (For development):
+  - Continuous integration
+  - Testing latest changes
+  - Auto-updating from source
+  - Example: `my-plugin = user/repo,branch,develop`
+
+#### Direct URL Integration
+
+**When to Use:**
+- Premium plugins not in WordPress.org
+- Plugins from marketplaces (CodeCanyon, etc.)
+- Custom builds from CI/CD
+- Internal plugins from company servers
+
+**Security Considerations:**
+⚠️ **Important**: Only download from trusted sources!
+- Verify HTTPS URLs
+- Use authenticated URLs for sensitive plugins
+- Consider hosting internally for production
+- Validate zip file integrity
+
+#### Best Practices
+
+**Version Management:**
+✅ **Do:**
+- Use Git tags for production
+- Follow semantic versioning (v1.2.3)
+- Document version changes in baseline history
+- Test updates in staging first
+
+❌ **Don't:**
+- Use `latest` or `master` branch in production
+- Mix development and production sources
+- Skip version numbers
+
+**Organization:**
+Group plugins by purpose in your config for better clarity.
+
+**Troubleshooting Custom Sources:**
+
+*GitHub Download Fails:*
+- Verify repository exists and is accessible
+- Check tag/branch exists
+- Test download manually: `curl -L https://github.com/user/repo/archive/refs/tags/v1.0.0.zip -o test.zip`
+- For private repos, ensure GITHUB_TOKEN is set
+- Check rate limiting (60 requests/hour unauthenticated, 5000/hour authenticated)
+
+*URL Download Issues:*
+- Test URL accessibility: `curl -I "https://example.com/plugin.zip"`
+- Verify it's actually a zip file: `file plugin.zip`
+- Check zip contents: `unzip -l plugin.zip`
+
 ---
 
 ## Commands Reference
@@ -352,6 +591,151 @@ Display current baseline configuration.
 ```bash
 wo multitenancy baseline
 ```
+
+
+### wo multitenancy baseline add-plugin
+
+Add a plugin to the shared baseline from WordPress.org, GitHub, or a direct URL.
+
+```bash
+# From WordPress.org
+wo multitenancy baseline add-plugin <slug> [--apply-now]
+
+# From GitHub repository
+wo multitenancy baseline add-plugin <slug> --github=user/repo [--tag=v1.0.0] [--branch=main] [--apply-now]
+
+# From direct URL
+wo multitenancy baseline add-plugin <slug> --url=https://example.com/plugin.zip [--apply-now]
+```
+
+**Options:**
+- `--github=user/repo`: Download from GitHub repository
+- `--tag=v1.0.0`: Use specific Git tag (recommended for production)
+- `--branch=main`: Use specific Git branch (for development)
+- `--url=<url>`: Download from direct HTTPS URL
+- `--apply-now`: Immediately apply baseline to all sites
+
+**Examples:**
+```bash
+# Add plugin from WordPress.org
+wo multitenancy baseline add-plugin contact-form-7
+
+# Add custom plugin from GitHub with specific tag
+wo multitenancy baseline add-plugin my-custom-plugin --github=mycompany/my-plugin --tag=v2.1.0
+
+# Add plugin from GitHub using branch (development)
+wo multitenancy baseline add-plugin dev-tools --github=mycompany/dev-tools --branch=develop
+
+# Add premium plugin from direct URL
+wo multitenancy baseline add-plugin wp-rocket --url=https://example.com/downloads/wp-rocket.zip
+
+# Add and immediately activate on all sites
+wo multitenancy baseline add-plugin my-plugin --github=user/repo --tag=v1.0.0 --apply-now
+```
+
+### wo multitenancy baseline add-theme
+
+Add a theme to the shared baseline from WordPress.org, GitHub, or a direct URL.
+
+```bash
+# From WordPress.org
+wo multitenancy baseline add-theme <slug> [--apply-now]
+
+# From GitHub repository
+wo multitenancy baseline add-theme <slug> --github=user/repo [--tag=v1.0.0] [--branch=main] [--apply-now]
+
+# From direct URL
+wo multitenancy baseline add-theme <slug> --url=https://example.com/theme.zip [--apply-now]
+```
+
+**Examples:**
+```bash
+# Add theme from WordPress.org
+wo multitenancy baseline add-theme astra
+
+# Add custom theme from GitHub
+wo multitenancy baseline add-theme corporate-theme --github=mycompany/wp-theme --tag=v1.0.0
+
+# Add premium theme from URL
+wo multitenancy baseline add-theme premium-theme --url=https://example.com/theme.zip
+```
+
+### wo multitenancy baseline remove-plugin
+
+Remove a plugin from the shared baseline.
+
+```bash
+wo multitenancy baseline remove-plugin <slug> [--apply-now]
+```
+
+**Example:**
+```bash
+wo multitenancy baseline remove-plugin old-plugin --apply-now
+```
+
+### wo multitenancy baseline remove-theme
+
+Remove a theme from the shared baseline.
+
+```bash
+wo multitenancy baseline remove-theme <slug> [--apply-now]
+```
+
+### wo multitenancy baseline update-plugin
+
+Update a plugin from its original source (WordPress.org, GitHub, or URL).
+
+```bash
+wo multitenancy baseline update-plugin <slug>
+```
+
+**What it does:**
+1. Reads plugin source from baseline.json metadata
+2. Re-downloads from original source:
+   - WordPress.org: Gets latest version
+   - GitHub: Re-downloads from same tag/branch
+   - URL: Re-downloads from same URL
+3. Updates last_updated timestamp in baseline.json
+4. Suggests testing and applying to sites
+
+**Examples:**
+```bash
+# Update WordPress.org plugin to latest version
+wo multitenancy baseline update-plugin contact-form-7
+
+# Re-download GitHub plugin (same tag)
+wo multitenancy baseline update-plugin my-custom-plugin
+
+# Re-download from URL
+wo multitenancy baseline update-plugin premium-plugin
+```
+
+**Note:** For GitHub plugins, this re-downloads from the same tag/branch. To upgrade to a new tag, use `remove-plugin` then `add-plugin` with the new tag.
+
+### wo multitenancy baseline update-theme
+
+Update the theme from its original source.
+
+```bash
+wo multitenancy baseline update-theme
+```
+
+**Examples:**
+```bash
+# Update theme from its source
+wo multitenancy baseline update-theme
+```
+
+### wo multitenancy baseline apply
+
+Apply the baseline configuration to all sites (activate plugins/theme).
+
+```bash
+wo multitenancy baseline apply [--verify-only]
+```
+
+**Options:**
+- `--verify-only`: Check compliance without making changes
 
 ### wo multitenancy remove
 
@@ -1015,6 +1399,264 @@ The multi-tenancy plugin is designed for fresh site creation using the shared in
 
 ---
 
+
+### Custom Plugin Sources Issues
+
+#### GitHub Download Failures
+
+**Symptoms:** Plugin not downloaded during init, error message about repository access.
+
+**Causes:**
+1. Repository doesn't exist or is private without authentication
+2. Tag or branch doesn't exist
+3. Network connectivity issues
+4. GitHub rate limiting (60 requests/hour without authentication)
+5. Invalid repository format in configuration
+
+**Solutions:**
+
+```bash
+# 1. Verify repository exists and is accessible
+curl -I https://github.com/user/repo
+
+# 2. Check if tag exists
+curl -I https://github.com/user/repo/archive/refs/tags/v1.0.0.zip
+
+# 3. Check if branch exists
+curl -I https://github.com/user/repo/archive/refs/heads/main.zip
+
+# 4. Test download manually
+curl -L https://github.com/user/repo/archive/refs/tags/v1.0.0.zip -o test.zip
+unzip -l test.zip
+
+# 5. For private repositories, set GitHub token
+export GITHUB_TOKEN="ghp_your_token_here"
+echo 'export GITHUB_TOKEN="ghp_xxx"' >> ~/.bashrc
+source ~/.bashrc
+
+# 6. Verify token is set
+echo $GITHUB_TOKEN
+
+# 7. Check your rate limit status
+curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit
+
+# 8. Re-run init with authentication
+wo multitenancy init --force
+```
+
+**Configuration Validation:**
+```bash
+# Check config file syntax
+cat /etc/wo/plugins.d/multitenancy.conf
+
+# Verify GitHub plugin format is correct:
+# Format: slug = repository,ref_type,ref
+# Example: my-plugin = user/repo,tag,v1.0.0
+```
+
+#### Private Repository Authentication
+
+**Symptoms:** "404 Not Found" error when downloading from a private GitHub repository.
+
+**Solution:**
+
+1. **Create GitHub Personal Access Token:**
+   - Go to https://github.com/settings/tokens
+   - Click "Generate new token" → "Generate new token (classic)"
+   - Grant `repo` scope (full access to private repositories)
+   - Copy the token (starts with `ghp_`)
+
+2. **Set Environment Variable:**
+```bash
+# Add to /root/.bashrc for persistence
+echo 'export GITHUB_TOKEN="ghp_YOUR_TOKEN_HERE"' >> /root/.bashrc
+source /root/.bashrc
+
+# Or add to /etc/environment for system-wide
+echo 'GITHUB_TOKEN="ghp_YOUR_TOKEN_HERE"' | sudo tee -a /etc/environment
+```
+
+3. **Verify and Re-run:**
+```bash
+# Verify token is set
+echo $GITHUB_TOKEN
+
+# Test authentication
+curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user
+
+# Re-initialize or add plugin
+wo multitenancy init --force
+# OR
+wo multitenancy baseline add-plugin my-plugin --github=mycompany/private-repo --tag=v1.0.0
+```
+
+#### URL Download Failures
+
+**Symptoms:** Plugin/theme from URL not downloading, timeout errors, or invalid file errors.
+
+**Common Issues:**
+
+1. **URL Not Accessible:**
+```bash
+# Test URL accessibility
+curl -I "https://example.com/plugin.zip"
+
+# Test download
+curl -L "https://example.com/plugin.zip" -o test.zip
+
+# Check if it's actually a zip file
+file test.zip
+# Should output: "Zip archive data"
+
+# Verify zip contents
+unzip -l test.zip
+```
+
+2. **SSL Certificate Issues:**
+```bash
+# Test SSL certificate
+curl -v "https://example.com/plugin.zip" 2>&1 | grep -i certificate
+
+# If certificate is self-signed or expired, you may need to host internally
+```
+
+3. **Authentication Required:**
+```bash
+# If URL requires authentication, use authenticated URL or download manually
+curl -u username:password "https://example.com/plugin.zip" -o plugin.zip
+
+# Or use token-based authentication
+curl -H "Authorization: Bearer YOUR_TOKEN" "https://example.com/plugin.zip" -o plugin.zip
+```
+
+4. **URL Format Issues:**
+```bash
+# Verify URL in config file:
+# - Must be HTTPS (not HTTP)
+# - Must end with .zip
+# - Must be publicly accessible or properly authenticated
+
+# Invalid examples:
+# ❌ http://example.com/plugin.zip  (HTTP not HTTPS)
+# ❌ https://example.com/plugin     (missing .zip extension)
+
+# Valid example:
+# ✅ https://example.com/plugin.zip
+```
+
+#### GitHub Rate Limiting
+
+**Symptoms:** Error message "API rate limit exceeded" or "403 Forbidden" from GitHub.
+
+**Explanation:**
+- Unauthenticated requests: 60 per hour
+- Authenticated requests: 5,000 per hour
+
+**Solution:**
+
+```bash
+# 1. Set GitHub token to increase limit
+export GITHUB_TOKEN="ghp_your_token_here"
+
+# 2. Check current rate limit
+curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit
+
+# 3. Wait if rate limit exceeded
+# Rate limits reset hourly
+
+# 4. For multiple init runs, consider caching downloads
+# The shared infrastructure downloads are preserved between runs
+```
+
+#### Plugin Source Metadata Issues
+
+**Symptoms:** `update-plugin` command fails with "Unknown source type" or "Missing source metadata".
+
+**Cause:** Plugin was added before Phase 3 implementation, or baseline.json is corrupted.
+
+**Solution:**
+
+```bash
+# 1. Check baseline.json for plugin source metadata
+cat /var/www/shared/config/baseline.json | grep -A 5 "plugin_sources"
+
+# 2. If source metadata is missing, remove and re-add plugin
+wo multitenancy baseline remove-plugin my-plugin
+wo multitenancy baseline add-plugin my-plugin --github=user/repo --tag=v1.0.0
+
+# 3. For WordPress.org plugins without metadata (backward compatibility)
+# These will default to WordPress.org source
+wo multitenancy baseline update-plugin my-wordpress-plugin
+
+# 4. Verify baseline.json structure
+python3 -c "import json; print(json.dumps(json.load(open('/var/www/shared/config/baseline.json')), indent=2))"
+```
+
+#### Network and Connectivity Issues
+
+**Symptoms:** Timeouts, connection refused, or DNS errors during downloads.
+
+**Checks:**
+
+```bash
+# 1. Test internet connectivity
+ping -c 3 8.8.8.8
+ping -c 3 github.com
+
+# 2. Test DNS resolution
+nslookup github.com
+nslookup example.com
+
+# 3. Check firewall rules
+sudo iptables -L OUTPUT -v -n | grep -E "(REJECT|DROP)"
+
+# 4. Test HTTPS connectivity
+curl -v https://github.com 2>&1 | grep -i "connected"
+
+# 5. Check proxy settings
+echo $HTTP_PROXY
+echo $HTTPS_PROXY
+
+# 6. If behind proxy, configure git
+git config --global http.proxy http://proxy.example.com:8080
+git config --global https.proxy https://proxy.example.com:8080
+```
+
+#### Mixed Sources Configuration Errors
+
+**Symptoms:** Some plugins download, others fail during init.
+
+**Debugging:**
+
+```bash
+# 1. Check config file for formatting errors
+cat /etc/wo/plugins.d/multitenancy.conf
+
+# Look for:
+# - Correct section headers: [github_plugins], [url_plugins], etc.
+# - Correct format: slug = repository,ref_type,ref
+# - No extra spaces or special characters
+# - HTTPS URLs only for url_plugins
+
+# 2. Validate each source type manually
+# Test WordPress.org plugin
+curl -I https://downloads.wordpress.org/plugin/nginx-helper.zip
+
+# Test GitHub plugin
+curl -L https://github.com/user/repo/archive/refs/tags/v1.0.0.zip -o test.zip
+
+# Test URL plugin
+curl -I https://example.com/plugin.zip
+
+# 3. Check WordOps logs for specific errors
+wo multitenancy init --force 2>&1 | tee /tmp/init-debug.log
+cat /tmp/init-debug.log | grep -i error
+
+# 4. Review baseline.json after init
+cat /var/www/shared/config/baseline.json | python3 -m json.tool
+```
+
+
 ## FAQ
 
 ### Why don't we need custom nginx templates?
@@ -1036,6 +1678,147 @@ Yes, for this use case. Each site has its own database, can use different PHP ve
 ### What about plugin updates from WordPress admin?
 
 Plugins in the shared directory are read-only from the web. Updates must be done via `wo multitenancy update` or manually in the shared directory.
+
+
+### Can I use private GitHub repositories for plugins?
+
+Yes! Set a GitHub Personal Access Token as an environment variable:
+
+```bash
+# Create token at https://github.com/settings/tokens with 'repo' scope
+export GITHUB_TOKEN="ghp_your_token_here"
+echo 'export GITHUB_TOKEN="ghp_xxx"' >> /root/.bashrc
+```
+
+Then use the same config format:
+```ini
+[github_plugins]
+private-plugin = mycompany/private-repo,tag,v1.0.0
+```
+
+The token increases your rate limit from 60 to 5,000 requests per hour and enables access to private repositories.
+
+### What happens if GitHub is down during init?
+
+The init process will continue but log failures for GitHub plugins. You can:
+
+1. **Wait and retry:** Once GitHub is back online, run `wo multitenancy init --force`
+2. **Add plugins individually:** Use `wo multitenancy baseline add-plugin <slug> --github=user/repo --tag=v1.0.0`
+3. **Manual download:** Download the plugin zip and place it in `/var/www/shared/wp-content/plugins/`
+
+Existing plugins and WordPress.org plugins will download successfully even if GitHub is unavailable.
+
+### How do I update a GitHub plugin to a newer tag?
+
+To update to a new version (tag), remove the old plugin and add the new version:
+
+```bash
+# Remove old version
+wo multitenancy baseline remove-plugin my-plugin
+
+# Add new version
+wo multitenancy baseline add-plugin my-plugin --github=user/repo --tag=v2.0.0
+
+# Apply to all sites
+wo multitenancy baseline apply
+```
+
+**Note:** The `update-plugin` command re-downloads from the same tag/branch. It doesn't automatically upgrade to newer tags.
+
+### Can I mix WordPress.org and custom plugins?
+
+Absolutely! This is the recommended approach:
+
+```ini
+[multitenancy]
+# Use WordPress.org for public plugins
+baseline_plugins = nginx-helper,redis-cache,contact-form-7
+
+[github_plugins]
+# Use GitHub for your custom/proprietary plugins
+custom-api = mycompany/api-plugin,tag,v1.5.0
+analytics = mycompany/analytics,tag,v2.0.0
+
+[url_plugins]
+# Use URLs for premium/commercial plugins
+wp-rocket = https://secure.mycompany.com/plugins/wp-rocket.zip
+```
+
+All plugins are treated equally once downloaded. The baseline enforcement MU-plugin activates all of them regardless of source.
+
+### Do custom plugins affect rollback?
+
+No, rollback is unaffected by plugin sources. The baseline.json is stored separately from WordPress releases:
+
+```
+/var/www/shared/
+├── current -> releases/wp-20250106-120000  # Rollback changes this symlink
+├── releases/
+│   ├── wp-20250106-120000/                 # Old WordPress version
+│   └── wp-20250106-140000/                 # New WordPress version
+├── wp-content/                              # Plugins/themes (persistent)
+│   └── plugins/                             # All plugins regardless of source
+└── config/
+    └── baseline.json                        # Plugin metadata (persistent)
+```
+
+Rollback only changes which WordPress core version is active. All plugins, themes, and baseline configuration remain unchanged.
+
+### Can I host plugins on my own server?
+
+Yes, using direct URLs:
+
+```ini
+[url_plugins]
+company-plugin = https://plugins.mycompany.com/company-plugin-v1.0.0.zip
+internal-tool = https://intranet.company.lan/wordpress/internal-tool.zip
+```
+
+**Requirements:**
+- HTTPS URLs only (no HTTP)
+- URL must end with `.zip`
+- Zip file must contain plugin directory
+- Server must be accessible from WordOps server
+
+This is useful for:
+- Internal company plugins
+- Premium plugins from marketplaces
+- Custom builds from CI/CD pipelines
+- Plugins that require authentication to download
+
+### How are plugin sources tracked for updates?
+
+Plugin sources are automatically tracked in `/var/www/shared/config/baseline.json`:
+
+```json
+{
+  "plugins": ["nginx-helper", "my-custom-plugin", "premium-plugin"],
+  "plugin_sources": {
+    "nginx-helper": {
+      "type": "wordpress.org",
+      "last_updated": "2025-10-06T11:30:00"
+    },
+    "my-custom-plugin": {
+      "type": "github",
+      "repo": "mycompany/my-plugin",
+      "ref_type": "tag",
+      "ref": "v1.5.0",
+      "last_updated": "2025-10-06T11:30:00"
+    },
+    "premium-plugin": {
+      "type": "url",
+      "url": "https://example.com/plugin.zip",
+      "last_updated": "2025-10-06T11:30:00"
+    }
+  }
+}
+```
+
+This metadata enables:
+- The `update-plugin` command to know where to download updates from
+- Version tracking and auditing
+- Complete provenance information for each plugin
+- Rollback of plugin changes if needed
 
 ---
 

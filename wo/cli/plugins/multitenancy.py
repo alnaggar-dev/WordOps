@@ -1218,6 +1218,93 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Sites will stop using plugin on next baseline sync")
 
     @expose(help="Remove theme from baseline")
+
+    @expose(help="Update plugin from its original source")
+    def update_plugin(self):
+        """
+        Update a plugin from its original source (WordPress.org, GitHub, or URL)
+        
+        This command re-downloads a plugin from the source specified in baseline.json,
+        allowing you to get the latest version while maintaining source information.
+        
+        Usage:
+            wo multitenancy baseline update-plugin <slug>
+        """
+        pargs = self.app.pargs
+        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
+        
+        if not plugin_slug:
+            Log.error(self, "Plugin slug is required")
+        
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        Log.info(self, f"Updating plugin: {plugin_slug}")
+        
+        # Update plugin using SharedInfrastructure method
+        infra = SharedInfrastructure(self, shared_root)
+        success = infra.update_plugin(plugin_slug)
+        
+        if success:
+            Log.info(self, "")
+            Log.info(self, f"✅ Plugin {plugin_slug} updated successfully")
+            Log.info(self, "")
+            Log.info(self, "Next steps:")
+            Log.info(self, "  • Test changes in staging site")
+            Log.info(self, f"  • Apply to all sites: wo multitenancy baseline apply")
+        else:
+            Log.error(self, f"Failed to update plugin {plugin_slug}")
+            Log.error(self, "Check the error messages above for details")
+
+    @expose(help="Update theme from its original source")
+    def update_theme(self):
+        """
+        Update the theme from its original source (WordPress.org, GitHub, or URL)
+        
+        This command re-downloads the theme from the source specified in baseline.json.
+        
+        Usage:
+            wo multitenancy baseline update-theme
+        """
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
+        
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Get theme name from baseline
+        baseline_file = f"{shared_root}/config/baseline.json"
+        try:
+            with open(baseline_file, 'r') as f:
+                baseline = json.load(f)
+            theme_name = baseline.get('theme')
+            if not theme_name:
+                Log.error(self, "No theme configured in baseline")
+        except FileNotFoundError:
+            Log.error(self, "Baseline configuration not found")
+        except json.JSONDecodeError:
+            Log.error(self, "Failed to parse baseline.json")
+        
+        Log.info(self, f"Updating theme: {theme_name}")
+        
+        # Update theme using SharedInfrastructure method
+        infra = SharedInfrastructure(self, shared_root)
+        success = infra.update_theme()
+        
+        if success:
+            Log.info(self, "")
+            Log.info(self, f"✅ Theme {theme_name} updated successfully")
+            Log.info(self, "")
+            Log.info(self, "Next steps:")
+            Log.info(self, "  • Test changes in staging site")
+            Log.info(self, f"  • Apply to all sites: wo multitenancy baseline apply")
+        else:
+            Log.error(self, f"Failed to update theme {theme_name}")
+            Log.error(self, "Check the error messages above for details")
+
     def remove_theme(self):
         """Remove a theme from baseline default"""
         pargs = self.app.pargs

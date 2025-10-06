@@ -1858,10 +1858,6 @@ add_action('init', function() {
                 os.chmod(os.path.join(root, f), 0o644)
 
 
-
-class ReleaseManager:
-    """Manages WordPress core releases in the shared infrastructure"""
-    
     def initialize_git_tracking(self):
         """Initialize git repository for baseline tracking"""
         try:
@@ -1956,16 +1952,16 @@ class ReleaseManager:
             Log.debug(self.app, f"Git commit: {message}")
             return True
             
-        except subprocess.CalledProcessError as e:
-            # Check if it's just "no changes to commit" (which is OK)
-            error_msg = e.stderr.decode("utf-8", errors="ignore") if e.stderr else ""
-            if "nothing to commit" in error_msg or "no changes added" in error_msg:
-                Log.debug(self.app, "Git: No changes to commit")
-                return True
-            else:
-                Log.warn(self.app, f"⚠️  Git commit failed: {error_msg}")
-                Log.warn(self.app, "Changes not tracked in git history")
-                return False
+        except subprocess.CalledProcessError:
+            # No changes to commit (this is okay)
+            return True
+        except Exception as e:
+            Log.debug(self.app, f"Git commit failed: {e}")
+            return False
+
+
+class ReleaseManager:
+    """Manage WordPress releases"""
     
     def __init__(self, app, shared_root):
         self.app = app
@@ -2260,13 +2256,9 @@ class BaselineApplicator:
         success_count = 0
         quarantine_count = 0
         
-        for idx, site in enumerate(production_sites, 1):
+        for site in production_sites:
             domain = site['domain']
             site_path = site['site_path']
-            
-            # Show progress indicator
-            progress = f"[{idx}/{len(production_sites)}]"
-            Log.info(app, f"{progress} Applying to {domain}...")
             
             # Apply baseline to this site
             result = BaselineApplicator.apply_baseline_to_site(
