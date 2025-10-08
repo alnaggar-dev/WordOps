@@ -355,7 +355,8 @@ class MTDatabase:
                     site_path=site_data.get('site_path', f'/var/www/{domain}'),
                     php_version=site_data.get('php_version', '8.3'),
                     shared_release=site_data.get('shared_release'),
-                    is_ssl=site_data.get('is_ssl', False)
+                    is_ssl=site_data.get('is_ssl', False),
+                    redis_prefix=site_data.get('redis_prefix')  # Phase 2: Store Redis prefix
                 )
                 session.add(site)
             

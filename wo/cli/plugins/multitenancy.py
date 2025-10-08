@@ -268,11 +268,31 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Linking to shared WordPress core...")
             MTFunctions.create_shared_symlinks(self, site_htdocs, shared_root)
             
-            # Generate wp-config.php
+            # ================================================================
+            # PHASE 2: Generate unique Redis prefix for cache isolation
+            # ================================================================
+            # Each site gets a unique Redis prefix to prevent cache collisions
+            # in the shared Redis instance. The prefix is:
+            # 1. Generated with collision detection (adds hash if needed)
+            # 2. Written to wp-config.php for Redis Object Cache Pro
+            # 3. Stored in database via site_data for tracking and debugging
+            Log.info(self, "Generating Redis cache prefix...")
+            redis_prefix = MTDatabase.generate_redis_prefix(self, wo_domain)
+            Log.debug(self, f"Redis prefix for {wo_domain}: {redis_prefix}")
+            
+            # ================================================================
+            # Generate wp-config.php with Redis prefix and shared config
+            # ================================================================
+            # Creates site-specific wp-config.php that includes:
+            # - Unique Redis prefix (for cache isolation)
+            # - Shared configuration include (fleet-wide settings)
+            # - Site-specific database credentials
+            # - Site-specific authentication salts
             Log.info(self, "Generating wp-config.php...")
             MTFunctions.generate_wp_config(
                 self, site_root, wo_domain,
-                db_name, db_user, db_pass, db_host
+                db_name, db_user, db_pass, db_host,
+                redis_prefix=redis_prefix  # Pass explicit prefix for consistency
             )
             
             # Generate nginx configuration
@@ -341,7 +361,8 @@ class WOMultitenancyController(CementBaseController):
                 'php_version': php_version,
                 'is_shared': True,
                 'is_ssl': False,  # Will be updated after SSL setup
-                'shared_release': MTDatabase.get_current_release(self)
+                'shared_release': MTDatabase.get_current_release(self),
+                'redis_prefix': redis_prefix  # Phase 2: Store Redis prefix with site data
             }
             addNewSite(
                 self,
