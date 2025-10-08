@@ -94,6 +94,12 @@ class WOMultitenancyController(CementBaseController):
             (['--url'], dict(help='Direct download URL', dest='url')),
             # Phase 3: Rollback support
             (['--to-version'], dict(help='Baseline version to rollback to', type=int, dest='to_version')),
+            # Phase 3: Shared configuration management
+            (['--action'], dict(help='Config action: show|set|get|history|test|edit|rollback', dest='config_action')),
+            (['--key'], dict(help='Configuration key', dest='config_key')),
+            (['--value'], dict(help='Configuration value', dest='config_value')),
+            (['--dry-run'], dict(help='Preview changes without applying', action='store_true', dest='dry_run')),
+            (['--config-version'], dict(help='Git version for rollback', dest='config_version')),
             (['--to-commit'], dict(help='Git commit hash to rollback to', dest='to_commit')),
         ]
         usage = "wo multitenancy <command> [options]"
@@ -1791,6 +1797,103 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"  3. Check plugin files exist in /var/www/shared/wp-content/plugins/")
             Log.error(self, "  4. Check site error logs for more details")
 
+
+
+
+    @expose(help="Manage shared WordPress configuration")
+    def shared_config(self):
+        """Manage shared configuration (fleet-wide settings)"""
+        
+        # Verify multi-tenancy is initialized
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+            Log.error(self, "Run: wo multitenancy init")
+            return
+        
+        # Load configuration
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        
+        # Get action from arguments
+        action = self.app.pargs.config_action
+        
+        if not action:
+            Log.error(self, "Missing --action parameter")
+            Log.info(self, "Available actions: show, set, get, history, test, edit, rollback")
+            Log.info(self, "Example: wo multitenancy shared-config --action show")
+            return
+        
+        # Verify shared config file exists
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        if not os.path.exists(config_file) and action != 'show':
+            Log.error(self, f"Shared config file not found: {config_file}")
+            Log.error(self, "Run 'wo multitenancy init --force' to recreate")
+            return
+        
+        # Route to appropriate action
+        if action == 'show':
+            SharedConfig.show_config(self, shared_root)
+        
+        elif action == 'set':
+            key = self.app.pargs.config_key
+            value = self.app.pargs.config_value
+            dry_run = getattr(self.app.pargs, 'dry_run', False)
+            
+            if not key or not value:
+                Log.error(self, "Both --key and --value are required for set action")
+                Log.info(self, "Example: wo multitenancy shared-config --action set --key WP_DEBUG --value true")
+                return
+            
+            # Confirm if not dry-run
+            if not dry_run and sys.stdin.isatty():
+                current = SharedConfig.get_config_value(self, shared_root, key)
+                if current:
+                    Log.warn(self, f"\n⚠️  Change {key} from '{current}' to '{value}'")
+                    Log.warn(self, "This affects ALL sites immediately!")
+                    if input("\nProceed? [y/N]: ").lower() not in ['y', 'yes']:
+                        Log.info(self, "Cancelled")
+                        return
+            
+            SharedConfig.set_config(self, shared_root, key, value, dry_run=dry_run)
+        
+        elif action == 'get':
+            key = self.app.pargs.config_key
+            if not key:
+                Log.error(self, "--key is required for get action")
+                return
+            
+            value = SharedConfig.get_config_value(self, shared_root, key)
+            if value is not None:
+                Log.info(self, f"{key} = {value}")
+            else:
+                Log.error(self, f"Key not found: {key}")
+        
+        elif action == 'history':
+            SharedConfig.show_config_history(self, shared_root)
+        
+        elif action == 'test':
+            SharedConfig.test_config(self, shared_root)
+        
+        elif action == 'edit':
+            dry_run = getattr(self.app.pargs, 'dry_run', False)
+            if not dry_run:
+                Log.warn(self, "\n⚠️  Manual edit - invalid syntax breaks ALL sites!")
+                Log.warn(self, "Backup created automatically\n")
+            SharedConfig.edit_config(self, shared_root, auto_reload=not dry_run)
+        
+        elif action == 'rollback':
+            version = getattr(self.app.pargs, 'config_version', None)
+            if sys.stdin.isatty():
+                msg = f"version {version}" if version else "previous version"
+                Log.warn(self, f"\n⚠️  Rollback to {msg} affects ALL sites!")
+                if input("\nProceed? [y/N]: ").lower() not in ['y', 'yes']:
+                    Log.info(self, "Cancelled")
+                    return
+            SharedConfig.rollback_config(self, shared_root, version)
+        
+        else:
+            Log.error(self, f"Unknown action: {action}")
+            Log.info(self, "Available: show, set, get, history, test, edit, rollback")
 
 
 def load(app):

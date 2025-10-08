@@ -3038,3 +3038,759 @@ define('WO_REDIS_TOKEN', '');
             Log.error(app, f"Git history error: {str(e)}")
             return False
 
+
+    # ========================================================================
+    # PHASE 3A: CONFIG MANIPULATION METHODS
+    # ========================================================================
+    
+    @staticmethod
+    def get_config_value(app, shared_root, key):
+        """
+        Extract current value of a configuration key from wp-config-shared.php
+        
+        This method safely reads the shared configuration file and extracts
+        the value for a given PHP constant defined via define(). It handles
+        different quote styles and value types (strings, booleans, integers).
+        
+        Args:
+            app: WordOps application instance
+            key: Configuration key (e.g., 'WP_MEMORY_LIMIT', 'WP_DEBUG')
+        
+        Returns:
+            str: Current value as string, or None if key not found
+        
+        Examples:
+            >>> get_config_value(app, 'WP_MEMORY_LIMIT')
+            '256M'
+            >>> get_config_value(app, 'WP_DEBUG')
+            'false'
+            >>> get_config_value(app, 'WP_POST_REVISIONS')
+            '5'
+        
+        Handles multiple PHP define formats:
+            - define('KEY', 'value');     // Single quotes
+            - define("KEY", "value");     // Double quotes
+            - define('KEY', value);       // No quotes (bool/int)
+            - define('KEY', false);       // Boolean
+            - define('KEY', 123);         // Integer
+        """
+        from wo.core.logging import Log
+        import re
+        
+        # shared_root passed as parameter
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        
+        if not os.path.exists(config_file):
+            Log.error(app, f"Config file not found: {config_file}")
+            return None
+        
+        try:
+            with open(config_file, 'r') as f:
+                content = f.read()
+            
+            # Match define('KEY', 'value'); or define('KEY', value);
+            # Handles single quotes, double quotes, and no quotes
+            # The pattern breaks down as:
+            # - define\s*\(        : Match 'define' followed by optional whitespace and opening paren
+            # - \s*['\"]?          : Optional whitespace and optional quote (single or double)
+            # - {re.escape(key)}   : The exact key we're looking for (escaped for safety)
+            # - ['\"]?             : Optional closing quote
+            # - \s*,\s*            : Optional whitespace, comma, optional whitespace
+            # - ([^)]+)            : Capture group: everything until closing paren (the value)
+            # - \s*\)              : Optional whitespace and closing paren
+            pattern = rf"define\s*\(\s*['\"]?{re.escape(key)}['\"]?\s*,\s*([^)]+)\s*\)"
+            match = re.search(pattern, content)
+            
+            if match:
+                value = match.group(1).strip()
+                # Remove quotes if present (handles both single and double quotes)
+                value = value.strip("'\"")
+                Log.debug(app, f"Found {key} = {value}")
+                return value
+            
+            Log.debug(app, f"Key not found: {key}")
+            return None
+            
+        except Exception as e:
+            Log.error(app, f"Error reading config for key '{key}': {str(e)}")
+            return None
+
+    @staticmethod
+    def show_config_diff(app, shared_root, key, new_value):
+        """
+        Show preview of configuration change (for dry-run mode)
+        
+        Displays a formatted preview showing the current value, proposed new value,
+        and impact warning. This is used by the --dry-run flag to let users see
+        what would change before actually applying modifications.
+        
+        Args:
+            app: WordOps application instance
+            key: Configuration key being changed
+            new_value: Proposed new value
+        
+        Returns:
+            None (displays output directly)
+        
+        Example output:
+            ============================================================
+            CONFIGURATION CHANGE PREVIEW (DRY RUN)
+            ============================================================
+            
+            Key: WP_DEBUG
+            Current value: false
+            New value: true
+            
+            Impact: This will affect ALL sites immediately after applying
+            Services that will be reloaded: PHP-FPM (all versions), Nginx
+            
+            ============================================================
+            No changes applied (dry-run mode)
+            ============================================================
+        """
+        from wo.core.logging import Log
+        
+        # Get current value for comparison
+        current_value = SharedConfig.get_config_value(app, shared_root, key)
+        
+        # Format the preview output
+        Log.info(app, "\n" + "="*70)
+        Log.info(app, "CONFIGURATION CHANGE PREVIEW (DRY RUN)")
+        Log.info(app, "="*70)
+        Log.info(app, f"\nKey: {key}")
+        Log.info(app, f"Current value: {current_value if current_value else '(not set)'}")
+        Log.info(app, f"New value: {new_value}")
+        Log.info(app, f"\nImpact: This will affect ALL sites immediately after applying")
+        Log.info(app, f"Services that will be reloaded: PHP-FPM (all versions), Nginx")
+        Log.info(app, "\n" + "="*70)
+        Log.info(app, "No changes applied (dry-run mode)")
+        Log.info(app, "="*70 + "\n")
+
+    @staticmethod
+    def reload_services_after_config_change(app, shared_root):
+        """
+        Reload PHP-FPM (all installed versions) and Nginx after config changes
+        
+        This method automatically detects all installed PHP versions and reloads
+        their PHP-FPM services, plus Nginx. This ensures configuration changes
+        take effect immediately across all sites.
+        
+        Uses native WordOps service management (WOService) for reliability.
+        PHP-FPM reload failures are non-fatal (logged as warnings), but Nginx
+        reload failure is critical and will raise an exception.
+        
+        Args:
+            app: WordOps application instance
+        
+        Returns:
+            bool: True if all services reloaded successfully
+        
+        Raises:
+            Exception: If Nginx reload fails (critical failure)
+        
+        Process:
+            1. Detect all installed PHP versions (7.4, 8.0, 8.1, 8.2, 8.3)
+            2. Reload PHP-FPM for each version (continue on failure)
+            3. Reload Nginx (abort on failure - critical)
+            4. Log all operations for debugging
+        
+        Note:
+            OpCache is automatically cleared during PHP-FPM reload
+        """
+        from wo.core.services import WOService
+        from wo.core.logging import Log
+        
+        Log.info(app, "Reloading services to apply configuration changes...")
+        
+        # Detect all installed PHP versions by checking for config files
+        php_versions = []
+        for version in ['7.4', '8.0', '8.1', '8.2', '8.3']:
+            config_path = f'/etc/php/{version}/fpm/php-fpm.conf'
+            if os.path.exists(config_path):
+                php_versions.append(version)
+                Log.debug(app, f"Detected PHP {version} installed")
+        
+        if not php_versions:
+            Log.warn(app, "No PHP-FPM versions detected on system")
+        else:
+            Log.debug(app, f"Found {len(php_versions)} PHP version(s): {', '.join(php_versions)}")
+        
+        # Reload PHP-FPM for each installed version
+        # Continue even if one version fails (non-fatal)
+        service = WOService()
+        failed_php_reloads = []
+        
+        for version in php_versions:
+            service_name = f'php{version}-fpm'
+            try:
+                Log.debug(app, f"Reloading {service_name}...")
+                service.reload_service(service_name)
+                Log.debug(app, f"✅ Reloaded {service_name} successfully")
+            except Exception as e:
+                Log.warn(app, f"⚠️  Failed to reload {service_name}: {str(e)}")
+                failed_php_reloads.append(service_name)
+                # Continue with other services (non-fatal)
+        
+        # Reload Nginx (CRITICAL - must succeed)
+        try:
+            Log.debug(app, "Reloading nginx...")
+            service.reload_service('nginx')
+            Log.debug(app, "✅ Reloaded nginx successfully")
+        except Exception as e:
+            Log.error(app, f"❌ CRITICAL: Failed to reload nginx: {str(e)}")
+            Log.error(app, "Configuration may not be applied correctly!")
+            # Re-raise to signal critical failure
+            raise
+        
+        # Summary
+        if failed_php_reloads:
+            Log.warn(app, f"Some PHP-FPM services failed to reload: {', '.join(failed_php_reloads)}")
+            Log.warn(app, "Sites using those PHP versions may not have updated configuration")
+        
+        Log.info(app, "✅ Service reload completed")
+        return True
+
+    @staticmethod
+    def set_config(app, shared_root, key, value, dry_run=False):
+        """
+        Set/update a configuration value in wp-config-shared.php
+        
+        This is the most critical method in Phase 3. It safely updates PHP
+        configuration values using a comprehensive workflow to prevent breaking
+        all sites with invalid syntax.
+        
+        Safety Workflow:
+            1. Get current value for comparison
+            2. If dry_run: show preview and STOP (no changes)
+            3. Backup current config file
+            4. Read and modify content in memory
+            5. Write to TEMP file first
+            6. Validate temp file syntax (php -l)
+            7. If valid: replace original file atomically
+            8. Commit changes to Git
+            9. Reload all services
+            10. If any step fails: restore from backup
+        
+        Args:
+            app: WordOps application instance
+            key: Configuration key to update (e.g., 'WP_MEMORY_LIMIT')
+            value: New value as string
+            dry_run: If True, only preview changes without applying (default: False)
+        
+        Returns:
+            bool: True if successful, False if failed
+        
+        Value Type Handling:
+            - 'true'/'false' (case-insensitive) → boolean (no quotes)
+            - Pure integers → integer (no quotes)
+            - Everything else → string (with single quotes)
+        
+        Examples:
+            >>> set_config(app, 'WP_DEBUG', 'true')
+            # Results in: define('WP_DEBUG', true);
+            
+            >>> set_config(app, 'WP_MEMORY_LIMIT', '512M')
+            # Results in: define('WP_MEMORY_LIMIT', '512M');
+            
+            >>> set_config(app, 'WP_POST_REVISIONS', '10')
+            # Results in: define('WP_POST_REVISIONS', 10);
+        
+        Error Recovery:
+            - Backup created before ANY changes
+            - Temp file validation before overwriting
+            - Backup restored if validation fails
+            - Git provides additional rollback capability
+        
+        Risk Level: HIGH
+            - One syntax error = all sites broken
+            - Mitigated by temp file validation + backups
+        """
+        from wo.core.logging import Log
+        import re
+        import shutil
+        
+        # shared_root passed as parameter
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        
+        # Validate that config file exists
+        if not os.path.exists(config_file):
+            Log.error(app, f"Config file not found: {config_file}")
+            return False
+        
+        # Step 1: Get current value for comparison/preview
+        old_value = SharedConfig.get_config_value(app, shared_root, key)
+        
+        # Check if key exists in config
+        if old_value is None:
+            Log.error(app, f"Configuration key not found: {key}")
+            Log.error(app, "Available keys can be viewed with: wo multitenancy config show")
+            return False
+        
+        # Step 2: If dry_run mode, show preview and STOP (no changes)
+        if dry_run:
+            SharedConfig.show_config_diff(app, shared_root, key, value)
+            return True  # Success in dry-run means preview displayed
+        
+        # Step 3: Create backup before making ANY changes
+        Log.debug(app, "Creating backup before modifications...")
+        backup_file = SharedConfig.backup_config(app, config_file)
+        if not backup_file:
+            Log.error(app, "Failed to create backup, ABORTING for safety")
+            return False
+        Log.debug(app, f"Backup created: {backup_file}")
+        
+        try:
+            # Step 4: Read current content
+            with open(config_file, 'r') as f:
+                content = f.read()
+            
+            # Step 5: Determine value format based on type
+            # Boolean: true/false without quotes
+            # Integer: numeric value without quotes
+            # String: everything else with single quotes
+            if value.lower() in ['true', 'false']:
+                formatted_value = value.lower()  # Boolean (no quotes)
+                value_type = 'boolean'
+            elif value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
+                formatted_value = value  # Integer (no quotes)
+                value_type = 'integer'
+            else:
+                # String value - escape any single quotes in the value
+                escaped_value = value.replace("'", "\\'")
+                formatted_value = f"'{escaped_value}'"
+                value_type = 'string'
+            
+            Log.debug(app, f"Value type detected: {value_type}")
+            Log.debug(app, f"Formatted value: {formatted_value}")
+            
+            # Step 6: Replace value in content using regex
+            # Pattern matches: define('KEY', OLD_VALUE)
+            # Replaces with: define('KEY', NEW_VALUE)
+            pattern = rf"(define\s*\(\s*['\"]?{re.escape(key)}['\"]?\s*,\s*)([^)]+)(\s*\);?)"
+            
+            # Check if pattern exists before replacement
+            if not re.search(pattern, content):
+                Log.error(app, f"Could not find define pattern for key: {key}")
+                Log.error(app, "This should not happen - key was found in get_config_value()")
+                return False
+            
+            # Perform the replacement
+            new_content = re.sub(pattern, rf"\1{formatted_value}\3", content)
+            
+            # Verify replacement actually changed something
+            if new_content == content:
+                Log.warn(app, f"Content unchanged - value may already be set to {value}")
+                return True  # Not an error, just no change needed
+            
+            # Step 7: Write to TEMP file for validation
+            temp_file = f"{config_file}.tmp"
+            Log.debug(app, f"Writing to temp file: {temp_file}")
+            with open(temp_file, 'w') as f:
+                f.write(new_content)
+            
+            # Step 8: Validate syntax BEFORE overwriting original
+            Log.debug(app, "Validating PHP syntax of modified config...")
+            if not SharedConfig.validate_config(app, temp_file):
+                # Validation failed - clean up and abort
+                os.remove(temp_file)
+                Log.error(app, "❌ New configuration has INVALID PHP syntax!")
+                Log.error(app, "Changes NOT applied - original config preserved")
+                Log.error(app, f"Backup available at: {backup_file}")
+                return False
+            
+            Log.debug(app, "✅ PHP syntax validation passed")
+            
+            # Step 9: Replace original file atomically
+            Log.debug(app, "Replacing original config file...")
+            shutil.move(temp_file, config_file)
+            os.chmod(config_file, 0o644)  # Ensure correct permissions
+            
+            Log.info(app, f"✅ Updated {key}: {old_value} → {value}")
+            
+            # Step 10: Commit to Git for audit trail
+            Log.debug(app, "Committing change to Git...")
+            commit_message = f"Update {key} from {old_value} to {value}"
+            SharedConfig.commit_config_change(app, shared_root, commit_message)
+            
+            # Step 11: Reload services to apply changes immediately
+            Log.debug(app, "Reloading services...")
+            SharedConfig.reload_services_after_config_change(app, shared_root)
+            
+            Log.info(app, "✅ Configuration updated successfully and applied to all sites")
+            return True
+            
+        except Exception as e:
+            # Something went wrong - attempt to restore from backup
+            Log.error(app, f"❌ Error during config update: {str(e)}")
+            
+            # Clean up temp file if it exists
+            temp_file = f"{config_file}.tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    Log.debug(app, "Cleaned up temp file")
+                except:
+                    pass  # Best effort
+            
+            # Restore from backup
+            if backup_file and os.path.exists(backup_file):
+                try:
+                    shutil.copy2(backup_file, config_file)
+                    Log.info(app, "✅ Restored configuration from backup")
+                    Log.info(app, f"Backup location: {backup_file}")
+                except Exception as restore_error:
+                    Log.error(app, f"❌ CRITICAL: Failed to restore from backup: {str(restore_error)}")
+                    Log.error(app, f"Manual restoration may be needed from: {backup_file}")
+            
+            return False
+
+    # ========================================================================
+    # PHASE 3B: ADDITIONAL HELPER METHODS
+    # ========================================================================
+    
+    @staticmethod
+    def show_config(app, shared_root):
+        """
+        Display the entire shared configuration file
+        
+        Shows the complete contents of wp-config-shared.php with formatting
+        for easy reading. This is useful for viewing all current settings
+        at once.
+        
+        Args:
+            app: WordOps application instance
+            shared_root: Path to shared infrastructure root
+        
+        Returns:
+            bool: True if displayed successfully, False if file not found
+        """
+        from wo.core.logging import Log
+        
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        
+        if not os.path.exists(config_file):
+            Log.error(app, f"Config file not found: {config_file}")
+            return False
+        
+        try:
+            with open(config_file, 'r') as f:
+                content = f.read()
+            
+            Log.info(app, "\n" + "="*70)
+            Log.info(app, "Shared Configuration: wp-config-shared.php")
+            Log.info(app, "="*70 + "\n")
+            Log.info(app, content)
+            Log.info(app, "\n" + "="*70 + "\n")
+            
+            return True
+            
+        except Exception as e:
+            Log.error(app, f"Error reading config file: {str(e)}")
+            return False
+
+    @staticmethod
+    def test_config(app, shared_root):
+        """
+        Test configuration syntax without making changes
+        
+        Wrapper for validate_config() that provides user-friendly output.
+        Validates the PHP syntax of wp-config-shared.php without modifying
+        anything. Useful for checking configuration health.
+        
+        Args:
+            app: WordOps application instance
+            shared_root: Path to shared infrastructure root
+        
+        Returns:
+            bool: True if syntax is valid, False if invalid
+        """
+        from wo.core.logging import Log
+        
+        config_file = f"{shared_root}/config/wp-config-shared.php"
+        
+        if not os.path.exists(config_file):
+            Log.error(app, f"Config file not found: {config_file}")
+            return False
+        
+        Log.info(app, "Testing configuration syntax...")
+        
+        if SharedConfig.validate_config(app, config_file):
+            Log.info(app, "✅ Configuration syntax is VALID")
+            Log.info(app, "All sites should load correctly with this configuration")
+            return True
+        else:
+            Log.error(app, "❌ Configuration syntax is INVALID")
+            Log.error(app, "Sites may be broken! Use 'wo multitenancy config rollback' to restore")
+            return False
+
+    # ========================================================================
+    # PHASE 3C: ADVANCED FEATURES
+    # ========================================================================
+    
+    @staticmethod
+    def rollback_config(app, shared_root, version=None):
+        """
+        Rollback configuration to a previous Git version
+        
+        Uses Git history to restore a previous configuration state. Can rollback
+        to a specific commit or to the most recent previous version. After
+        rollback, validates syntax and reloads services to apply changes.
+        
+        Args:
+            app: WordOps application instance
+            shared_root: Path to shared infrastructure root
+            version: Optional Git commit hash to rollback to (default: HEAD~1)
+        
+        Returns:
+            bool: True if rollback successful, False otherwise
+        
+        Process:
+            1. Verify Git repository exists
+            2. Create backup before rollback (safety)
+            3. Checkout previous version from Git
+            4. Validate syntax of rolled-back config
+            5. If valid: reload services to apply
+            6. If invalid: restore from backup and abort
+        
+        Examples:
+            >>> rollback_config(app, shared_root)  # Rollback to previous commit
+            >>> rollback_config(app, shared_root, 'abc123')  # Rollback to specific commit
+        
+        Note:
+            You can view available versions with: wo multitenancy config history
+        """
+        from wo.core.logging import Log
+        import subprocess
+        import shutil
+        
+        config_dir = f"{shared_root}/config"
+        config_file = f"{config_dir}/wp-config-shared.php"
+        git_dir = f"{config_dir}/.git"
+        
+        # Verify Git repository exists
+        if not os.path.exists(git_dir):
+            Log.error(app, "Git repository not initialized for config")
+            return False
+        
+        # Determine rollback target
+        if version:
+            target = version
+            Log.info(app, f"Rolling back configuration to version: {version}")
+        else:
+            target = "HEAD~1"
+            Log.info(app, "Rolling back configuration to previous version (HEAD~1)")
+        
+        # Create backup before rollback (safety)
+        Log.debug(app, "Creating safety backup before rollback...")
+        backup_file = SharedConfig.backup_config(app, config_file)
+        if not backup_file:
+            Log.error(app, "Failed to create safety backup, ABORTING")
+            return False
+        
+        try:
+            # Checkout previous version from Git
+            Log.debug(app, f"Checking out {target} from Git...")
+            result = subprocess.run(
+                ['git', 'checkout', target, '--', 'wp-config-shared.php'],
+                cwd=config_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            Log.debug(app, "✅ Git checkout successful")
+            
+            # Validate syntax of rolled-back configuration
+            Log.debug(app, "Validating syntax of rolled-back configuration...")
+            if not SharedConfig.validate_config(app, config_file):
+                Log.error(app, "❌ Rolled-back configuration has INVALID syntax!")
+                Log.error(app, "This should not happen - Git history should be valid")
+                
+                # Restore from backup
+                Log.info(app, "Restoring from backup...")
+                shutil.copy2(backup_file, config_file)
+                Log.error(app, "Rollback ABORTED - original configuration restored")
+                return False
+            
+            Log.debug(app, "✅ Rolled-back configuration syntax is valid")
+            
+            # Reload services to apply rolled-back configuration
+            Log.debug(app, "Reloading services to apply rolled-back configuration...")
+            SharedConfig.reload_services_after_config_change(app, shared_root)
+            
+            Log.info(app, "✅ Configuration rolled back successfully and applied to all sites")
+            Log.info(app, "Use 'wo multitenancy config history' to see current version")
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"❌ Git rollback failed: {str(e)}")
+            if e.stderr:
+                Log.error(app, f"Git error: {e.stderr}")
+            Log.error(app, "Use 'wo multitenancy config history' to see available versions")
+            return False
+            
+        except Exception as e:
+            Log.error(app, f"❌ Rollback error: {str(e)}")
+            
+            # Attempt to restore from backup
+            if backup_file and os.path.exists(backup_file):
+                try:
+                    shutil.copy2(backup_file, config_file)
+                    Log.info(app, "✅ Restored from backup after error")
+                except:
+                    Log.error(app, f"Failed to restore from backup: {backup_file}")
+            
+            return False
+
+    @staticmethod
+    def edit_config(app, shared_root, auto_reload=True):
+        """
+        Open configuration in user's preferred editor
+        
+        Opens wp-config-shared.php in the user's $EDITOR (or nano as fallback).
+        After the user saves and exits, validates syntax. If valid and auto_reload
+        is True, commits changes to Git and reloads services. If syntax is invalid,
+        restores from backup.
+        
+        Args:
+            app: WordOps application instance
+            shared_root: Path to shared infrastructure root
+            auto_reload: If True, reload services after valid changes (default: True)
+        
+        Returns:
+            bool: True if edit was successful, False otherwise
+        
+        Process:
+            1. Check for modified files in Git (warn if dirty)
+            2. Create backup before opening editor
+            3. Open file in $EDITOR
+            4. After save: validate syntax
+            5. If valid: commit to Git, optionally reload services
+            6. If invalid: restore from backup, show error
+        
+        Safety Features:
+            - Backup before editing
+            - Syntax validation after save
+            - Automatic restore if invalid
+            - Warning if Git has uncommitted changes
+        
+        Environment Variables:
+            $EDITOR: Preferred text editor (default: nano)
+        
+        Example:
+            $ export EDITOR=vim
+            $ wo multitenancy config edit
+        """
+        from wo.core.logging import Log
+        import subprocess
+        import shutil
+        
+        config_dir = f"{shared_root}/config"
+        config_file = f"{config_dir}/wp-config-shared.php"
+        git_dir = f"{config_dir}/.git"
+        
+        if not os.path.exists(config_file):
+            Log.error(app, f"Config file not found: {config_file}")
+            return False
+        
+        # Check Git status for uncommitted changes
+        if os.path.exists(git_dir):
+            try:
+                result = subprocess.run(
+                    ['git', 'status', '--porcelain', 'wp-config-shared.php'],
+                    cwd=config_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip():
+                    Log.warn(app, "⚠️  Configuration has uncommitted changes")
+                    Log.warn(app, "Those changes will be included in the next commit")
+            except:
+                pass  # Best effort - don't fail if git status fails
+        
+        # Create backup before allowing edits
+        Log.debug(app, "Creating backup before opening editor...")
+        backup_file = SharedConfig.backup_config(app, config_file)
+        if not backup_file:
+            Log.error(app, "Failed to create backup, ABORTING for safety")
+            return False
+        
+        Log.debug(app, f"Backup created: {backup_file}")
+        
+        # Get file modification time before edit
+        mtime_before = os.path.getmtime(config_file)
+        
+        # Determine editor to use
+        editor = os.environ.get('EDITOR', 'nano')
+        Log.info(app, f"Opening configuration in {editor}...")
+        Log.info(app, "Save and exit when done editing")
+        
+        try:
+            # Open file in editor (blocking call - waits for user to save & exit)
+            result = subprocess.run(
+                [editor, config_file],
+                check=True
+            )
+            
+            # Check if file was actually modified
+            mtime_after = os.path.getmtime(config_file)
+            if mtime_before == mtime_after:
+                Log.info(app, "No changes made to configuration")
+                return True  # Success - no changes is not an error
+            
+            Log.info(app, "Configuration file modified - validating syntax...")
+            
+            # Validate syntax of edited file
+            if not SharedConfig.validate_config(app, config_file):
+                Log.error(app, "❌ Edited configuration has INVALID PHP syntax!")
+                Log.error(app, "Changes NOT applied - restoring from backup")
+                
+                # Restore from backup
+                shutil.copy2(backup_file, config_file)
+                Log.info(app, "✅ Original configuration restored from backup")
+                Log.info(app, f"Your edited version is saved at: {backup_file}")
+                Log.info(app, "Fix syntax errors and try again")
+                return False
+            
+            Log.info(app, "✅ Syntax validation passed")
+            
+            # Commit changes to Git
+            Log.debug(app, "Committing changes to Git...")
+            commit_message = "Manual configuration edit via wo multitenancy config edit"
+            SharedConfig.commit_config_change(app, shared_root, commit_message)
+            
+            # Reload services if auto_reload is True
+            if auto_reload:
+                Log.debug(app, "Reloading services to apply changes...")
+                SharedConfig.reload_services_after_config_change(app, shared_root)
+                Log.info(app, "✅ Configuration updated successfully and applied to all sites")
+            else:
+                Log.info(app, "✅ Configuration updated successfully")
+                Log.info(app, "Run 'wo stack reload' to apply changes")
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"Editor exited with error: {str(e)}")
+            return False
+            
+        except KeyboardInterrupt:
+            Log.info(app, "\nEdit cancelled by user")
+            return False
+            
+        except Exception as e:
+            Log.error(app, f"Error during edit: {str(e)}")
+            
+            # Attempt to restore from backup
+            if backup_file and os.path.exists(backup_file):
+                try:
+                    # Check if current file is valid, if not restore
+                    if not SharedConfig.validate_config(app, config_file):
+                        shutil.copy2(backup_file, config_file)
+                        Log.info(app, "✅ Restored from backup after error")
+                except:
+                    pass  # Best effort
+            
+            return False
