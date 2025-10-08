@@ -50,6 +50,8 @@ class MultitenancySite(Base):
     is_quarantined = Column(Boolean, default=False)
     quarantine_reason = Column(Text)
     quarantine_date = Column(DateTime)
+    # Phase 1: Redis Object Cache prefix (unique per site for cache isolation)
+    redis_prefix = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -115,6 +117,38 @@ class MTDatabase:
                         Log.debug(app, "Added quarantine_date column")
                     except Exception:
                         pass
+                    
+                    # Phase 1: Add redis_prefix column for Redis Object Cache isolation
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites 
+                            ADD COLUMN redis_prefix TEXT
+                        """))
+                        Log.debug(app, "Added redis_prefix column")
+                    except Exception:
+                        pass  # Column might already exist
+                    
+                    # Phase 1: Create unique index on redis_prefix for collision prevention
+                    # This ensures no two sites can have the same Redis prefix
+                    try:
+                        db_session.execute(text('''
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_redis_prefix_unique 
+                            ON multitenancy_sites(redis_prefix) 
+                            WHERE redis_prefix IS NOT NULL
+                        '''))
+                        Log.debug(app, "Created unique index on redis_prefix")
+                    except Exception:
+                        pass  # Index might already exist
+                    
+                    # Phase 1: Create regular index for faster lookups
+                    try:
+                        db_session.execute(text('''
+                            CREATE INDEX IF NOT EXISTS idx_redis_prefix 
+                            ON multitenancy_sites(redis_prefix)
+                        '''))
+                        Log.debug(app, "Created index on redis_prefix")
+                    except Exception:
+                        pass  # Index might already exist
                     
                     db_session.commit()
                     Log.info(app, "✅ Phase 2 database migration completed")
@@ -606,3 +640,219 @@ class MTDatabase:
         except Exception as e:
             Log.debug(app, f"Error getting quarantined sites: {e}")
             return []
+
+    # ========================================================================
+    # PHASE 1: REDIS PREFIX MANAGEMENT
+    # ========================================================================
+    # These methods manage unique Redis Object Cache prefixes for each site
+    # to ensure cache isolation in shared Redis instances.
+    # ========================================================================
+    
+    @staticmethod
+    def generate_redis_prefix(app, domain):
+        """
+        Generate a unique Redis prefix for a site with collision detection.
+        
+        Redis prefixes ensure cache isolation between sites in a shared Redis
+        instance. Each site gets a unique prefix based on its domain name.
+        If a collision is detected, a hash suffix is added for uniqueness.
+        
+        Args:
+            app: WordOps application instance
+            domain: Site domain name (e.g., 'example.com', 'test-site.org')
+        
+        Returns:
+            str: Unique Redis prefix (e.g., 'example_com_', 'test_site_org_abc123_')
+        
+        Examples:
+            example.com -> example_com_
+            test-site.org -> test_site_org_
+            
+        Collision Handling:
+            If 'example_com_' is already used, generates 'example_com_a1b2c3_'
+            using MD5 hash of the domain for uniqueness.
+        """
+        from wo.core.logging import Log
+        import hashlib
+        
+        # Convert domain to safe prefix format
+        # Replace dots and hyphens with underscores, add trailing underscore
+        base_prefix = domain.replace('.', '_').replace('-', '_')
+        prefix = f"{base_prefix}_"
+        
+        # Check if this prefix is already in use by another site
+        existing_domain = MTDatabase.check_redis_prefix_exists(app, prefix)
+        
+        if existing_domain and existing_domain != domain:
+            # Collision detected! Another site is already using this prefix
+            # Add a hash suffix to make it unique
+            hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+            prefix = f"{base_prefix}_{hash_suffix}_"
+            
+            Log.warn(app, f"⚠️  Redis prefix collision detected for '{domain}'")
+            Log.warn(app, f"   Another site already uses '{base_prefix}_'")
+            Log.warn(app, f"   Using unique version: {prefix}")
+        
+        Log.debug(app, f"Generated Redis prefix for {domain}: {prefix}")
+        return prefix
+    
+    @staticmethod
+    def check_redis_prefix_exists(app, prefix):
+        """
+        Check if a Redis prefix is already in use by another site.
+        
+        This prevents two sites from having the same Redis prefix, which would
+        cause cache collisions and data leakage between sites.
+        
+        Args:
+            app: WordOps application instance
+            prefix: Redis prefix to check (e.g., 'example_com_')
+        
+        Returns:
+            str|None: Domain name currently using this prefix, or None if unused
+        
+        Usage:
+            existing = check_redis_prefix_exists(app, 'example_com_')
+            if existing:
+                print(f"Prefix already used by: {existing}")
+        """
+        from wo.core.logging import Log
+        
+        try:
+            session = db_session
+            
+            # Query for any site with this Redis prefix
+            site = session.query(MultitenancySite).filter_by(
+                redis_prefix=prefix
+            ).first()
+            
+            if site:
+                Log.debug(app, f"Redis prefix '{prefix}' is used by: {site.domain}")
+                return site.domain
+            
+            Log.debug(app, f"Redis prefix '{prefix}' is available")
+            return None
+            
+        except Exception as e:
+            Log.debug(app, f"Error checking Redis prefix: {e}")
+            return None
+    
+    @staticmethod
+    def set_redis_prefix(app, domain, prefix):
+        """
+        Store the Redis prefix for a site in the database.
+        
+        This is called during site creation to persist the generated Redis
+        prefix. The unique constraint on the column ensures no duplicates.
+        
+        Args:
+            app: WordOps application instance
+            domain: Site domain name
+            prefix: Redis prefix to store (e.g., 'example_com_')
+        
+        Returns:
+            bool: True if prefix stored successfully, False otherwise
+        
+        Database Constraint:
+            The unique index on redis_prefix ensures no two sites can have
+            the same prefix, providing database-level collision prevention.
+        """
+        from wo.core.logging import Log
+        
+        try:
+            session = db_session
+            
+            # Find the site record
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            
+            if site:
+                # Update the Redis prefix
+                site.redis_prefix = prefix
+                site.updated_at = datetime.now()
+                session.commit()
+                
+                Log.debug(app, f"Set Redis prefix for {domain}: {prefix}")
+                return True
+            else:
+                Log.error(app, f"Site not found in database: {domain}")
+                return False
+                
+        except Exception as e:
+            session.rollback()
+            Log.error(app, f"Failed to set Redis prefix for {domain}: {str(e)}")
+            return False
+    
+    @staticmethod
+    def get_redis_prefix(app, domain):
+        """
+        Retrieve the stored Redis prefix for a site.
+        
+        This is used when generating configuration files or debugging
+        Redis cache issues for a specific site.
+        
+        Args:
+            app: WordOps application instance
+            domain: Site domain name
+        
+        Returns:
+            str|None: Redis prefix for the site, or None if not set
+        
+        Usage:
+            prefix = get_redis_prefix(app, 'example.com')
+            if prefix:
+                print(f"Site uses Redis prefix: {prefix}")
+        """
+        from wo.core.logging import Log
+        
+        try:
+            session = db_session
+            
+            # Find the site record
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            
+            if site and site.redis_prefix:
+                Log.debug(app, f"Retrieved Redis prefix for {domain}: {site.redis_prefix}")
+                return site.redis_prefix
+            else:
+                Log.debug(app, f"No Redis prefix found for: {domain}")
+                return None
+                
+        except Exception as e:
+            Log.debug(app, f"Error retrieving Redis prefix for {domain}: {e}")
+            return None
+    
+    @staticmethod
+    def get_all_redis_prefixes(app):
+        """
+        Get all Redis prefixes in use across all sites.
+        
+        Useful for debugging Redis cache issues, checking for collisions,
+        or listing all cache namespaces in use.
+        
+        Args:
+            app: WordOps application instance
+        
+        Returns:
+            dict: Dictionary mapping domain names to Redis prefixes
+                  Example: {'example.com': 'example_com_', 'test.org': 'test_org_'}
+        """
+        from wo.core.logging import Log
+        
+        try:
+            session = db_session
+            
+            # Query all sites with Redis prefixes
+            sites = session.query(MultitenancySite).filter(
+                MultitenancySite.redis_prefix.isnot(None)
+            ).all()
+            
+            # Build dictionary of domain -> prefix mappings
+            prefixes = {site.domain: site.redis_prefix for site in sites}
+            
+            Log.debug(app, f"Found {len(prefixes)} Redis prefixes in use")
+            return prefixes
+            
+        except Exception as e:
+            Log.debug(app, f"Error retrieving Redis prefixes: {e}")
+            return {}
+

@@ -26,7 +26,7 @@ from wo.core.sslutils import SSL
 from wo.core.variables import WOVar
 from wo.core.acme import WOAcme
 from wo.cli.plugins.multitenancy_functions import (
-    MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator
+    MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator, SharedConfig
 )
 from wo.cli.plugins.multitenancy_db import MTDatabase
 
@@ -144,6 +144,21 @@ class WOMultitenancyController(CementBaseController):
             # Create MU-plugin
             Log.info(self, "Creating MU-plugin for baseline enforcement...")
             infra.create_mu_plugin()
+            
+            # Phase 1: Create shared configuration file
+            Log.info(self, "Creating shared configuration file...")
+            if SharedConfig.create_shared_config_file(self, shared_root):
+                Log.info(self, "   ✅ Shared config file created")
+            else:
+                Log.warn(self, "   ⚠️  Could not create shared config file")
+            
+            # Phase 1: Initialize dedicated Git repository for shared config
+            Log.info(self, "Setting up git tracking for shared config...")
+            config_dir = f"{shared_root}/config"
+            if SharedConfig.initialize_config_git(self, shared_root):
+                Log.info(self, "   ✅ Shared config Git tracking initialized")
+            else:
+                Log.warn(self, "   Git tracking not available (git not installed)")
             
             # Initialize git tracking
             Log.info(self, "Setting up git tracking for baseline...")
