@@ -13,7 +13,7 @@ tags: [openspec, change]
 - Do not write any code during the proposal stage. Only create design documents (proposal.md, tasks.md, design.md, and spec deltas). Implementation happens in the apply stage after approval.
 
 **Steps**
-1. Review `openspec/project.md`, run `openspec list` and `openspec list --specs`, and inspect related code or docs (e.g., via `rg`/`ls`) to ground the proposal in current behaviour; note any gaps that require clarification.
+1. Review `openspec/project.md` and `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` (the project's source of truth documentation), run `openspec list` and `openspec list --specs`, and inspect related code or docs (e.g., via `rg`/`ls`) to ground the proposal in current behaviour; check if the requested feature already exists or can extend existing functionality before proposing new capabilities; note any gaps that require clarification.
 2. Choose a unique verb-led `change-id` and scaffold `proposal.md`, `tasks.md`, and `design.md` (when needed) under `openspec/changes/<id>/`.
 3. Map the change into concrete capabilities or requirements, breaking multi-scope efforts into distinct spec deltas with clear relationships and sequencing.
 4. Capture architectural reasoning in `design.md` when the solution spans multiple systems, introduces new patterns, or demands trade-off discussion before committing to specs.
@@ -25,4 +25,5 @@ tags: [openspec, change]
 - Use `openspec show <id> --json --deltas-only` or `openspec show <spec> --type spec` to inspect details when validation fails.
 - Search existing requirements with `rg -n "Requirement:|Scenario:" openspec/specs` before writing new ones.
 - Explore the codebase with `rg <keyword>`, `ls`, or direct file reads so proposals align with current implementation realities.
+- `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` documents all existing commands, configuration options, and features - always check it before proposing to avoid duplicating existing functionality.
 <!-- OPENSPEC:END -->
