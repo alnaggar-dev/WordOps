@@ -86,6 +86,123 @@ After deployment, create separate PR to:
   - Change: `openspec show <change-id> --json --deltas-only`
 - Full-text search (use ripgrep): `rg -n "Requirement:|Scenario:" openspec/specs`
 
+---
+
+## WordOps Plugin Guidelines
+
+This project is a **Multi-tenancy Plugin for a forked WordOps**. While we have flexibility to customize, we should stay close to upstream WordOps patterns to minimize maintenance burden and enable future upstream merges.
+
+### Extend First, Customize Second
+
+**Decision Tree for Implementation:**
+```
+Need new functionality?
+├─ Can WordOps native function do it? → Use it directly
+├─ Can we extend/wrap a native function? → Extend it
+├─ Does WordOps have a pattern for this? → Follow that pattern
+├─ Must we create something new? → Create, but document why
+└─ Changing WordOps core behavior? → Requires strong justification
+```
+
+**Prefer Native WordOps Functions:**
+| Task | Use This | Not This |
+|------|----------|----------|
+| Create database | `setupdatabase()` | Custom MySQL code |
+| SSL certificates | `WOAcme` class | Custom acme.sh wrapper |
+| Service control | `WOService` | Direct systemctl calls |
+| Logging | `Log.info/debug/error` | print() or custom logger |
+| Shell commands | `WOShellExec` | subprocess.run() |
+| File operations | `WOFileUtils` | Direct os/shutil calls |
+
+### Plugin Architecture
+
+**Key Files (modify these):**
+```
+wo/cli/plugins/
+├── multitenancy.py           # CLI controller (@expose decorators)
+├── multitenancy_functions.py # Business logic (MTFunctions, SharedInfrastructure)
+└── multitenancy_db.py        # Database operations (MTDatabase)
+```
+
+**WordOps Core (extend, don't modify unless necessary):**
+```
+wo/core/           # Core utilities - use, don't change
+wo/cli/plugins/    # Other plugins - reference for patterns
+```
+
+### Implementation Patterns
+
+**Adding a New Command:**
+1. Add argument to `WOMultitenancyController.Meta.arguments`
+2. Create `@expose` method in controller
+3. Implement logic in `multitenancy_functions.py`
+4. Add database operations to `multitenancy_db.py` if needed
+
+**Nginx Configuration:**
+- Use WordOps modular includes (`common/wpfc-php83.conf`, etc.)
+- Generate via `MTFunctions.generate_modular_nginx_config()`
+- Do NOT create custom nginx templates
+
+**Database Operations:**
+- Extend WordOps SQLite schema in `multitenancy_db.py`
+- Use `MTDatabase` class methods
+- Tables: `multitenancy_config`, `multitenancy_releases`, `multitenancy_sites`
+
+### When Customization is Justified
+
+Create custom implementation when:
+- WordOps has no equivalent functionality
+- Native function doesn't support required parameters
+- Performance requires optimization (document benchmarks)
+- Security requires isolation from WordOps patterns
+
+**Always document in proposal.md:**
+- Why native WordOps approach doesn't work
+- What upstream changes would eliminate need for customization
+- Migration path if upstream adds equivalent feature
+
+### Code Style for This Project
+
+```python
+# Imports: stdlib, then WordOps core, then plugin modules
+import os
+import json
+from wo.core.logging import Log
+from wo.core.shellexec import WOShellExec
+from wo.cli.plugins.multitenancy_functions import MTFunctions
+
+# Logging: Always use WordOps Log class
+Log.info(self, "Creating site: {0}".format(domain))
+Log.debug(self, "Debug details here")
+Log.error(self, "Error message")
+
+# Error handling: Comprehensive with user-friendly messages
+try:
+    result = WOShellExec.cmd_exec(self, command)
+except CommandExecutionError as e:
+    Log.error(self, "Failed to execute: {0}".format(str(e)))
+    raise
+```
+
+### Testing Changes
+
+Before submitting:
+```bash
+# Validate nginx configs
+nginx -t
+
+# Test plugin loads
+wo multitenancy --help
+
+# Verify database schema
+sqlite3 /var/lib/wo/dbase.db ".schema multitenancy_%"
+
+# Check symlink structure
+ls -la /var/www/shared/current
+```
+
+---
+
 ## Quick Start
 
 ### CLI Commands
