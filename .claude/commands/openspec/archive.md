@@ -20,8 +20,20 @@ tags: [openspec, archive]
 3. Run `openspec archive <id> --yes` so the CLI moves the change and applies spec updates without prompts (use `--skip-specs` only for tooling-only work).
 4. Review the command output to confirm the target specs were updated and the change landed in `changes/archive/`.
 5. Validate with `openspec validate --strict` and inspect with `openspec show <id>` if anything looks off.
+6. **Update Project Documentation:**
+   - Read `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` (the source of truth for this project).
+   - Based on the archived change's `proposal.md` and implemented code, update the relevant section(s) in the documentation:
+     - **New commands** → Add to "Commands Reference" section
+     - **New configuration options** → Add to "Configuration" section
+     - **Architecture changes** → Update "Architecture" or "How It Works" sections
+     - **New troubleshooting items** → Add to "Troubleshooting" section
+     - **New FAQ items** → Add to "FAQ" section
+     - **Bug fixes with user impact** → Add to "Troubleshooting" if relevant
+   - Follow the existing documentation style and format.
+   - If the change is internal/refactoring with no user-facing impact, note this and skip documentation update.
 
 **Reference**
 - Use `openspec list` to confirm change IDs before archiving.
 - Inspect refreshed specs with `openspec list --specs` and address any validation issues before handing off.
+- `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` is the main documentation file and must stay in sync with implemented features.
 <!-- OPENSPEC:END -->
