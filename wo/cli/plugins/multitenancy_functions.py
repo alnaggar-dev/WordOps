@@ -104,9 +104,64 @@ class MTFunctions:
                     url_themes[key] = value
             if url_themes:
                 result['url_themes'] = url_themes
-        
+
+        # DevOps improvements: [webhooks] section
+        if config.has_section('webhooks'):
+            webhooks = {
+                'url': config.get('webhooks', 'url', fallback='').strip(),
+                'secret': config.get('webhooks', 'secret', fallback='').strip(),
+                'enabled_events': [
+                    e.strip() for e in config.get(
+                        'webhooks', 'enabled_events', fallback=''
+                    ).split(',') if e.strip()
+                ],
+                'timeout': config.getint('webhooks', 'timeout', fallback=5),
+                'retries': config.getint('webhooks', 'retries', fallback=3),
+            }
+            result['webhooks'] = webhooks
+
+        # DevOps improvements: [logging] section
+        if config.has_section('logging'):
+            result['logging'] = {
+                'file': config.get(
+                    'logging', 'file', fallback='/var/log/wo/multitenancy.json'
+                ).strip(),
+                'enabled': config.getboolean('logging', 'enabled', fallback=True),
+            }
+        else:
+            result['logging'] = {
+                'file': '/var/log/wo/multitenancy.json',
+                'enabled': True,
+            }
+
+        # DevOps improvements: [audit] section
+        if config.has_section('audit'):
+            result['audit'] = {
+                'retention_days': config.getint(
+                    'audit', 'retention_days', fallback=90
+                ),
+                'enabled': config.getboolean('audit', 'enabled', fallback=True),
+            }
+        else:
+            result['audit'] = {'retention_days': 90, 'enabled': True}
+
+        # DevOps improvements: [maintenance] section (admin IP bypass)
+        if config.has_section('maintenance'):
+            result['maintenance'] = {
+                'admin_ips': [
+                    ip.strip() for ip in config.get(
+                        'maintenance', 'admin_ips', fallback=''
+                    ).split(',') if ip.strip()
+                ],
+                'default_retry_after': config.getint(
+                    'maintenance', 'default_retry_after', fallback=600
+                ),
+            }
+        else:
+            result['maintenance'] = {'admin_ips': [], 'default_retry_after': 600}
+
         return result
-    
+
         return result
     
     @staticmethod
@@ -2391,133 +2446,186 @@ class BaselineApplicator:
             return result
     
     @staticmethod
-    def apply_baseline_to_sites(app, config, baseline_version):
-        """Apply current baseline to all sites via WP-CLI"""
+    def apply_baseline_to_sites(app, config, baseline_version, dry_run=False, verbose=False, tag_filter=None):
+        """Apply current baseline to all sites via WP-CLI.
+
+        Returns a summary dict suitable for JSON output or audit details.
+        Accepts dry_run (preview without mutating), verbose (per-site progress),
+        and tag_filter (list of tags to restrict the target set).
+        """
         from wo.cli.plugins.multitenancy_db import MTDatabase
-        
+
         # Get baseline config
         shared_root = config.get('shared_root', '/var/www/shared')
         baseline_file = f"{shared_root}/config/baseline.json"
-        
+
         with open(baseline_file, 'r') as f:
             baseline = json.load(f)
 
-        # *** PHASE 2: TEST ON STAGING SITE FIRST ***
-        staging_site = MTDatabase.get_staging_site(app)
-        
-        if staging_site:
-            Log.info(app, f"Testing on staging site: {staging_site['domain']}...")
-            
-            result = BaselineApplicator.apply_baseline_to_site(
-                app,
-                staging_site['domain'],
-                staging_site['site_path'],
-                baseline
-            )
-            
-            if not result['success']:
-                Log.error(app, "=" * 60)
-                Log.error(app, f"❌ STAGING TEST FAILED: {result['error']}")
-                Log.error(app, "=" * 60)
-                Log.error(app, "Aborting production rollout!")
-                Log.error(app, f"Fix the issue on staging site: {staging_site['domain']}")
-                Log.error(app, "Then try again.")
-                return
-            
-            Log.info(app, "✅ Staging test PASSED")
-            Log.info(app, "")
-        else:
-            Log.warn(app, "⚠️  No staging site found")
-            Log.warn(app, "   Skipping pre-production test (NOT RECOMMENDED)")
-            Log.warn(app, "   Create one with: wo multitenancy staging create <domain>")
-            Log.warn(app, "")
-            
-            # Ask for confirmation
-            if not hasattr(app.pargs, 'force') or not app.pargs.force:
-                try:
-                    confirm = input("Continue without staging test? [y/N]: ").strip().lower()
-                    if confirm != 'y':
-                        Log.info(app, "Aborted by user")
-                        return
-                except:
-                    pass  # If input fails (non-interactive), continue
-        
-        
+        # *** PHASE 2: TEST ON STAGING SITE FIRST *** (skipped in dry_run)
+        if not dry_run:
+            staging_site = MTDatabase.get_staging_site(app)
+
+            if staging_site:
+                Log.info(app, f"Testing on staging site: {staging_site['domain']}...")
+
+                result = BaselineApplicator.apply_baseline_to_site(
+                    app,
+                    staging_site['domain'],
+                    staging_site['site_path'],
+                    baseline
+                )
+
+                if not result['success']:
+                    Log.error(app, "=" * 60)
+                    Log.error(app, f"❌ STAGING TEST FAILED: {result['error']}")
+                    Log.error(app, "=" * 60)
+                    Log.error(app, "Aborting production rollout!")
+                    Log.error(app, f"Fix the issue on staging site: {staging_site['domain']}")
+                    Log.error(app, "Then try again.")
+                    return {'status': 'aborted', 'reason': 'staging_test_failed'}
+
+                Log.info(app, "✅ Staging test PASSED")
+                Log.info(app, "")
+            else:
+                Log.warn(app, "⚠️  No staging site found")
+                Log.warn(app, "   Skipping pre-production test (NOT RECOMMENDED)")
+                Log.warn(app, "   Create one with: wo multitenancy staging create <domain>")
+                Log.warn(app, "")
+
+                # Ask for confirmation
+                if not hasattr(app.pargs, 'force') or not app.pargs.force:
+                    try:
+                        confirm = input("Continue without staging test? [y/N]: ").strip().lower()
+                        if confirm != 'y':
+                            Log.info(app, "Aborted by user")
+                            return {'status': 'aborted', 'reason': 'user_declined'}
+                    except:
+                        pass  # If input fails (non-interactive), continue
+
         # Get all production sites (not staging, not quarantined)
         from wo.core.database import db_session
         from wo.cli.plugins.multitenancy_db import MultitenancySite
-        
+
         session = db_session
         sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
-        
+
         production_sites = [
             {
                 'domain': s.domain,
                 'site_path': s.site_path,
                 'is_staging': s.is_staging,
-                'is_quarantined': s.is_quarantined
+                'is_quarantined': s.is_quarantined,
+                'tags': [t for t in (getattr(s, 'tags', '') or '').split(',') if t],
             }
-            for s in sites 
-            if not getattr(s, 'is_staging', False) 
+            for s in sites
+            if not getattr(s, 'is_staging', False)
             and not getattr(s, 'is_quarantined', False)
         ]
-        
+
+        if tag_filter:
+            wanted = set(tag_filter)
+            production_sites = [
+                s for s in production_sites if wanted.intersection(set(s['tags']))
+            ]
+
         if not production_sites:
-            Log.error(app, "No production sites found")
-            return
-        
-        Log.info(app, f"Applying baseline v{baseline_version} to {len(production_sites)} sites...")
-        
+            Log.warn(app, "No production sites match the filter")
+            return {
+                'status': 'noop', 'dry_run': dry_run,
+                'baseline_version': baseline_version,
+                'attempted': 0, 'succeeded': 0, 'failed': 0,
+                'quarantined': 0, 'sites': [],
+            }
+
+        header = f"Applying baseline v{baseline_version} to {len(production_sites)} sites"
+        if dry_run:
+            header += ' [DRY RUN — no changes will be written]'
+        Log.info(app, header + '...')
+
         success_count = 0
         quarantine_count = 0
-        
+        per_site = []
+
         for site in production_sites:
             domain = site['domain']
             site_path = site['site_path']
-            
-            # Apply baseline to this site
+
+            if dry_run:
+                if verbose:
+                    Log.info(
+                        app,
+                        f"  [dry-run] would apply baseline to {domain} "
+                        f"(plugins={','.join(baseline.get('plugins', []))}, "
+                        f"theme={baseline.get('theme', '')})",
+                    )
+                per_site.append({
+                    'domain': domain, 'status': 'dry_run', 'tags': site['tags'],
+                })
+                continue
+
+            start = _time.monotonic()
             result = BaselineApplicator.apply_baseline_to_site(
-                app, 
-                domain, 
-                site_path, 
-                baseline
+                app, domain, site_path, baseline,
             )
-            
+            dur = int((_time.monotonic() - start) * 1000)
+
             if result['success']:
-                # Update baseline version in DB
                 site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
                 if site_obj:
                     site_obj.baseline_version = baseline_version
                     site_obj.updated_at = datetime.now()
                     session.commit()
-                
                 success_count += 1
-                Log.debug(app, f"Applied to {domain}")
+                if verbose:
+                    Log.info(app, f"  ✅ {domain} ({dur} ms)")
+                else:
+                    Log.debug(app, f"Applied to {domain}")
+                per_site.append({
+                    'domain': domain, 'status': 'success',
+                    'duration_ms': dur, 'tags': site['tags'],
+                })
             else:
-                # Quarantine the site
-                MTDatabase.mark_site_quarantined(
-                    app, 
-                    domain, 
-                    result['error']
-                )
+                MTDatabase.mark_site_quarantined(app, domain, result['error'])
                 quarantine_count += 1
-                Log.warn(app, f"Quarantined {domain}: {result['error']}")
-        
-        # Clear global cache
-        Log.info(app, "Clearing cache globally...")
-        from wo.core.shellexec import WOShellExec
-        WOShellExec.cmd_exec(app, "wo clean --all", errormsg="", log=False)
-        
+                Log.warn(app, f"  ❌ {domain}: {result['error']}")
+                per_site.append({
+                    'domain': domain, 'status': 'quarantined',
+                    'error': result['error'], 'duration_ms': dur, 'tags': site['tags'],
+                })
+
+        if not dry_run:
+            Log.info(app, "Clearing cache globally...")
+            from wo.core.shellexec import WOShellExec
+            WOShellExec.cmd_exec(app, "wo clean --all", errormsg="", log=False)
+
         # Report results
         Log.info(app, "")
         Log.info(app, "=" * 60)
-        Log.info(app, f"✅ Successfully applied to {success_count}/{len(production_sites)} sites")
-        
+        Log.info(
+            app,
+            f"✅ Successfully applied to {success_count}/{len(production_sites)} sites"
+            if not dry_run
+            else f"[DRY RUN] Would apply to {len(production_sites)} sites",
+        )
+
         if quarantine_count > 0:
             Log.warn(app, f"⚠️  {quarantine_count} site(s) quarantined due to errors")
             Log.info(app, "Run 'wo multitenancy baseline validate' to review")
-        
+
         Log.info(app, "=" * 60)
+
+        return {
+            'status': 'completed' if not dry_run else 'dry_run',
+            'dry_run': dry_run,
+            'baseline_version': baseline_version,
+            'attempted': len(production_sites),
+            'succeeded': success_count,
+            'failed': quarantine_count,
+            'quarantined': quarantine_count,
+            'tag_filter': tag_filter or [],
+            'sites': per_site,
+        }
 
 
 # ============================================================================
@@ -3792,5 +3900,415 @@ define('WO_REDIS_TOKEN', '');
                         Log.info(app, "✅ Restored from backup after error")
                 except:
                     pass  # Best effort
-            
+
             return False
+
+
+# ---------------------------------------------------------------------------
+# DevOps improvements: structured logging, JSON output, audit, webhooks
+# ---------------------------------------------------------------------------
+
+
+import hashlib as _hashlib
+import hmac as _hmac
+import logging as _logging
+import re as _re
+import socket as _socket
+import time as _time
+import urllib.error as _urlerror
+import urllib.request as _urlrequest
+import uuid as _uuid
+from contextlib import contextmanager as _contextmanager
+
+
+_TAG_RE = _re.compile(r'^[a-z0-9-]+$')
+
+
+def validate_tags(tags_csv):
+    """Parse and validate a comma-separated tag string.
+
+    Returns a deduplicated sorted list. Raises ValueError on malformed input.
+    """
+    if tags_csv is None:
+        return []
+    if isinstance(tags_csv, (list, tuple, set)):
+        parts = [str(t).strip() for t in tags_csv]
+    else:
+        parts = [p.strip() for p in str(tags_csv).split(',')]
+    parts = [p for p in parts if p]
+    for tag in parts:
+        if not _TAG_RE.match(tag):
+            raise ValueError(
+                f"Invalid tag '{tag}' (allowed: lowercase letters, digits, hyphens)"
+            )
+    return sorted(set(parts))
+
+
+# Attach as MTFunctions method for discoverability
+MTFunctions.validate_tags = staticmethod(validate_tags)
+
+
+class StructuredLogger:
+    """JSON-lines logger for multitenancy operations.
+
+    Emits one JSON object per line to the file configured in the [logging]
+    section (default /var/log/wo/multitenancy.json). Wraps stdlib logging so
+    writes are multi-process safe. Use the `operation()` context manager to
+    automatically attach correlation IDs and measure duration.
+    """
+
+    SCHEMA_VERSION = 1
+    _LOGGERS = {}
+
+    def __init__(self, app, log_file=None):
+        self.app = app
+        config = MTFunctions.load_config(app) if app is not None else {}
+        logging_cfg = config.get('logging', {}) if isinstance(config, dict) else {}
+        self.log_file = log_file or logging_cfg.get(
+            'file', '/var/log/wo/multitenancy.json'
+        )
+        self.enabled = logging_cfg.get('enabled', True)
+        self._logger = self._get_logger(self.log_file)
+
+    @classmethod
+    def _get_logger(cls, path):
+        if path in cls._LOGGERS:
+            return cls._LOGGERS[path]
+        logger = _logging.getLogger(f'wo.multitenancy.structured::{path}')
+        logger.setLevel(_logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                handler = _logging.FileHandler(path)
+                handler.setFormatter(_logging.Formatter('%(message)s'))
+                logger.addHandler(handler)
+            except Exception:
+                # Silent fallback — never let logging break the caller
+                handler = _logging.NullHandler()
+                logger.addHandler(handler)
+        cls._LOGGERS[path] = logger
+        return logger
+
+    def emit(self, level, event, correlation_id=None, duration_ms=None, **fields):
+        if not self.enabled:
+            return
+        record = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'level': level,
+            'event': event,
+            'schema_version': self.SCHEMA_VERSION,
+        }
+        if correlation_id:
+            record['correlation_id'] = correlation_id
+        if duration_ms is not None:
+            record['duration_ms'] = int(duration_ms)
+        for k, v in fields.items():
+            if v is None:
+                continue
+            try:
+                json.dumps(v)
+                record[k] = v
+            except TypeError:
+                record[k] = str(v)
+        try:
+            self._logger.info(json.dumps(record, default=str))
+        except Exception:
+            pass
+
+    def info(self, event, **kwargs):
+        self.emit('info', event, **kwargs)
+
+    def warn(self, event, **kwargs):
+        self.emit('warn', event, **kwargs)
+
+    def error(self, event, **kwargs):
+        self.emit('error', event, **kwargs)
+
+    @_contextmanager
+    def operation(self, event, correlation_id=None, **start_fields):
+        cid = correlation_id or str(_uuid.uuid4())
+        start = _time.monotonic()
+        self.emit('info', f'{event}.start', correlation_id=cid, **start_fields)
+        state = {'result': 'success', 'correlation_id': cid, 'extra': {}}
+        try:
+            yield state
+        except Exception as exc:
+            elapsed_ms = (_time.monotonic() - start) * 1000
+            self.emit(
+                'error', f'{event}.failed',
+                correlation_id=cid, duration_ms=elapsed_ms,
+                error=str(exc), **state.get('extra', {})
+            )
+            raise
+        else:
+            elapsed_ms = (_time.monotonic() - start) * 1000
+            self.emit(
+                'info', f'{event}.complete',
+                correlation_id=cid, duration_ms=elapsed_ms,
+                result=state.get('result'), **state.get('extra', {})
+            )
+
+
+class JsonOutput:
+    """Emit machine-readable JSON payloads without Log's color wrapping.
+
+    Always writes to the interpreter's original stdout (`sys.__stdout__`) so
+    that callers which temporarily redirect `sys.stdout` to stderr during
+    command execution (to keep progress text out of a `jq` pipe) still see a
+    clean JSON document on stdout.
+    """
+
+    @staticmethod
+    def emit(app, payload):
+        import sys as _sys
+        try:
+            text = json.dumps(payload, default=str, indent=2, sort_keys=True)
+        except Exception as exc:
+            text = json.dumps({'error': f'serialization failed: {exc}'})
+        target = _sys.__stdout__ or _sys.stdout
+        try:
+            target.write(text + '\n')
+            target.flush()
+        except Exception:
+            try:
+                Log.info(app, text, log=False)
+            except Exception:
+                print(text)
+
+    @staticmethod
+    def should_emit(pargs):
+        return bool(getattr(pargs, 'json_output', False))
+
+
+@_contextmanager
+def json_quiet_stdout(pargs):
+    """Redirect `sys.stdout` -> `sys.stderr` while a command runs in JSON mode.
+
+    This keeps Log.info / Log.warn progress messages visible to a human
+    operator on a terminal (stderr still renders) while guaranteeing that a
+    pipe like `wo multitenancy create ... --json | jq .` receives only the
+    final JSON document on stdout. `JsonOutput.emit` writes directly to
+    `sys.__stdout__`, so the emitted payload lands on real stdout regardless
+    of the redirect.
+    """
+    if not JsonOutput.should_emit(pargs):
+        yield
+        return
+    import sys as _sys
+    saved = _sys.stdout
+    _sys.stdout = _sys.stderr
+    try:
+        yield
+    finally:
+        _sys.stdout = saved
+
+
+class AuditLogger:
+    """SQLite-backed audit log with SHA-256 tamper-detection checksums."""
+
+    def __init__(self, app):
+        self.app = app
+        config = MTFunctions.load_config(app) if app is not None else {}
+        audit_cfg = config.get('audit', {}) if isinstance(config, dict) else {}
+        self.enabled = audit_cfg.get('enabled', True)
+        self.retention_days = int(audit_cfg.get('retention_days', 90))
+
+    @staticmethod
+    def _compute_checksum(record):
+        """Compute SHA-256 over a canonical JSON repr of the record.
+
+        Timestamps are always serialised with a single space separator
+        (`"2026-04-17 10:46:08.172129"`) so the checksum round-trips
+        regardless of whether the row is fetched via the SQLAlchemy ORM
+        (returns `datetime`) or raw `sqlite3` (returns string). The ORM
+        `datetime` is converted with `str()` to match the SQLite storage
+        format; a string timestamp passes through untouched. This lets an
+        operator re-verify a row with `sqlite3 + hashlib` directly.
+        """
+        payload = {k: v for k, v in record.items() if k != 'checksum'}
+        ts = payload.get('timestamp')
+        if isinstance(ts, datetime):
+            payload['timestamp'] = str(ts)  # "YYYY-MM-DD HH:MM:SS[.us]"
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(',', ':'), default=str
+        )
+        return _hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _derive_actor():
+        return (
+            os.environ.get('SUDO_USER')
+            or os.environ.get('USER')
+            or os.environ.get('LOGNAME')
+            or 'system'
+        )
+
+    @staticmethod
+    def _derive_actor_ip():
+        ssh_client = os.environ.get('SSH_CLIENT') or os.environ.get('SSH_CONNECTION')
+        if ssh_client:
+            return ssh_client.split()[0]
+        return 'local'
+
+    def record(
+        self, action, target, result='success',
+        target_type='site', duration_ms=0, details=None,
+        event_id=None, actor=None, actor_ip=None, timestamp=None,
+    ):
+        if not self.enabled:
+            return None
+        from wo.cli.plugins.multitenancy_db import MTDatabase
+        record = {
+            'timestamp': timestamp or datetime.now(),
+            'event_id': event_id or str(_uuid.uuid4()),
+            'actor': actor or self._derive_actor(),
+            'actor_ip': actor_ip or self._derive_actor_ip(),
+            'action': action,
+            'target': target,
+            'target_type': target_type,
+            'result': result,
+            'duration_ms': int(duration_ms or 0),
+            'details': json.dumps(details, default=str) if details else None,
+        }
+        record['checksum'] = self._compute_checksum(record)
+        row_id = MTDatabase.insert_audit_record(self.app, record)
+        # Lazy retention pruning (runs on ~5% of writes)
+        MTDatabase.prune_audit(self.app, self.retention_days)
+        return row_id
+
+    def verify(self, row):
+        """Return True if the row's stored checksum matches its canonical hash."""
+        working = dict(row)
+        stored = working.pop('checksum', None)
+        working.pop('id', None)
+        # normalize back to the fields used when the checksum was generated
+        payload = {
+            'timestamp': working.get('timestamp'),
+            'event_id': working.get('event_id'),
+            'actor': working.get('actor'),
+            'actor_ip': working.get('actor_ip'),
+            'action': working.get('action'),
+            'target': working.get('target'),
+            'target_type': working.get('target_type'),
+            'result': working.get('result'),
+            'duration_ms': int(working.get('duration_ms') or 0),
+            'details': working.get('details'),
+        }
+        return self._compute_checksum(payload) == stored
+
+
+class WebhookNotifier:
+    """Stdlib-only HTTP notifier with HMAC-SHA256 signing and retry backoff.
+
+    Failure to deliver never raises — the originating operation must never be
+    blocked by a broken endpoint. Warnings are routed through StructuredLogger.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, app, logger=None):
+        self.app = app
+        config = MTFunctions.load_config(app) if app is not None else {}
+        hook_cfg = config.get('webhooks', {}) if isinstance(config, dict) else {}
+        self.url = (hook_cfg.get('url') or '').strip()
+        self.secret = (hook_cfg.get('secret') or '').strip()
+        self.enabled_events = set(hook_cfg.get('enabled_events') or [])
+        self.timeout = int(hook_cfg.get('timeout') or 5)
+        self.retries = int(hook_cfg.get('retries') or 3)
+        self._structured = logger or StructuredLogger(app)
+
+    def configured(self):
+        return bool(self.url)
+
+    def notify(self, event, data, correlation_id=None):
+        if not self.configured():
+            return False
+        if self.enabled_events and event not in self.enabled_events:
+            return False
+        body = json.dumps({
+            'event': event,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'schema_version': self.SCHEMA_VERSION,
+            'correlation_id': correlation_id,
+            'data': data or {},
+        }, default=str).encode('utf-8')
+        headers = {'Content-Type': 'application/json', 'User-Agent': 'wo-multitenancy'}
+        if self.secret:
+            sig = _hmac.new(
+                self.secret.encode('utf-8'), body, _hashlib.sha256
+            ).hexdigest()
+            headers['X-WO-Signature'] = f'sha256={sig}'
+
+        last_error = None
+        for attempt in range(max(1, self.retries)):
+            try:
+                req = _urlrequest.Request(self.url, data=body, headers=headers)
+                with _urlrequest.urlopen(req, timeout=self.timeout) as resp:
+                    status = getattr(resp, 'status', 200)
+                    if 200 <= status < 300:
+                        # Use `hook_event` as the structured-log payload key to
+                        # avoid colliding with `event` which is the positional
+                        # event-name param of StructuredLogger.info/warn.
+                        self._structured.info(
+                            'webhook.delivered',
+                            correlation_id=correlation_id,
+                            hook_event=event, attempts=attempt + 1, status=status,
+                        )
+                        return True
+                    last_error = f'HTTP {status}'
+            except (_urlerror.URLError, _urlerror.HTTPError, _socket.timeout) as exc:
+                last_error = str(exc)
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < self.retries - 1:
+                _time.sleep(2 ** attempt)
+        self._structured.warn(
+            'webhook.failed',
+            correlation_id=correlation_id,
+            hook_event=event, attempts=self.retries, error=last_error,
+        )
+        return False
+
+
+_RESERVED_LOG_KEYS = frozenset({
+    'correlation_id', 'target', 'result', 'duration_ms',
+    'event', 'level', 'timestamp', 'schema_version',
+})
+
+
+def _emit_event(app, event, data, correlation_id=None, logger=None, target=None, target_type='site', result='success', duration_ms=0, details=None):
+    """Convenience: record audit + send webhook + structured log for an event.
+
+    Always safe: exceptions are swallowed so no instrumented operation fails
+    because of telemetry. Callers may safely include reserved keys (like
+    `duration_ms`) in `data` for webhook payloads — those are stripped before
+    they flow into the structured-log keyword spread so we never collide with
+    explicit kwargs.
+    """
+    try:
+        if logger is None:
+            logger = StructuredLogger(app)
+        safe_extra = {
+            k: v for k, v in (data or {}).items()
+            if k not in _RESERVED_LOG_KEYS
+        }
+        logger.info(event, correlation_id=correlation_id,
+                    target=target, result=result, duration_ms=duration_ms,
+                    **safe_extra)
+    except Exception:
+        pass
+    try:
+        AuditLogger(app).record(
+            action=event, target=target or '', result=result,
+            target_type=target_type, duration_ms=duration_ms,
+            details=details or data, event_id=correlation_id,
+        )
+    except Exception:
+        pass
+    try:
+        WebhookNotifier(app, logger=logger).notify(
+            event, data or {}, correlation_id=correlation_id
+        )
+    except Exception:
+        pass

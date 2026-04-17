@@ -26,9 +26,12 @@ from wo.core.sslutils import SSL
 from wo.core.variables import WOVar
 from wo.core.acme import WOAcme
 from wo.cli.plugins.multitenancy_functions import (
-    MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator, SharedConfig
+    MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator, SharedConfig,
+    StructuredLogger, JsonOutput, AuditLogger, WebhookNotifier, validate_tags,
+    _emit_event, json_quiet_stdout,
 )
 from wo.cli.plugins.multitenancy_db import MTDatabase
+from wo.cli.plugins.multitenancy_health import HealthChecker, render_text as render_health_text
 
 
 def wo_multitenancy_hook(app):
@@ -101,6 +104,18 @@ class WOMultitenancyController(CementBaseController):
             (['--dry-run'], dict(help='Preview changes without applying', action='store_true', dest='dry_run')),
             (['--config-version'], dict(help='Git version for rollback', dest='config_version')),
             (['--to-commit'], dict(help='Git commit hash to rollback to', dest='to_commit')),
+            # DevOps improvements: cross-cutting flags
+            (['--json'], dict(help='Emit machine-readable JSON output', action='store_true', dest='json_output')),
+            (['--tags'], dict(help='Comma-separated tag list (filter or assign)', dest='tags')),
+            (['--since'], dict(help='Audit window (e.g. 24h, 7d, 30m)', dest='since')),
+            (['--target'], dict(help='Audit target filter (domain or baseline)', dest='target')),
+            (['--format'], dict(help='Audit output format: table|json|csv', dest='output_format')),
+            (['--enable'], dict(help='Enable maintenance mode', action='store_true', dest='enable_flag')),
+            (['--disable'], dict(help='Disable maintenance mode', action='store_true', dest='disable_flag')),
+            (['--site'], dict(help='Target site domain for health/maintenance', dest='site_filter')),
+            (['--all'], dict(help='Apply operation to every shared site', action='store_true', dest='all_flag')),
+            (['--message'], dict(help='Maintenance message shown to visitors', dest='message')),
+            (['--verbose'], dict(help='Verbose per-site output', action='store_true', dest='verbose')),
         ]
         usage = "wo multitenancy <command> [options]"
 
@@ -205,7 +220,15 @@ class WOMultitenancyController(CementBaseController):
     def create(self):
         """Create a new site with shared WordPress core"""
         pargs = self.app.pargs
-        
+        # When --json is set, redirect ambient stdout to stderr so progress
+        # Log.info lines don't contaminate the JSON payload consumers expect
+        # on stdout. JsonOutput.emit writes to sys.__stdout__ directly.
+        with json_quiet_stdout(pargs):
+            return self._create_impl()
+
+    def _create_impl(self):
+        pargs = self.app.pargs
+
         if not pargs.site_name:
             try:
                 while not pargs.site_name:
@@ -236,17 +259,33 @@ class WOMultitenancyController(CementBaseController):
         
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
-        
+
+        # Validate any tags up front so malformed input fails before work starts.
+        tags_list = []
+        if getattr(pargs, 'tags', None):
+            try:
+                tags_list = validate_tags(pargs.tags)
+            except ValueError as exc:
+                Log.error(self, str(exc))
+                return
+
         # Determine PHP version
         php_version = MTFunctions.get_php_version(self, pargs)
-        
+
         # Determine cache type
         cache_type = MTFunctions.get_cache_type(self, pargs)
-        
+
         Log.info(self, f"Creating shared WordPress site: {wo_domain}")
         Log.info(self, f"   PHP version: {php_version}")
         Log.info(self, f"   Cache type: {cache_type}")
-        
+
+        _structured = StructuredLogger(self)
+        _correlation_id = str(__import__('uuid').uuid4())
+        _op_start = __import__('time').monotonic()
+        _structured.info(
+            'site_created.start', correlation_id=_correlation_id,
+            domain=wo_domain, php_version=php_version, cache_type=cache_type,
+        )
         try:
             # Create site directory structure
             site_root = f"/var/www/{wo_domain}"
@@ -413,16 +452,77 @@ class WOMultitenancyController(CementBaseController):
             # Display success message
             admin_pass = MTFunctions.get_admin_password(self, wo_domain)
             site_url = f"https://{wo_domain}" if pargs.letsencrypt else f"http://{wo_domain}"
-            
+
+            # Persist tags (if supplied)
+            if tags_list:
+                MTDatabase.update_site_tags(self, wo_domain, tags_list)
+
+            result_payload = {
+                'domain': wo_domain,
+                'status': 'success',
+                'php_version': php_version,
+                'cache_type': cache_type,
+                'is_ssl': bool(pargs.letsencrypt),
+                'tags': tags_list,
+                'url': site_url,
+                'admin_user': pargs.admin_user,
+                'admin_password': admin_pass,
+                'correlation_id': _correlation_id,
+            }
+
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+            _structured.info(
+                'site_created.complete', correlation_id=_correlation_id,
+                duration_ms=_duration_ms, domain=wo_domain, result='success',
+            )
+            _emit_event(
+                self, 'site_created',
+                data={
+                    'domain': wo_domain,
+                    'php_version': php_version,
+                    'cache_type': cache_type,
+                    'is_ssl': bool(pargs.letsencrypt),
+                    'tags': tags_list,
+                },
+                correlation_id=_correlation_id, logger=_structured,
+                target=wo_domain, target_type='site', result='success',
+                duration_ms=_duration_ms,
+            )
+
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, result_payload)
+                return
+
             Log.info(self, "")
             Log.info(self, "🎉 WordPress site created successfully!")
             Log.info(self, f"   URL: {site_url}")
             Log.info(self, f"   Admin URL: {site_url}/wp-admin")
             Log.info(self, f"   Admin user: {pargs.admin_user}")
             Log.info(self, f"   Admin password: {admin_pass}")
+            if tags_list:
+                Log.info(self, f"   Tags: {','.join(tags_list)}")
             Log.info(self, "")
-            
+
         except Exception as e:
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+            _structured.error(
+                'site_created.failed', correlation_id=_correlation_id,
+                duration_ms=_duration_ms, domain=wo_domain, error=str(e),
+            )
+            _emit_event(
+                self, 'site_create_failed',
+                data={'domain': wo_domain, 'error': str(e)},
+                correlation_id=_correlation_id, logger=_structured,
+                target=wo_domain, target_type='site', result='failure',
+                duration_ms=_duration_ms,
+            )
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, {
+                    'domain': wo_domain,
+                    'status': 'failure',
+                    'error': str(e),
+                    'correlation_id': _correlation_id,
+                })
             Log.error(self, f"Failed to create site: {str(e)}")
             # Cleanup failed site creation
             try:
@@ -445,19 +545,43 @@ class WOMultitenancyController(CementBaseController):
         shared_root = config.get('shared_root', '/var/www/shared')
         
         Log.info(self, "Updating WordPress multi-tenancy infrastructure...")
-        
+
+        _structured = StructuredLogger(self)
+        _correlation_id = str(__import__('uuid').uuid4())
+        _op_start = __import__('time').monotonic()
+
+        # --tags cannot scope core updates: every tenant shares the single
+        # /var/www/shared/current symlink, so switching a release affects all
+        # sites. Reject the flag with a clear pointer to the nearest
+        # tag-scoped operation (baseline apply) instead of silently
+        # misleading the operator.
+        if getattr(pargs, 'tags', None):
+            Log.error(
+                self,
+                "--tags cannot scope 'wo multitenancy update': all tenants "
+                "share a single WordPress core via /var/www/shared/current. "
+                "Use 'wo multitenancy apply --tags=...' for tag-scoped "
+                "baseline rollout.",
+            )
+            return
+
         # Get list of shared sites
         shared_sites = MTDatabase.get_shared_sites(self)
+
         if not shared_sites:
             Log.info(self, "No shared sites found")
             return
-        
+
         Log.info(self, f"Found {len(shared_sites)} shared sites")
-        
+        _structured.info(
+            'update_completed.start', correlation_id=_correlation_id,
+            site_count=len(shared_sites),
+        )
+
         # Create new release
         infra = SharedInfrastructure(self, shared_root)
         release_manager = ReleaseManager(self, shared_root)
-        
+
         try:
             # Create new release
             Log.info(self, "Creating new WordPress release...")
@@ -495,12 +619,33 @@ class WOMultitenancyController(CementBaseController):
             
             # Update baseline version to trigger reapplication
             MTDatabase.increment_baseline_version(self)
-            
+
             Log.info(self, "✅ Update completed successfully!")
             Log.info(self, f"   New release: {new_release}")
             Log.info(self, f"   Updated {len(shared_sites)} sites")
-            
+
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+            _emit_event(
+                self, 'update_completed',
+                data={
+                    'new_release': new_release,
+                    'sites_updated': len(shared_sites),
+                    'duration_ms': _duration_ms,
+                },
+                correlation_id=_correlation_id, logger=_structured,
+                target='baseline', target_type='baseline', result='success',
+                duration_ms=_duration_ms,
+            )
+
         except Exception as e:
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+            _emit_event(
+                self, 'update_failed',
+                data={'error': str(e), 'sites': len(shared_sites)},
+                correlation_id=_correlation_id, logger=_structured,
+                target='baseline', target_type='baseline', result='failure',
+                duration_ms=_duration_ms,
+            )
             Log.error(self, f"Update failed: {str(e)}")
             Log.info(self, "Run 'wo multitenancy rollback' to revert")
 
@@ -535,38 +680,103 @@ class WOMultitenancyController(CementBaseController):
                     return
             
             # Perform rollback
+            _structured = StructuredLogger(self)
+            _correlation_id = str(__import__('uuid').uuid4())
+            _op_start = __import__('time').monotonic()
+            _structured.info(
+                'rollback_triggered.start', correlation_id=_correlation_id,
+                from_release=current_release, to_release=previous_release,
+            )
             Log.info(self, "Performing rollback...")
             infra = SharedInfrastructure(self, shared_root)
             infra.switch_release(previous_release)
-            
+
             # Clear all caches globally (fast - ~2 seconds for any number of sites)
             MTFunctions.clear_all_caches(self)
-            
+
             # Update database
             MTDatabase.update_release(self, previous_release)
-            
+
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
             Log.info(self, "✅ Rollback completed successfully!")
             Log.info(self, f"   Now running: {previous_release}")
-            
+            _emit_event(
+                self, 'rollback_triggered',
+                data={
+                    'from_release': current_release,
+                    'to_release': previous_release,
+                    'duration_ms': _duration_ms,
+                },
+                correlation_id=_correlation_id, logger=_structured,
+                target='baseline', target_type='baseline', result='success',
+                duration_ms=_duration_ms,
+            )
+
         except Exception as e:
+            try:
+                _emit_event(
+                    self, 'rollback_failed',
+                    data={'error': str(e)},
+                    correlation_id=locals().get('_correlation_id'),
+                    target='baseline', target_type='baseline', result='failure',
+                )
+            except Exception:
+                pass
             Log.error(self, f"Rollback failed: {str(e)}")
 
     @expose(help="Show status of multi-tenancy infrastructure")
     def status(self):
         """Display multi-tenancy status and health check"""
-        
+        pargs = self.app.pargs
+
         if not MTDatabase.is_initialized(self):
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, {'initialized': False})
+                return
             Log.info(self, "❌ Multi-tenancy not initialized")
             Log.info(self, "   Run: wo multitenancy init")
             return
-        
+
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
-        
+
         # Get current state
         current_release = MTDatabase.get_current_release(self)
         shared_sites = MTDatabase.get_shared_sites(self)
         baseline_version = MTDatabase.get_baseline_version(self)
+
+        if JsonOutput.should_emit(pargs):
+            release_manager = ReleaseManager(self, shared_root)
+            disk_usage = MTFunctions.calculate_disk_usage(self, shared_root, shared_sites)
+            baseline_info = {}
+            baseline_file = f"{shared_root}/config/baseline.json"
+            if os.path.exists(baseline_file):
+                try:
+                    with open(baseline_file, 'r') as f:
+                        baseline_info = json.load(f)
+                except Exception:
+                    baseline_info = {}
+            payload = {
+                'initialized': True,
+                'infrastructure': {
+                    'shared_root': shared_root,
+                    'current_release': current_release,
+                    'baseline_version': baseline_version,
+                },
+                'sites': {
+                    'total': len(shared_sites),
+                    'enabled': sum(1 for s in shared_sites if s.get('is_enabled')),
+                    'ssl': sum(1 for s in shared_sites if s.get('is_ssl')),
+                    'quarantined': sum(1 for s in shared_sites if s.get('is_quarantined')),
+                    'staging': sum(1 for s in shared_sites if s.get('is_staging')),
+                },
+                'releases': release_manager.list_releases(),
+                'disk': disk_usage,
+                'baseline': baseline_info,
+                'health': MTFunctions.perform_health_check(self, shared_root),
+            }
+            JsonOutput.emit(self, payload)
+            return
         
         Log.info(self, "")
         Log.info(self, "=== WordPress Multi-tenancy Status ===")
@@ -629,32 +839,51 @@ class WOMultitenancyController(CementBaseController):
     @expose(help="List all sites using shared WordPress core")
     def list(self):
         """List all shared WordPress sites"""
-        
+        pargs = self.app.pargs
+
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
-        
+
         shared_sites = MTDatabase.get_shared_sites(self)
-        
+
+        if getattr(pargs, 'tags', None):
+            try:
+                wanted = validate_tags(pargs.tags)
+            except ValueError as exc:
+                Log.error(self, str(exc))
+                return
+            if wanted:
+                wanted_set = set(wanted)
+                shared_sites = [
+                    s for s in shared_sites
+                    if wanted_set.intersection(set(s.get('tags') or []))
+                ]
+
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, shared_sites)
+            return
+
         if not shared_sites:
             Log.info(self, "No shared WordPress sites found")
             return
-        
+
         Log.info(self, "")
         Log.info(self, "Shared WordPress Sites:")
-        Log.info(self, "-" * 80)
-        Log.info(self, f"{'Domain':<30} {'PHP':<8} {'Cache':<12} {'SSL':<5} {'Status':<10}")
-        Log.info(self, "-" * 80)
-        
+        Log.info(self, "-" * 92)
+        Log.info(self, f"{'Domain':<30} {'PHP':<8} {'Cache':<10} {'SSL':<5} {'Status':<10} {'Tags':<20}")
+        Log.info(self, "-" * 92)
+
         for site in shared_sites:
             domain = site['domain']
             php = site.get('php_version', 'unknown')
             cache = site.get('cache_type', 'none')
             ssl = "Yes" if site.get('is_ssl', False) else "No"
             enabled = "Enabled" if site.get('is_enabled', True) else "Disabled"
-            
-            Log.info(self, f"{domain:<30} {php:<8} {cache:<12} {ssl:<5} {enabled:<10}")
-        
-        Log.info(self, "-" * 80)
+            tag_str = ','.join(site.get('tags') or [])[:20]
+
+            Log.info(self, f"{domain:<30} {php:<8} {cache:<10} {ssl:<5} {enabled:<10} {tag_str:<20}")
+
+        Log.info(self, "-" * 92)
         Log.info(self, f"Total: {len(shared_sites)} sites")
         Log.info(self, "")
 
@@ -662,29 +891,36 @@ class WOMultitenancyController(CementBaseController):
     def baseline(self):
         """Manage baseline plugins and themes"""
         pargs = self.app.pargs
-        
+
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
-        
+
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         baseline_file = f"{shared_root}/config/baseline.json"
-        
-        # Show current baseline
-        if os.path.exists(baseline_file):
-            with open(baseline_file, 'r') as f:
-                baseline = json.load(f)
-            
-            Log.info(self, "Current Baseline Configuration:")
-            Log.info(self, f"  Version: {baseline.get('version', 1)}")
-            Log.info(self, f"  Plugins: {', '.join(baseline.get('plugins', []))}")
-            Log.info(self, f"  Theme: {baseline.get('theme', 'unknown')}")
-            Log.info(self, "")
-            Log.info(self, "To update baseline:")
-            Log.info(self, "  1. Edit: /etc/wo/plugins.d/multitenancy.conf")
-            Log.info(self, "  2. Run: wo multitenancy baseline --update")
-        else:
+
+        if not os.path.exists(baseline_file):
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, {'error': 'baseline file not found', 'path': baseline_file})
+                return
             Log.error(self, "Baseline configuration not found")
+            return
+
+        with open(baseline_file, 'r') as f:
+            baseline = json.load(f)
+
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, baseline)
+            return
+
+        Log.info(self, "Current Baseline Configuration:")
+        Log.info(self, f"  Version: {baseline.get('version', 1)}")
+        Log.info(self, f"  Plugins: {', '.join(baseline.get('plugins', []))}")
+        Log.info(self, f"  Theme: {baseline.get('theme', 'unknown')}")
+        Log.info(self, "")
+        Log.info(self, "To update baseline:")
+        Log.info(self, "  1. Edit: /etc/wo/plugins.d/multitenancy.conf")
+        Log.info(self, "  2. Run: wo multitenancy baseline --update")
 
     @expose(help="Validate baseline configuration and site status")
     def validate(self):
@@ -870,6 +1106,11 @@ class WOMultitenancyController(CementBaseController):
     def delete(self):
         """Delete a site from multitenancy system"""
         pargs = self.app.pargs
+        with json_quiet_stdout(pargs):
+            return self._delete_impl()
+
+    def _delete_impl(self):
+        pargs = self.app.pargs
         domain = pargs.site_name
         
         if not domain:
@@ -904,7 +1145,15 @@ class WOMultitenancyController(CementBaseController):
                 return
         
         Log.info(self, f"Deleting site: {domain}")
-        
+
+        _structured = StructuredLogger(self)
+        _correlation_id = str(__import__('uuid').uuid4())
+        _op_start = __import__('time').monotonic()
+        _structured.info(
+            'site_deleted.start', correlation_id=_correlation_id,
+            domain=domain, is_staging=bool(is_staging),
+        )
+
         # Delete the site using regular WO command
         try:
             import subprocess
@@ -914,29 +1163,72 @@ class WOMultitenancyController(CementBaseController):
                 text=True,
                 timeout=300
             )
-            
+
             if result.returncode != 0:
+                _structured.error(
+                    'site_deleted.failed', correlation_id=_correlation_id,
+                    domain=domain, error=result.stderr,
+                )
+                _emit_event(
+                    self, 'site_delete_failed',
+                    data={'domain': domain, 'error': result.stderr},
+                    correlation_id=_correlation_id, logger=_structured,
+                    target=domain, target_type='site', result='failure',
+                )
                 Log.error(self, f"Failed to delete site: {result.stderr}")
                 return
-            
+
             Log.info(self, "✅ Site files and database deleted")
-            
+
         except Exception as e:
+            _structured.error(
+                'site_deleted.failed', correlation_id=_correlation_id,
+                domain=domain, error=str(e),
+            )
+            _emit_event(
+                self, 'site_delete_failed',
+                data={'domain': domain, 'error': str(e)},
+                correlation_id=_correlation_id, logger=_structured,
+                target=domain, target_type='site', result='failure',
+            )
             Log.error(self, f"Error deleting site: {e}")
             return
-        
+
         # Remove from multitenancy tracking
         try:
             session.delete(site)
             session.commit()
             Log.info(self, "✅ Removed from multitenancy tracking")
-            
+
+            _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+            _emit_event(
+                self, 'site_deleted',
+                data={'domain': domain, 'is_staging': bool(is_staging)},
+                correlation_id=_correlation_id, logger=_structured,
+                target=domain, target_type='site', result='success',
+                duration_ms=_duration_ms,
+            )
+
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, {
+                    'domain': domain,
+                    'status': 'deleted',
+                    'is_staging': bool(is_staging),
+                    'duration_ms': _duration_ms,
+                    'correlation_id': _correlation_id,
+                })
+                return
+
             if is_staging:
                 Log.info(self, "")
                 Log.info(self, "Staging site deleted. You can create a new one with:")
                 Log.info(self, "  wo multitenancy staging <domain>")
-            
+
         except Exception as e:
+            _structured.error(
+                'site_deleted.tracking_failed', correlation_id=_correlation_id,
+                domain=domain, error=str(e),
+            )
             Log.error(self, f"Error removing from tracking: {e}")
             Log.warn(self, "Site deleted but tracking entry remains")
             Log.warn(self, f"Manually clean up with: sqlite3 /var/lib/wo/dbase.db \"DELETE FROM multitenancy_sites WHERE domain = '{domain}';\"")
@@ -1375,20 +1667,72 @@ class WOMultitenancyController(CementBaseController):
     @expose(help="Apply current baseline to all sites")
     def apply(self):
         """Apply baseline to all sites immediately"""
+        pargs = self.app.pargs
+        with json_quiet_stdout(pargs):
+            return self._apply_impl()
+
+    def _apply_impl(self):
+        pargs = self.app.pargs
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
-        
+
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         baseline_file = f"{shared_root}/config/baseline.json"
-        
+
         with open(baseline_file, 'r') as f:
             baseline = json.load(f)
-        
+
         baseline_version = baseline.get('version', 1)
-        
-        Log.info(self, f"Applying baseline v{baseline_version} to all sites...")
-        BaselineApplicator.apply_baseline_to_sites(self, config, baseline_version)
+
+        tag_filter = None
+        if getattr(pargs, 'tags', None):
+            try:
+                tag_filter = validate_tags(pargs.tags)
+            except ValueError as exc:
+                Log.error(self, str(exc))
+                return
+
+        dry_run = bool(getattr(pargs, 'dry_run', False))
+        verbose = bool(getattr(pargs, 'verbose', False))
+
+        _structured = StructuredLogger(self)
+        _correlation_id = str(__import__('uuid').uuid4())
+        _op_start = __import__('time').monotonic()
+        _structured.info(
+            'baseline_applied.start', correlation_id=_correlation_id,
+            baseline_version=baseline_version,
+            dry_run=dry_run, verbose=verbose, tag_filter=tag_filter,
+        )
+
+        header = f"Applying baseline v{baseline_version} to all sites"
+        if tag_filter:
+            header += f" (tags: {','.join(tag_filter)})"
+        if dry_run:
+            header += ' [DRY RUN]'
+        Log.info(self, header + '...')
+
+        result = BaselineApplicator.apply_baseline_to_sites(
+            self, config, baseline_version,
+            dry_run=dry_run, verbose=verbose, tag_filter=tag_filter,
+        )
+        _duration_ms = int((__import__('time').monotonic() - _op_start) * 1000)
+
+        summary = result if isinstance(result, dict) else {}
+        summary.setdefault('baseline_version', baseline_version)
+        summary.setdefault('dry_run', dry_run)
+        summary['duration_ms'] = _duration_ms
+        summary['correlation_id'] = _correlation_id
+
+        _emit_event(
+            self, 'baseline_applied',
+            data=summary, correlation_id=_correlation_id, logger=_structured,
+            target='baseline', target_type='baseline', result='success',
+            duration_ms=_duration_ms,
+        )
+
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, summary)
 
     @expose(help="Remove multi-tenancy infrastructure (dangerous)")
     def remove(self):
@@ -1894,6 +2238,331 @@ class WOMultitenancyController(CementBaseController):
         else:
             Log.error(self, f"Unknown action: {action}")
             Log.info(self, "Available: show, set, get, history, test, edit, rollback")
+
+    # ==========================================
+    # DevOps improvements: health / audit / maintenance / webhook
+    # ==========================================
+
+    @expose(help="Health snapshot across shared infra, DB, disk, PHP-FPM, nginx, sites")
+    def health(self):
+        """Run all registered health checks and render a status envelope."""
+        pargs = self.app.pargs
+        if not MTDatabase.is_initialized(self):
+            payload = {
+                'status': 'unhealthy',
+                'checks': {
+                    'initialized': {
+                        'status': 'error',
+                        'details': {'error': 'multitenancy not initialized'},
+                    }
+                },
+            }
+            if JsonOutput.should_emit(pargs):
+                JsonOutput.emit(self, payload)
+            else:
+                Log.error(self, "❌ Multi-tenancy not initialized")
+            return
+
+        site_filter = pargs.site_filter or (
+            pargs.site_name if pargs.site_name else None
+        )
+        checker = HealthChecker(self).register_defaults(site_filter=site_filter)
+        result = checker.run_all()
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, result)
+        else:
+            Log.info(self, render_health_text(result), log=False)
+
+    @expose(help="Query the multitenancy audit log")
+    def audit(self):
+        """Display privileged-operation audit entries."""
+        pargs = self.app.pargs
+        since = _parse_since(self, pargs.since or '7d')
+        action = getattr(pargs, 'config_action', None)
+        target = pargs.target
+        rows = MTDatabase.query_audit(
+            self, since=since, action=action, target=target, limit=500,
+        )
+        fmt = (pargs.output_format or '').lower()
+        if JsonOutput.should_emit(pargs) or fmt == 'json':
+            JsonOutput.emit(self, rows)
+            return
+        if fmt == 'csv':
+            import csv
+            import io
+            buf = io.StringIO()
+            fields = [
+                'timestamp', 'actor', 'actor_ip', 'action', 'target',
+                'target_type', 'result', 'duration_ms', 'event_id', 'checksum',
+            ]
+            writer = csv.DictWriter(buf, fieldnames=fields, extrasaction='ignore')
+            writer.writeheader()
+            for row in rows:
+                row_out = dict(row)
+                ts = row_out.get('timestamp')
+                if hasattr(ts, 'isoformat'):
+                    row_out['timestamp'] = ts.isoformat()
+                writer.writerow(row_out)
+            Log.info(self, buf.getvalue(), log=False)
+            return
+        # Default: human-friendly table
+        if not rows:
+            Log.info(self, "No audit entries match the filter.")
+            return
+        Log.info(self, f"{'Timestamp':<20} {'Actor':<15} {'Action':<24} {'Target':<30} {'Result':<8}")
+        Log.info(self, '-' * 100)
+        for row in rows:
+            ts = row.get('timestamp')
+            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S') if hasattr(ts, 'strftime') else str(ts)
+            Log.info(
+                self,
+                f"{ts_str:<20} {(row.get('actor') or ''):<15} "
+                f"{(row.get('action') or ''):<24} {(row.get('target') or ''):<30} "
+                f"{(row.get('result') or ''):<8}",
+            )
+        Log.info(self, f"\nTotal: {len(rows)} entries (retention: "
+                       f"{AuditLogger(self).retention_days}d)")
+
+    @expose(help="Toggle maintenance mode for one site or every shared site")
+    def maintenance(self):
+        """Enable or disable an nginx 503 maintenance page."""
+        pargs = self.app.pargs
+        with json_quiet_stdout(pargs):
+            return self._maintenance_impl()
+
+    def _maintenance_impl(self):
+        pargs = self.app.pargs
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized")
+            return
+        if pargs.enable_flag == pargs.disable_flag:
+            Log.error(self, "Specify exactly one of --enable or --disable")
+            return
+        target_domain = pargs.site_filter or (pargs.site_name if pargs.site_name else None)
+        if pargs.all_flag and target_domain:
+            Log.error(self, "Use either --all or --site=<domain>, not both")
+            return
+        if not pargs.all_flag and not target_domain:
+            Log.error(self, "Specify --site=<domain> or --all")
+            return
+
+        config = MTFunctions.load_config(self)
+        sites = MTDatabase.get_shared_sites(self)
+        if target_domain:
+            sites = [s for s in sites if s.get('domain') == target_domain]
+            if not sites:
+                Log.error(self, f"Site {target_domain} not found in multitenancy tracking")
+                return
+
+        message = pargs.message or (
+            'We are performing scheduled maintenance and will be back shortly.'
+        )
+        results = []
+        cid = str(__import__('uuid').uuid4())
+        logger = StructuredLogger(self)
+        action_event = 'maintenance_enabled' if pargs.enable_flag else 'maintenance_disabled'
+        for site in sites:
+            domain = site['domain']
+            try:
+                if pargs.enable_flag:
+                    ok = _maintenance_enable(self, domain, message, config)
+                else:
+                    ok = _maintenance_disable(self, domain)
+                status = 'success' if ok else 'failure'
+            except Exception as exc:
+                status = 'failure'
+                Log.warn(self, f"maintenance toggle failed for {domain}: {exc}")
+            results.append({'domain': domain, 'status': status})
+
+        # Reload nginx once after batch changes
+        reload_ok = MTFunctions.safe_nginx_reload(self, sites[-1]['domain']) if sites else True
+
+        for item in results:
+            _emit_event(
+                self, action_event,
+                data={'domain': item['domain'], 'message': message if pargs.enable_flag else None},
+                correlation_id=cid, logger=logger,
+                target=item['domain'], target_type='site',
+                result=item['status'],
+            )
+
+        payload = {
+            'action': action_event,
+            'sites': results,
+            'nginx_reload_ok': bool(reload_ok),
+            'correlation_id': cid,
+        }
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, payload)
+        else:
+            for item in results:
+                ico = '✅' if item['status'] == 'success' else '❌'
+                Log.info(self, f"{ico} {item['domain']}: {item['status']}")
+            Log.info(self, f"Nginx reload: {'ok' if reload_ok else 'failed'}")
+
+    @expose(help="Test the configured webhook endpoint (use --action=test)")
+    def webhook(self):
+        """Send a synthetic signed payload to the configured webhook URL."""
+        pargs = self.app.pargs
+        with json_quiet_stdout(pargs):
+            return self._webhook_impl()
+
+    def _webhook_impl(self):
+        pargs = self.app.pargs
+        action = (getattr(pargs, 'config_action', '') or 'test').strip().lower()
+        if action != 'test':
+            Log.error(self, "Only --action=test is supported")
+            return
+        notifier = WebhookNotifier(self)
+        if not notifier.configured():
+            Log.error(self, "No webhook URL configured in [webhooks] section")
+            return
+        cid = str(__import__('uuid').uuid4())
+        payload = {
+            'domain': 'example.test',
+            'note': 'synthetic test event from wo multitenancy webhook --action=test',
+        }
+        ok = notifier.notify('test_event', payload, correlation_id=cid)
+        result = {
+            'delivered': bool(ok),
+            'url': notifier.url,
+            'signed': bool(notifier.secret),
+            'correlation_id': cid,
+        }
+        if JsonOutput.should_emit(pargs):
+            JsonOutput.emit(self, result)
+        else:
+            icon = '✅' if ok else '❌'
+            Log.info(self, f"{icon} Webhook {'delivered' if ok else 'failed'} to {notifier.url}")
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for the controller above
+# ---------------------------------------------------------------------------
+
+_SINCE_RE = __import__('re').compile(r'^\s*(\d+)\s*([smhd])\s*$', __import__('re').IGNORECASE)
+
+
+def _parse_since(controller, value):
+    """Convert `24h`, `7d`, `30m`, `3600s` into a datetime cutoff.
+
+    `controller` is the Cement controller (used for Log.warn when the
+    supplied value is malformed). On invalid input we warn and fall back to
+    a 7-day window so the `audit` subcommand still returns *something*
+    useful instead of dying silently.
+    """
+    from datetime import timedelta as _td
+    if value is None:
+        return None
+    match = _SINCE_RE.match(str(value))
+    if not match:
+        if controller is not None:
+            try:
+                Log.warn(
+                    controller,
+                    f"Invalid --since value '{value}'. "
+                    f"Expected 30m / 24h / 7d / 3600s — defaulting to 7d.",
+                )
+            except Exception:
+                pass
+        return datetime.now() - _td(days=7)
+    qty = int(match.group(1))
+    unit = match.group(2).lower()
+    deltas = {
+        's': _td(seconds=qty),
+        'm': _td(minutes=qty),
+        'h': _td(hours=qty),
+        'd': _td(days=qty),
+    }
+    return datetime.now() - deltas[unit]
+
+
+def _maintenance_paths(domain):
+    site_root = f'/var/www/{domain}'
+    return {
+        'site_root': site_root,
+        'site_htdocs': f'{site_root}/htdocs',
+        'nginx_include_dir': f'{site_root}/conf/nginx',
+        'nginx_include_file': f'{site_root}/conf/nginx/multitenancy-maintenance.conf',
+        'maintenance_html': f'{site_root}/htdocs/maintenance.html',
+    }
+
+
+def _maintenance_enable(controller, domain, message, config):
+    paths = _maintenance_paths(domain)
+    maintenance_cfg = config.get('maintenance', {}) if isinstance(config, dict) else {}
+    admin_ips = maintenance_cfg.get('admin_ips') or []
+    retry_after = int(maintenance_cfg.get('default_retry_after') or 600)
+    try:
+        os.makedirs(paths['nginx_include_dir'], exist_ok=True)
+    except Exception:
+        pass
+    # Cement renderer lives on the app, not the controller.
+    renderer = getattr(controller, 'app', controller)
+    # Render HTML
+    html_data = {
+        'site_name': domain,
+        'message': message,
+        'retry_after_human': _humanize_seconds(retry_after),
+    }
+    try:
+        with open(paths['maintenance_html'], 'w') as fh:
+            renderer.render(html_data, 'multitenancy-maintenance-page.mustache', out=fh)
+    except Exception as exc:
+        Log.warn(controller, f"could not write maintenance page for {domain}: {exc}")
+        return False
+    # Render nginx include
+    admin_regex = '|'.join([_escape_ip(ip) for ip in admin_ips])
+    nginx_data = {
+        'domain': domain,
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'retry_after_seconds': retry_after,
+        'site_htdocs': paths['site_htdocs'],
+        'has_admin_ips': bool(admin_regex),
+        'admin_ips_regex': admin_regex,
+    }
+    try:
+        with open(paths['nginx_include_file'], 'w') as fh:
+            renderer.render(nginx_data, 'multitenancy-maintenance.mustache', out=fh)
+    except Exception as exc:
+        Log.warn(controller, f"could not write maintenance nginx include for {domain}: {exc}")
+        return False
+    return True
+
+
+def _maintenance_disable(controller, domain):
+    paths = _maintenance_paths(domain)
+    ok = True
+    for path in (paths['nginx_include_file'], paths['maintenance_html']):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as exc:
+                Log.warn(controller, f"could not remove {path}: {exc}")
+                ok = False
+    return ok
+
+
+def _escape_ip(ip):
+    r"""Escape literal dots for use inside an nginx regex character group.
+
+    Each `.` becomes `\.` (one backslash + dot) so nginx reads it as a
+    literal dot rather than "any character". Using `r'\\.'` here would
+    emit `\\.` to the config file, which nginx interprets as "literal
+    backslash followed by any char" and breaks the admin-IP bypass.
+    """
+    return ip.replace('.', r'\.')
+
+
+def _humanize_seconds(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} seconds"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} minutes" if not sec else f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours} hours"
 
 
 def load(app):

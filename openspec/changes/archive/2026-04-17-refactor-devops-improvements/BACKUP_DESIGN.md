@@ -1,5 +1,13 @@
 # Detailed Backup System Design
 
+> **Status: OUT OF SCOPE for `refactor-devops-improvements`.**
+>
+> Integrated backup / restore was removed from this proposal. Rationale: WordOps already ships `wo backup` and `wo site backup`, and external tools (`restic`, `borg`, `duplicity`) cover encrypted and off-box backups far better than an in-plugin reimplementation. See `proposal.md` → *Non-Goals* for the full reasoning.
+>
+> This document is retained as reference material only. If a dedicated backup proposal is ever opened, start here and revise — but do not treat any of the commands, schemas, or architecture below as in-flight work.
+
+---
+
 ## Overview
 
 The backup system provides automated, encrypted, and verifiable backups for WordOps multi-tenancy sites with support for multiple storage destinations and point-in-time recovery.

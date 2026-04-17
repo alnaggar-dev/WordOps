@@ -4,10 +4,11 @@ Handles database operations for multi-tenancy infrastructure.
 
 import os
 import json
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 from wo.core.logging import Log
 from wo.core.database import db_session, Base
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, Index
 
 
 class MultitenancyConfig(Base):
@@ -52,8 +53,42 @@ class MultitenancySite(Base):
     quarantine_date = Column(DateTime)
     # Phase 1: Redis Object Cache prefix (unique per site for cache isolation)
     redis_prefix = Column(Text)
+    # DevOps improvements: comma-separated tags for selective operations
+    tags = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class MultitenancyAudit(Base):
+    """Privileged-operation audit log with SHA-256 tamper detection.
+
+    Indexes are declared via `__table_args__` so SQLAlchemy's `create_all`
+    installs them on fresh installs. On existing installs the explicit
+    ALTER-path migration below also runs `CREATE INDEX IF NOT EXISTS` so the
+    audit table ends up with the same four indexes regardless of whether it
+    was created by ORM metadata or by the ALTER path.
+    """
+    __tablename__ = 'multitenancy_audit'
+
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.now, nullable=False)
+    event_id = Column(String(36))           # correlation UUID shared with structured log
+    actor = Column(String(255))             # username or "system"
+    actor_ip = Column(String(45))           # SSH_CLIENT address or "local"
+    action = Column(String(100), nullable=False)   # e.g. site_created
+    target = Column(String(255))            # e.g. example.com or "baseline"
+    target_type = Column(String(50))        # site | baseline | config | maintenance
+    result = Column(String(50))             # success | failure | error
+    duration_ms = Column(Integer, default=0)
+    details = Column(Text)                  # JSON extra data
+    checksum = Column(String(64))           # SHA-256 of canonicalized record
+
+    __table_args__ = (
+        Index('idx_audit_timestamp', 'timestamp'),
+        Index('idx_audit_actor', 'actor'),
+        Index('idx_audit_action', 'action'),
+        Index('idx_audit_target', 'target'),
+    )
 
 
 class MTDatabase:
@@ -143,17 +178,48 @@ class MTDatabase:
                     # Phase 1: Create regular index for faster lookups
                     try:
                         db_session.execute(text('''
-                            CREATE INDEX IF NOT EXISTS idx_redis_prefix 
+                            CREATE INDEX IF NOT EXISTS idx_redis_prefix
                             ON multitenancy_sites(redis_prefix)
                         '''))
                         Log.debug(app, "Created index on redis_prefix")
                     except Exception:
                         pass  # Index might already exist
-                    
+
                     db_session.commit()
                     Log.info(app, "✅ Phase 2 database migration completed")
                     Log.info(app, "   Added: is_staging, is_quarantined, quarantine_reason, quarantine_date")
-                
+
+                # DevOps improvements: tags column on multitenancy_sites
+                if 'tags' not in existing_columns:
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites
+                            ADD COLUMN tags TEXT
+                        """))
+                        db_session.commit()
+                        Log.debug(app, "Added tags column to multitenancy_sites")
+                    except Exception:
+                        pass
+
+                # DevOps improvements: multitenancy_audit table + indexes.
+                # `Base.metadata.create_all` above will have created the table
+                # for fresh installs (with indexes from __table_args__).
+                # For *existing* installs where the table was created before
+                # indexes were declared, we still need to backfill them —
+                # CREATE INDEX IF NOT EXISTS is cheap and idempotent, so just
+                # always run it.
+                try:
+                    for idx_sql in (
+                        "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON multitenancy_audit(timestamp)",
+                        "CREATE INDEX IF NOT EXISTS idx_audit_actor ON multitenancy_audit(actor)",
+                        "CREATE INDEX IF NOT EXISTS idx_audit_action ON multitenancy_audit(action)",
+                        "CREATE INDEX IF NOT EXISTS idx_audit_target ON multitenancy_audit(target)",
+                    ):
+                        db_session.execute(text(idx_sql))
+                    db_session.commit()
+                except Exception:
+                    pass
+
             except Exception as migration_error:
                 Log.debug(app, f"Migration check/execution: {migration_error}")
                 # Don't fail initialization if migration fails
@@ -356,7 +422,8 @@ class MTDatabase:
                     php_version=site_data.get('php_version', '8.3'),
                     shared_release=site_data.get('shared_release'),
                     is_ssl=site_data.get('is_ssl', False),
-                    redis_prefix=site_data.get('redis_prefix')  # Phase 2: Store Redis prefix
+                    redis_prefix=site_data.get('redis_prefix'),  # Phase 2: Store Redis prefix
+                    tags=site_data.get('tags')
                 )
                 session.add(site)
             
@@ -385,10 +452,14 @@ class MTDatabase:
                     'baseline_version': site.baseline_version,
                     'is_enabled': site.is_enabled,
                     'is_ssl': site.is_ssl,
+                    'is_staging': getattr(site, 'is_staging', False),
+                    'is_quarantined': getattr(site, 'is_quarantined', False),
+                    'redis_prefix': getattr(site, 'redis_prefix', None),
+                    'tags': [t for t in (getattr(site, 'tags', '') or '').split(',') if t],
                     'created_at': site.created_at,
                     'updated_at': site.updated_at
                 })
-            
+
             return result
                 
         except Exception as e:
@@ -852,8 +923,141 @@ class MTDatabase:
             
             Log.debug(app, f"Found {len(prefixes)} Redis prefixes in use")
             return prefixes
-            
+
         except Exception as e:
             Log.debug(app, f"Error retrieving Redis prefixes: {e}")
             return {}
 
+    # ------------------------------------------------------------------
+    # DevOps improvements: tag helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def update_site_tags(app, domain, tags):
+        """Set the tag list for a site. `tags` is an iterable of strings."""
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(domain=domain).first()
+            if not site:
+                return False
+            site.tags = ','.join(sorted({t.strip() for t in tags if t and t.strip()}))
+            site.updated_at = datetime.now()
+            session.commit()
+            return True
+        except Exception as e:
+            Log.debug(app, f"Failed to update tags for {domain}: {e}")
+            return False
+
+    @staticmethod
+    def get_sites_by_tags(app, tags):
+        """Return shared sites whose tag set intersects any supplied tag."""
+        try:
+            all_sites = MTDatabase.get_shared_sites(app)
+            wanted = {t.strip() for t in tags if t and t.strip()}
+            if not wanted:
+                return all_sites
+            return [
+                s for s in all_sites
+                if wanted.intersection(set(s.get('tags') or []))
+            ]
+        except Exception as e:
+            Log.debug(app, f"Failed to filter sites by tags: {e}")
+            return []
+
+    # ------------------------------------------------------------------
+    # DevOps improvements: audit helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def insert_audit_record(app, record):
+        """Insert one audit row. `record` is a dict of column values."""
+        try:
+            session = db_session
+            entry = MultitenancyAudit(
+                timestamp=record.get('timestamp') or datetime.now(),
+                event_id=record.get('event_id'),
+                actor=record.get('actor'),
+                actor_ip=record.get('actor_ip'),
+                action=record.get('action'),
+                target=record.get('target'),
+                target_type=record.get('target_type'),
+                result=record.get('result'),
+                duration_ms=int(record.get('duration_ms') or 0),
+                details=record.get('details'),
+                checksum=record.get('checksum'),
+            )
+            session.add(entry)
+            session.commit()
+            return entry.id
+        except Exception as e:
+            Log.debug(app, f"Failed to insert audit record: {e}")
+            try:
+                db_session.rollback()
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def query_audit(app, since=None, action=None, target=None, limit=500):
+        """Query audit entries with optional filters.
+
+        `since` is a datetime (entries with timestamp >= since are returned).
+        Returns a list of dicts ordered newest first.
+        """
+        try:
+            session = db_session
+            q = session.query(MultitenancyAudit)
+            if since is not None:
+                q = q.filter(MultitenancyAudit.timestamp >= since)
+            if action:
+                q = q.filter(MultitenancyAudit.action == action)
+            if target:
+                q = q.filter(MultitenancyAudit.target == target)
+            q = q.order_by(MultitenancyAudit.timestamp.desc()).limit(limit)
+            rows = []
+            for r in q.all():
+                rows.append({
+                    'id': r.id,
+                    'timestamp': r.timestamp,
+                    'event_id': r.event_id,
+                    'actor': r.actor,
+                    'actor_ip': r.actor_ip,
+                    'action': r.action,
+                    'target': r.target,
+                    'target_type': r.target_type,
+                    'result': r.result,
+                    'duration_ms': r.duration_ms,
+                    'details': r.details,
+                    'checksum': r.checksum,
+                })
+            return rows
+        except Exception as e:
+            Log.debug(app, f"Failed to query audit: {e}")
+            return []
+
+    @staticmethod
+    def prune_audit(app, retention_days, sample_rate=0.05, force=False):
+        """Opportunistically delete audit rows older than the retention window.
+
+        Runs on ~5% of writes by default so the hot path is fast; pass
+        force=True for an on-demand full prune.
+        """
+        try:
+            if not force and random.random() > sample_rate:
+                return 0
+            cutoff = datetime.now() - timedelta(days=int(retention_days))
+            session = db_session
+            deleted = session.query(MultitenancyAudit).filter(
+                MultitenancyAudit.timestamp < cutoff
+            ).delete(synchronize_session=False)
+            session.commit()
+            if deleted:
+                Log.debug(app, f"Pruned {deleted} audit rows older than {retention_days}d")
+            return deleted
+        except Exception as e:
+            Log.debug(app, f"Failed to prune audit: {e}")
+            try:
+                db_session.rollback()
+            except Exception:
+                pass
+            return 0

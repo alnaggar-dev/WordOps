@@ -1,0 +1,10 @@
+/var/log/wo/multitenancy.json {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 root adm
+}

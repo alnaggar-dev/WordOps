@@ -19,6 +19,7 @@
 14. [Migration Guide](#migration-guide)
 15. [FAQ](#faq)
 16. [Implementation Notes](#implementation-notes)
+17. [Appendix A: DevOps Primitives](#appendix-a-devops-primitives-health--audit--maintenance--webhooks) — health, audit, maintenance, webhooks, structured logs
 
 ---
 
@@ -744,6 +745,75 @@ Remove multi-tenancy infrastructure (dangerous).
 ```bash
 wo multitenancy remove [--force]
 ```
+
+---
+
+### wo multitenancy health
+
+Health snapshot across shared infrastructure, database, disk, PHP-FPM, nginx, and every tenant site.
+
+```bash
+wo multitenancy health [--json] [--site=<domain>]
+```
+
+**Returns** a `{status, checks:{...}, timestamp}` envelope. `status` is one of
+`healthy`, `degraded`, or `unhealthy`.
+
+- Critical checkers (shared infrastructure, database, PHP-FPM, nginx) downgrade
+  the overall status to `unhealthy`.
+- Non-critical checkers (disk, per-site HTTP probe) downgrade to `degraded`.
+
+Details live under `checks.<name>.details` and each check carries its own
+`duration_ms`. See [Appendix A.1](#a1-health-check) for payload examples.
+
+### wo multitenancy audit
+
+Query the privileged-operation audit log.
+
+```bash
+wo multitenancy audit [--since=<duration>] [--action=<name>] [--target=<domain>] [--format=table|json|csv]
+```
+
+**Options:**
+- `--since=<24h|7d|30m|3600s>` — window of rows to return (default `7d`). Invalid input emits a warning and defaults to 7 days.
+- `--action=<slug>` — filter by action name (`site_created`, `site_deleted`, `update_completed`, `rollback_triggered`, `baseline_applied`, `maintenance_enabled`, `maintenance_disabled`, …).
+- `--target=<domain>` — filter by target.
+- `--format=table|json|csv` — output format; `--json` is a shorthand for `--format=json`.
+
+Each row carries a SHA-256 checksum for tamper detection. See
+[Appendix A.4](#a4-audit-log) for the full column schema and the exact
+canonicalisation algorithm.
+
+### wo multitenancy maintenance
+
+Toggle maintenance mode for one site or every shared site atomically.
+
+```bash
+wo multitenancy maintenance --enable  [--site=<domain>|--all] [--message=<text>]
+wo multitenancy maintenance --disable [--site=<domain>|--all]
+```
+
+**Effect:** writes `/var/www/<domain>/htdocs/maintenance.html` and an nginx
+include at `/var/www/<domain>/conf/nginx/multitenancy-maintenance.conf`, then
+reloads nginx once for the whole batch. The include returns HTTP 503 with a
+`Retry-After` header; admin IPs configured in the `[maintenance] admin_ips`
+section of `/etc/wo/plugins.d/multitenancy.conf` bypass the 503 and still
+receive the normal site.
+
+See [Appendix A.5](#a5-maintenance-mode) for the nginx include format and
+how to configure admin-IP bypass.
+
+### wo multitenancy webhook
+
+Test the configured webhook endpoint.
+
+```bash
+wo multitenancy webhook --action=test [--json]
+```
+
+Sends a synthetic, HMAC-signed `test_event` payload to the `url` configured
+in the `[webhooks]` section. See [Appendix A.6](#a6-webhook-notifications)
+for the payload schema and signature verification.
 
 ---
 
@@ -1707,10 +1777,55 @@ CREATE TABLE multitenancy_sites (
     baseline_version INTEGER DEFAULT 0,
     is_enabled BOOLEAN DEFAULT 1,
     is_ssl BOOLEAN DEFAULT 0,
+    is_staging BOOLEAN DEFAULT 0,           -- Phase 2
+    is_quarantined BOOLEAN DEFAULT 0,       -- Phase 2
+    quarantine_reason TEXT,                 -- Phase 2
+    quarantine_date DATETIME,               -- Phase 2
+    redis_prefix TEXT,                      -- Phase 1 (unique per site)
+    tags TEXT,                              -- DevOps improvements: comma-separated
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_redis_prefix_unique
+    ON multitenancy_sites(redis_prefix) WHERE redis_prefix IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_redis_prefix
+    ON multitenancy_sites(redis_prefix);
 ```
+
+Existing installs get the `tags` column via an idempotent `ALTER TABLE ... ADD
+COLUMN tags TEXT` migration when `MTDatabase.initialize_tables` runs on the
+plugin hook.
+
+### multitenancy_audit
+```sql
+CREATE TABLE multitenancy_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    event_id VARCHAR(36),           -- correlation UUID shared with structured log + webhook
+    actor VARCHAR(255),             -- username or "system"
+    actor_ip VARCHAR(45),           -- SSH_CLIENT address or "local"
+    action VARCHAR(100) NOT NULL,   -- e.g. site_created
+    target VARCHAR(255),            -- e.g. example.com or "baseline"
+    target_type VARCHAR(50),        -- site | baseline | config | maintenance
+    result VARCHAR(50),             -- success | failure | error
+    duration_ms INTEGER DEFAULT 0,
+    details TEXT,                   -- JSON extra data
+    checksum VARCHAR(64)            -- SHA-256 tamper detection
+);
+
+CREATE INDEX idx_audit_timestamp ON multitenancy_audit(timestamp);
+CREATE INDEX idx_audit_actor     ON multitenancy_audit(actor);
+CREATE INDEX idx_audit_action    ON multitenancy_audit(action);
+CREATE INDEX idx_audit_target    ON multitenancy_audit(target);
+```
+
+Declared via `__table_args__` on the SQLAlchemy model so `Base.metadata.create_all`
+installs indexes on fresh deployments, and backfilled via `CREATE INDEX IF NOT
+EXISTS` on existing installs that predate the indexed model.
+
+See [Appendix A.4](#a4-audit-log) for how the `checksum` column is computed and
+how to verify a row's integrity outside the CLI.
 
 ---
 
@@ -3995,4 +4110,377 @@ This plugin provides true WordPress multi-tenancy for WordOps with:
 - ✅ Native integration with WordOps
 
 The implementation is clean, efficient, and production-ready.
+
+---
+
+## Appendix A: DevOps Primitives (health / audit / maintenance / webhooks)
+
+This appendix documents the DevOps layer shipped by the
+`refactor-devops-improvements` OpenSpec change (archived
+[2026-04-17-refactor-devops-improvements](openspec/changes/archive/2026-04-17-refactor-devops-improvements/)).
+The corresponding specification is [openspec/specs/multitenancy/spec.md](openspec/specs/multitenancy/spec.md)
+with 8 requirements covering the behaviors below. All additions are
+non-breaking and opt-in. Nothing here runs by default on an existing install
+unless the corresponding config section is populated.
+
+### A.1 Health check
+
+```bash
+wo multitenancy health                # colour table
+wo multitenancy health --json | jq .  # machine-readable
+wo multitenancy health --site=example.com
+```
+
+Returns a `{status, checks:{...}, timestamp}` envelope. `status` is one of
+`healthy`, `degraded`, `unhealthy`. Critical checkers (shared infra, database,
+php-fpm, nginx) downgrade to `unhealthy`; non-critical checkers (disk,
+per-site) downgrade to `degraded`.
+
+Per-check payload:
+
+```json
+{
+  "status": "ok",
+  "details": { "...": "..." },
+  "duration_ms": 12
+}
+```
+
+### A.2 Site tagging
+
+```bash
+wo multitenancy create example.com --php83 --wpfc --tags=production,client-a
+wo multitenancy list --tags=production
+wo multitenancy apply --tags=staging
+```
+
+Tags are lowercase `[a-z0-9-]`, comma-separated. Invalid characters fail fast
+before any work starts. Tags persist in `multitenancy_sites.tags`.
+
+**`wo multitenancy update --tags=…` is not supported** and is rejected with a
+pointer to `wo multitenancy apply --tags=…`. This is by design: every tenant
+shares the single `/var/www/shared/current` WordPress-core symlink, so
+switching a release would affect all sites regardless of tag. Tag-scoped
+rollout belongs on `apply` (baseline activation), not on `update` (core
+release switch).
+
+### A.3 Baseline apply — dry-run / verbose / tag-scoped
+
+```bash
+wo multitenancy apply --dry-run --verbose
+wo multitenancy apply --tags=staging
+wo multitenancy apply --tags=production --verbose
+```
+
+`--dry-run` reports the work that would be done without mutating state or
+running the staging-site gate. `--verbose` emits per-site timings and
+activation status.
+
+### A.4 Audit log
+
+```bash
+wo multitenancy audit                    # last 7 days, table
+wo multitenancy audit --since=24h
+wo multitenancy audit --action=site_deleted --since=30d
+wo multitenancy audit --target=example.com
+wo multitenancy audit --format=json --since=7d
+wo multitenancy audit --format=csv --since=30d > audit.csv
+```
+
+Every privileged operation (`create`, `delete`, `update`, `rollback`,
+`apply`, `maintenance_enable/disable`) writes one row to the
+`multitenancy_audit` SQLite table with fields:
+
+| Column | Notes |
+|---|---|
+| `timestamp` | Server local time. Stored as SQLite `DATETIME` with space separator (`"YYYY-MM-DD HH:MM:SS.us"`). |
+| `event_id` | Correlation UUID shared with the structured-log entries and webhook payload of the same operation. |
+| `actor` | `SUDO_USER` ∥ `USER` ∥ `system` |
+| `actor_ip` | First token of `SSH_CLIENT` / `SSH_CONNECTION` ∥ `local` |
+| `action` | e.g. `site_created` |
+| `target` | Domain or `baseline` |
+| `target_type` | `site` ∥ `baseline` ∥ `config` ∥ `maintenance` |
+| `result` | `success` ∥ `failure` |
+| `duration_ms` | Wall-clock milliseconds |
+| `details` | JSON string (details dict at emit time) |
+| `checksum` | `sha256(canonical_row_json)` — tamper detection |
+
+Retention defaults to 90 days (configurable in `[audit]`); pruning runs
+lazily on ~5 % of writes so the hot path stays cheap.
+
+Common queries:
+
+```bash
+# Who deleted example.com?
+wo multitenancy audit --action=site_deleted --target=example.com
+
+# What changed in the past 24 hours?
+wo multitenancy audit --since=24h
+```
+
+#### Verifying a row's checksum outside the CLI
+
+The checksum is the SHA-256 of the JSON-canonical form of the row minus the
+`id` and `checksum` columns. Keys are sorted, separators are `(',', ':')`,
+and the `timestamp` is serialised as `str(datetime)` — i.e. the same
+`"YYYY-MM-DD HH:MM:SS.us"` format that SQLite stores. This means you can
+recompute the hash with only `sqlite3` + `hashlib`:
+
+```python
+import sqlite3, json, hashlib
+con = sqlite3.connect("/var/lib/wo/dbase.db")
+row = con.execute("""
+    SELECT timestamp, event_id, actor, actor_ip, action, target,
+           target_type, result, duration_ms, details, checksum
+    FROM multitenancy_audit ORDER BY id DESC LIMIT 1
+""").fetchone()
+fields = ["timestamp","event_id","actor","actor_ip","action","target",
+          "target_type","result","duration_ms","details"]
+payload = dict(zip(fields, row[:10]))
+payload["duration_ms"] = int(payload["duration_ms"] or 0)
+canonical = json.dumps(payload, sort_keys=True,
+                       separators=(',', ':'), default=str)
+h = hashlib.sha256(canonical.encode()).hexdigest()
+assert h == row[10], "checksum mismatch — tampering detected"
+```
+
+The CLI ships `AuditLogger.verify(row)` with the equivalent logic; reach for
+the Python snippet when you're inspecting the DB from a forensics box that
+doesn't have WordOps installed.
+
+### A.5 Maintenance mode
+
+```bash
+wo multitenancy maintenance --enable --site=example.com --message="Back in 10 minutes"
+wo multitenancy maintenance --disable --site=example.com
+wo multitenancy maintenance --enable --all
+wo multitenancy maintenance --disable --all
+```
+
+Enable writes `/var/www/<domain>/htdocs/maintenance.html` and an nginx include
+at `/var/www/<domain>/conf/nginx/multitenancy-maintenance.conf`, then reloads
+nginx once for the whole batch. The include returns HTTP `503` with a
+`Retry-After` header.
+
+#### Admin-IP bypass
+
+Configure the `[maintenance]` section with a comma-separated list of IPs that
+should see the normal site while everyone else gets the 503 page:
+
+```ini
+[maintenance]
+admin_ips = 198.51.100.10, 203.0.113.42
+default_retry_after = 600
+```
+
+The generated nginx include reads:
+
+```nginx
+set $wo_mt_maintenance 1;
+if ($remote_addr ~ "^(198\.51\.100\.10|203\.0\.113\.42)$") {
+    set $wo_mt_maintenance 0;
+}
+if ($wo_mt_maintenance = 1) {
+    return 503;
+}
+error_page 503 @wo_mt_maintenance_page;
+location @wo_mt_maintenance_page {
+    add_header Retry-After "600" always;
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    root /var/www/<domain>/htdocs;
+    try_files /maintenance.html =503;
+}
+```
+
+IPs are regex-escaped with a single backslash (`\.`), so `198.51.100.10`
+matches the literal IP only — *not* `198X51X100X10` (a bug that would silently
+have defeated the bypass before the fix landed).
+
+`default_retry_after` is the `Retry-After` header value in seconds (default
+600). `admin_ips` defaults to empty, in which case no bypass stanza is
+emitted and *every* request gets the 503.
+
+### A.6 Webhook notifications
+
+Configure the `[webhooks]` section in `/etc/wo/plugins.d/multitenancy.conf`:
+
+```ini
+[webhooks]
+url = https://hooks.example.com/wo-multitenancy
+secret = change-me
+enabled_events = site_created,site_deleted,update_completed,rollback_triggered,baseline_applied,maintenance_enabled,maintenance_disabled
+timeout = 5
+retries = 3
+```
+
+Test delivery:
+
+```bash
+wo multitenancy webhook --action=test
+```
+
+Payload envelope:
+
+```json
+{
+  "event": "site_created",
+  "timestamp": "2026-04-17T12:00:00Z",
+  "schema_version": 1,
+  "correlation_id": "8c3b...",
+  "data": { "domain": "example.com", "php_version": "8.3", "cache_type": "wpfc", "is_ssl": true, "tags": ["production"] }
+}
+```
+
+When `secret` is set, requests carry `X-WO-Signature: sha256=<hmac>`.
+Verify on the receiver side:
+
+```python
+import hmac, hashlib, os
+expected = 'sha256=' + hmac.new(os.environ['WEBHOOK_SECRET'].encode(),
+                                 request.body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(expected, request.headers['X-WO-Signature'])
+```
+
+Retry policy: up to 3 attempts with 1 s / 2 s / 4 s backoff, 5 s per-attempt
+timeout. Failure is logged to the structured log at `warn` level and
+**never** fails the originating operation.
+
+### A.7 Structured JSON log
+
+All multitenancy operations emit JSON lines to
+`/var/log/wo/multitenancy.json`. Example:
+
+```json
+{"timestamp":"2026-04-17T12:00:00Z","level":"info","event":"site_created.complete","schema_version":1,"correlation_id":"8c3b...","duration_ms":42731,"domain":"example.com","result":"success"}
+```
+
+Fields:
+
+| Field | Notes |
+|---|---|
+| `timestamp` | ISO 8601 UTC |
+| `level` | `info`, `warn`, `error` |
+| `event` | dotted suffix: `.start`, `.complete`, `.failed` |
+| `schema_version` | current: `1` |
+| `correlation_id` | UUID4; shared with the audit row and webhook payload for the same logical operation |
+| `duration_ms` | present on `.complete` / `.failed` |
+| `domain` / `target` | operation target |
+| `error` | present on failure |
+
+Log rotation: the policy file `config/logrotate.d/wo-multitenancy` is
+installed to `/etc/logrotate.d/wo-multitenancy` by `setup.py`. Daily rotation,
+14 days kept, compressed, `copytruncate` (so running processes don't lose
+their handle).
+
+Grafana/Loki example queries:
+
+```
+# All failures in the last hour
+{job="wo-multitenancy"} | json | level="error"
+
+# Duration p95 for site_created
+{job="wo-multitenancy"} | json | event="site_created.complete" | quantile_over_time(0.95, duration_ms[1h])
+```
+
+Elasticsearch/Kibana KQL:
+
+```
+event : "site_deleted.complete" and result : "success"
+```
+
+### A.8 `--json` on read commands
+
+```bash
+wo multitenancy list --json
+wo multitenancy status --json
+wo multitenancy baseline --json
+wo multitenancy health --json
+wo multitenancy audit --json --since=24h
+wo multitenancy create example.com --php83 --wpfc --json
+```
+
+All JSON output is written to stdout without any Log colorization, suitable
+for piping through `jq` or ingestion by CI/CD tools.
+
+### A.9 New configuration sections (summary)
+
+```ini
+[logging]
+enabled = true
+file = /var/log/wo/multitenancy.json
+
+[audit]
+enabled = true
+retention_days = 90
+
+[webhooks]
+url =
+secret =
+enabled_events =
+timeout = 5
+retries = 3
+
+[maintenance]
+admin_ips =
+default_retry_after = 600
+```
+
+### A.10 Rollback of the DevOps additions
+
+All new features are additive and fail closed when unconfigured:
+
+- Empty `[webhooks] url` → no webhook traffic.
+- `[audit] enabled = false` → no audit rows written (table stays inert).
+- Maintenance include is only present when explicitly enabled.
+- The `tags` column and `multitenancy_audit` table remain unused without
+  side effects if you never use the new flags or subcommands.
+
+### A.11 Live-environment verification summary
+
+This feature set was exercised end-to-end on a clean Ubuntu 22.04 VPS with
+two real tenant sites (`wp-test1.waashub.com` tagged `production,client-a`
+with `--wpfc`; `wp-test2.waashub.com` tagged `staging` with `--wpredis`). All
+17 audit checks passed, including:
+
+- `health` / `health --json` / `health --site=<domain>` — all 6 built-in
+  checkers report OK against a running stack
+- `list --tags=production|staging|UPPER` — filter, scope, validation
+- `audit` in table / JSON / CSV formats, `--target=<domain>` filter,
+  `--since=garbage` warns-then-falls-back-to-7d (no silent swallow)
+- SHA-256 checksum round-trips cleanly when the row is read via raw
+  `sqlite3` (not just via the ORM) — the fix for the space-vs-T timestamp
+  canonicalisation
+- Tamper detection: modifying any field of a recomputed payload changes the
+  hash and `verify()` returns `False`
+- Maintenance `--enable --site=X` → 503 from non-admin IP, 200 from admin
+  IP; `--enable --all` toggles both sites atomically with a single nginx
+  reload
+- Admin-IP bypass nginx regex uses single-backslash dot escapes (bug fix
+  surfaced only in live testing — unit tests mocked the renderer)
+- Webhook `--action=test` delivers exactly once (no duplicate-kwarg retry
+  storm), HMAC-SHA256 signature verifies
+- `update --tags=…` rejected with a clear pointer to `apply --tags=…`
+- `apply --dry-run --verbose --tags=staging` previews work on the staging
+  site only, without mutating `baseline_version`
+- Correlation IDs tie each audit row back to at least two structured-log
+  entries (`.start` + `.complete` / `.failed`) for the same operation
+
+### A.12 Bug-fix history (during implementation)
+
+The following bugs were caught during review and/or live testing and are
+fixed in the shipped code. They are documented here so future contributors
+can avoid reintroducing the same shapes:
+
+| # | Severity | Bug | Fix |
+|---|---|---|---|
+| 1 | P1 | `wo multitenancy update --tags=…` silently ignored the filter and ran on every tenant (shared symlink) | Reject the flag with an error pointer to `apply --tags=…` |
+| 2 | P2 | `_maintenance_enable` called `app.render(...)` on the controller (renderer lives on `app.app`) | Resolve renderer via `getattr(controller, 'app', controller)` |
+| 3 | P2 | `HealthChecker` PHP-FPM socket probed `/run/php/php8.3-fpm.sock` (dots) instead of WordOps `/var/run/php/php83-fpm.sock` (no dots) | `ver.replace('.', '')` + `/var/run/php/` prefix |
+| 4 | P2 | `_emit_event` spread `data` dict into `logger.info(event, ...)` which could collide with reserved kwargs (`duration_ms`, `correlation_id`, `target`, `result`, …) → TypeError swallowed by broad `except` | Filter `_RESERVED_LOG_KEYS` before keyword-spread |
+| 5 | P2 | `create --json` / `delete --json` / etc. contaminated stdout with `Log.info` progress lines before the final JSON document | `json_quiet_stdout(pargs)` context manager redirects `sys.stdout → sys.stderr` while command body runs; `JsonOutput.emit` writes to `sys.__stdout__` directly |
+| 6 | P1 | `_escape_ip` used `r'\\.'` which rendered as `\\.` (literal backslash + any char) in the nginx regex → admin-IP bypass never matched | `r'\.'` (single backslash + dot) |
+| 7 | P2 | `_parse_since` had a dead-code error handler (`Log.error(None, ...) if False else None`) and silently fell back on bad input | Pass controller, call `Log.warn` properly, keep 7-day fallback |
+| 8 | P2 | `multitenancy_audit` table was created by `create_all` without the four declared indexes, and the ALTER-path migration was gated on an impossible condition | Declare indexes in `__table_args__` (fresh installs) + unconditional `CREATE INDEX IF NOT EXISTS` (existing installs) |
+| 9 | P2 | `WebhookNotifier.notify` passed `event=<hook event>` as a kwarg, colliding with `StructuredLogger.info`'s positional `event` param. The success branch threw `TypeError` which the retry loop swallowed → webhook delivered 3× per event | Rename the log payload key to `hook_event=` at both call sites |
+| 10 | P2 | `AuditLogger._compute_checksum` normalised `datetime` via `.isoformat()` (T-separator) at insert time, but raw-`sqlite3` reads see a space-separator string → checksum couldn't be re-verified outside the ORM | Always normalise `datetime` via `str()` to match the SQLite storage format; string timestamps pass through unchanged |
 

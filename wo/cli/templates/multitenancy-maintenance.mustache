@@ -1,0 +1,22 @@
+# WordOps multitenancy maintenance include for {{domain}}
+# Generated {{generated_at}}
+# Dropped into /var/www/{{domain}}/conf/nginx/ ; loaded by the main vhost.
+set $wo_mt_maintenance 1;
+{{#has_admin_ips}}
+if ($remote_addr ~ "^({{admin_ips_regex}})$") {
+    set $wo_mt_maintenance 0;
+}
+{{/has_admin_ips}}
+
+if ($wo_mt_maintenance = 1) {
+    return 503;
+}
+
+error_page 503 @wo_mt_maintenance_page;
+
+location @wo_mt_maintenance_page {
+    add_header Retry-After "{{retry_after_seconds}}" always;
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    root {{site_htdocs}};
+    try_files /maintenance.html =503;
+}
