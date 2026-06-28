@@ -4,7 +4,7 @@
 
 WordOps is a **root-only Python CLI** (`wo`) that automates a WordPress server stack — Nginx, PHP-FPM, MariaDB, Redis, Let's Encrypt — on Ubuntu/Debian. This is the **`alnaggar-dev` fork**: Git-only install/update (no PyPI, no mainline/beta channels) plus a custom **multitenancy plugin** that lets many WordPress sites share one WP core via symlinks (`/var/www/shared/current` → `releases/wp-<ts>`) for ~90% disk savings and atomic symlink-swap rollback.
 
-Operating model (see `CLAUDE.md`): **trust-model-of-one** — solo operator, own code, own fleet. Prefer **deleting code over adding abstractions**; reducing surface area is a feature. Per-tenant isolation, audit trails, tamper detection, and multi-operator workflows are explicit **non-goals** — do not propose them.
+Operating model: **trust-model-of-one** — solo operator, own code, own fleet. Prefer **deleting code over adding abstractions**; reducing surface area is a feature. Per-tenant isolation, audit trails, tamper detection, and multi-operator workflows are explicit **non-goals** — do not propose them.
 
 ## Architecture & Data Flow
 
@@ -37,7 +37,6 @@ Built on the **Cement 2.10.14** CLI framework (pinned; dependabot ignores cement
 | `wo/utils/` | `test.py` — Cement test harness (`WOTestCase`) |
 | `config/` | `wo.conf` (Cement app config), `plugins.d/*.conf` (per-plugin toggles), `logrotate.d/`, `bash_completion.d/` |
 | `tests/cli/` | nose + unittest test modules (`tests/core/` is empty) |
-| `openspec/` | Spec-driven change workflow for multitenancy (`specs/`, `changes/`, `AGENTS.md`, `project.md`) |
 | `docs/` | `wo.8` man page |
 
 ## Development Commands
@@ -81,7 +80,7 @@ tail -f /var/log/wo/wordops.log
 - **Logging**: `Log.info/warn/debug/error` (`wo/core/logging.py`); first arg is the controller `self`. `Log.error(msg)` defaults to `exit=True` → `app.close(1)`, so it doubles as a fatal-exit path.
 - **Errors**: domain exceptions in `wo/core/exc.py` (`WOError`, `WOConfigError`, `WORuntimeError`, `WOArgumentError`); plugin-level `SiteError`, `CommandExecutionError`. `main()` catches `WOError`, `CaughtSignal`, `FrameworkError`.
 - **Shell execution**: prefer `WOShellExec.cmd_exec` / `cmd_exec_stdout` (`wo/core/shellexec.py`); raw `subprocess` and `sh.git` / `sh.apt_get` also appear. `WOService` wraps `service …` and guards nginx with `nginx -t`.
-- **Multitenancy work is spec-governed**: for new capabilities or breaking changes, follow the OpenSpec workflow (`openspec/AGENTS.md`) — proposal → implement → archive (`openspec list|validate|archive`). Extend WordOps natives (`setupdatabase`, `WOAcme`, `WOService`, `Log`) rather than reinventing them.
+- **Extend WordOps natives** (`setupdatabase`, `WOAcme`, `WOService`, `Log`) rather than reinventing them.
 
 ## Important Files
 
@@ -90,7 +89,7 @@ tail -f /var/log/wo/wordops.log
 - **Site command**: `wo/cli/plugins/site.py`, `site_create.py`, `site_functions.py`, `sitedb.py`, `models.py`
 - **Multitenancy**: `wo/cli/plugins/multitenancy.py`, `multitenancy_functions.py`, `multitenancy_db.py`, `multitenancy_health.py`, `config/plugins.d/multitenancy.conf`
 - **Packaging/config**: `setup.py`, `setup.cfg`, `requirements.txt`, `config/wo.conf`
-- **AI/spec context**: `CLAUDE.md`, `openspec/AGENTS.md`, `openspec/project.md`; deep plugin reference `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md`; operator cheat sheet `short-guide.md`
+- **AI context**: `AGENTS.md`; deep plugin reference `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md`; operator cheat sheet `short-guide.md`
 
 ## Runtime/Tooling Preferences
 

@@ -25,7 +25,6 @@ Target end-state: ~3,500–4,000 LOC of plugin code, ~300 LOC of docs. Every lin
 | `install-multitenancy.sh` | Loose install script — **delete** |
 | `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` | Master doc (4,486 LOC) — **replace** with ~300-LOC reference |
 | `tests/cli/40_test_multitenancy_devops.py` | Tests for deleted features — **delete** |
-| `openspec/changes/refactor-simplify-multitenancy/` | New OpenSpec proposal — **create** |
 
 ---
 
@@ -45,27 +44,9 @@ Each phase = one commit. Order minimizes import-failure windows and lets interme
 
 ### Phase 0 — Prework (read-only audit, single commit allowed for tiny fixes)
 
-- Fix the **duplicate `@staticmethod`** decorators at `multitenancy_functions.py:25-26` and `:444-445`, and the duplicate `return result` at `:164-165`, and the duplicate `config_file = ...` at `:3421-3422`. These are cosmetic but tell you the file has outgrown one brain; do them with the delete-heavy Phase 2 edits.
+- Fix the **duplicate `@staticmethod`** decorators at `multitenancy_functions.py:25-26` and `:444-445`, and the duplicate `return result` at `:164-165`, and the duplicate `config_file = ...` at `:3421-3422`. These are cosmetic but tell you the file has outgrown one brain; do them with the delete-heavy Phase 1 edits.
 
-### Phase 1 — OpenSpec proposal
-
-Create `openspec/changes/refactor-simplify-multitenancy/` with:
-- `proposal.md` — single-paragraph "why"
-- `tasks.md` — mirrors the phases below
-- `specs/multitenancy/spec.md` — delta file
-
-Delta structure:
-- `## REMOVED Requirements` for Structured Logging, Machine-Readable Output (--json), Site Tagging, Audit Logging (+ retention scenario), Webhook Notifications, Staging Auto-Gate, Site Quarantine, Baseline MU-Plugin Enforcer, SharedConfig history/git/diff/rollback
-- `## MODIFIED Requirements` for Health Check System (drop --json scenario), Maintenance Mode (drop admin-IP bypass scenario), Baseline Apply (drop tag/quarantine/staging scenarios), Shared Configuration (now: `edit` only)
-- `## ADDED Requirements` for Preflight Syntax Check
-
-Copy each MODIFIED requirement block verbatim from `openspec/specs/multitenancy/spec.md` before editing — OpenSpec replaces the full requirement on archive.
-
-Run `openspec validate refactor-simplify-multitenancy --strict` and clear errors.
-
-**No code changes in this phase.**
-
-### Phase 2 — Remove telemetry (StructuredLogger / AuditLogger / WebhookNotifier / JsonOutput / json_quiet_stdout / _emit_event)
+### Phase 1 — Remove telemetry (StructuredLogger / AuditLogger / WebhookNotifier / JsonOutput / json_quiet_stdout / _emit_event)
 
 **Scope:** highest-surface delete; must go first so later phases don't import dead names.
 
@@ -103,9 +84,9 @@ Config/setup:
 - Drop the `('/etc/logrotate.d/', ['config/logrotate.d/wo-multitenancy'])` entry in `setup.py` (lines 82–83)
 - Drop the `MTFunctions.load_config` branches that parse `[logging]`, `[audit]`, `[webhooks]` (lines 108–147 in functions.py)
 
-**Delete `tests/cli/40_test_multitenancy_devops.py` in this phase** to keep CI green — the file imports symbols removed here. Phase 11 adds replacement tests.
+**Delete `tests/cli/40_test_multitenancy_devops.py` in this phase** to keep CI green — the file imports symbols removed here. Phase 10 adds replacement tests.
 
-### Phase 3 — Remove tagging
+### Phase 2 — Remove tagging
 
 Remove from `multitenancy.py`:
 - `--tags` argparse flag (line 109)
@@ -125,7 +106,7 @@ Remove from `multitenancy_db.py`:
 - `update_site_tags` method (~936)
 - `get_sites_by_tags` method (~952)
 
-### Phase 4 — Remove quarantine / staging / unquarantine
+### Phase 3 — Remove quarantine / staging / unquarantine
 
 Remove from `multitenancy.py`:
 - `staging` controller command (~1049–1103)
@@ -148,7 +129,7 @@ Remove from `multitenancy_db.py`:
 Remove from `multitenancy_health.py`:
 - The four `'quarantined': bool(site.get('is_quarantined'))` keys in `_check_single_site` return dicts (lines 280, 292, 301, 310). The health module is otherwise self-contained and untouched.
 
-### Phase 5 — Replace SharedConfig with `edit`-only
+### Phase 4 — Replace SharedConfig with `edit`-only
 
 In `multitenancy_functions.py`:
 - Delete the entire `SharedConfig` class (2638–3925).
@@ -161,7 +142,7 @@ In `multitenancy.py`:
 - Drop `--key`, `--value`, `--dry-run`, `--config-version`, `--to-commit` from `Meta.arguments` (101–106). Keep `--action` since `--action edit` is the only entry point.
 - Drop the `initialize_config_git` call in `init` (line 229); git history for this one file is not worth the subsystem.
 
-### Phase 6 — Remove MU-plugin enforcer
+### Phase 5 — Remove MU-plugin enforcer
 
 In `multitenancy_functions.py`:
 - Delete `create_mu_plugin` (~1951) and `get_mu_plugin_content` (~1960 through the end of the PHP heredoc).
@@ -172,7 +153,7 @@ In `multitenancy.py::init`:
 
 The `wo_mt_baseline_version` WP option in per-site DBs is left alone — inert after the enforcer is gone. `wo multitenancy baseline apply` becomes the sole propagation mechanism (already does the imperative work).
 
-### Phase 7 — Simplify maintenance mode
+### Phase 6 — Simplify maintenance mode
 
 In `multitenancy.py::_maintenance_enable`:
 - Drop `admin_ips` fetch + `admin_regex` build; drop `has_admin_ips` / `admin_ips_regex` from `nginx_data`.
@@ -188,7 +169,7 @@ In `wo/cli/templates/multitenancy-maintenance.mustache`:
 In `multitenancy_functions.py::load_config`:
 - Remove the `[maintenance]` parser block (149–161).
 
-### Phase 8 — Add preflight syntax check
+### Phase 7 — Add preflight syntax check
 
 New in `multitenancy_functions.py`:
 
@@ -198,13 +179,13 @@ New in `multitenancy_functions.py`:
 - Returns `True` when the file doesn't yet exist (first `init` call) or validates cleanly.
 - Called at the top of `init`, `_create_impl`, `_apply_impl`, `update`.
 
-### Phase 9 — Drop install script + setup cleanup
+### Phase 8 — Drop install script + setup cleanup
 
 - Delete `/Users/alnaggar/dev/WordOps/install-multitenancy.sh`.
 - Verify no references in README.md, setup.py, CI, or docs (already checked: none).
-- Confirm `setup.py` logrotate deletion from Phase 2 landed.
+- Confirm `setup.py` logrotate deletion from Phase 1 landed.
 
-### Phase 10 — Shrink docs
+### Phase 9 — Shrink docs
 
 Replace `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` (4,486 lines) with a ~300-line reference:
 - **Overview** — what this does, core model (shared core + per-site wp-config).
@@ -218,9 +199,9 @@ Replace `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` (4,486 lines) with a ~300-line 
 
 Move the deleted 4,186 lines to `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V1-archive.md` if retention matters; otherwise just delete.
 
-### Phase 11 — Tests
+### Phase 10 — Tests
 
-**Delete** `tests/cli/40_test_multitenancy_devops.py` (already queued for Phase 2 to keep CI green).
+**Delete** `tests/cli/40_test_multitenancy_devops.py` (already queued for Phase 1 to keep CI green).
 
 **Add** `tests/cli/40_test_multitenancy.py` with two unit tests — no live stack required, all mockable:
 
@@ -230,12 +211,6 @@ Move the deleted 4,186 lines to `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V1-archive.md`
 | `test_maintenance_enable_writes_include_without_admin_regex` | Mock `renderer.render`; call `_maintenance_enable`; assert the rendered mustache context has no `has_admin_ips` / `admin_ips_regex` keys. |
 
 All other tests in `tests/cli/` remain untouched — none reference multitenancy beyond the deleted file.
-
-### Phase 12 — OpenSpec archive
-
-After phases 2–11 land:
-- `openspec archive refactor-simplify-multitenancy` moves the proposal into `openspec/changes/archive/2026-04-17-refactor-simplify-multitenancy/` and applies the REMOVED / MODIFIED / ADDED deltas to `openspec/specs/multitenancy/spec.md`.
-- `openspec validate --strict` to confirm the spec file is coherent.
 
 ---
 
@@ -259,7 +234,7 @@ After each phase:
 python3 -c "from wo.cli.plugins.multitenancy import WOMultitenancyController; print('import ok')"
 python3 -m py_compile wo/cli/plugins/multitenancy*.py
 grep -rn "StructuredLogger\|AuditLogger\|WebhookNotifier\|JsonOutput\|json_quiet_stdout\|_emit_event\|validate_tags\|mark_site_quarantined\|get_staging_site\|unquarantine\|create_mu_plugin\|_escape_ip" wo/cli/plugins/
-# expect: no hits after Phase 7
+# expect: no hits after Phase 6
 
 # Unit tests
 pytest tests/cli/40_test_multitenancy.py -v
@@ -276,18 +251,13 @@ wo multitenancy shared-config --action edit
 wo multitenancy maintenance --enable --site=test.local
   # confirm: 503 from all IPs; simple mustache include, no admin regex
 wo multitenancy remove --force             # clean teardown
-
-# OpenSpec
-openspec validate refactor-simplify-multitenancy --strict
-openspec archive refactor-simplify-multitenancy
-openspec validate --strict
 ```
 
 ---
 
 ## Rollback strategy
 
-- Each phase = one commit on a feature branch. If any phase breaks something, `git revert <phase-commit>` restores that slice cleanly — later phases don't depend on earlier ones except via the import-order guardrail in Phase 2.
+- Each phase = one commit on a feature branch. If any phase breaks something, `git revert <phase-commit>` restores that slice cleanly — later phases don't depend on earlier ones except via the import-order guardrail in Phase 1.
 - The DB columns and `multitenancy_audit` table are left in place, so a full revert requires no DB rollback.
 - Existing sites continue working unchanged; the plugin keeps the same core architecture, same wp-config, same nginx template, same Redis prefix. Only DevOps metadata and the MU-plugin file go away.
 

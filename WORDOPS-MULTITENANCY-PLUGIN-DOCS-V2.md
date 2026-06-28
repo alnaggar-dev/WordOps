@@ -4115,13 +4115,10 @@ The implementation is clean, efficient, and production-ready.
 
 ## Appendix A: DevOps Primitives (health / audit / maintenance / webhooks)
 
-This appendix documents the DevOps layer shipped by the
-`refactor-devops-improvements` OpenSpec change (archived
-[2026-04-17-refactor-devops-improvements](openspec/changes/archive/2026-04-17-refactor-devops-improvements/)).
-The corresponding specification is [openspec/specs/multitenancy/spec.md](openspec/specs/multitenancy/spec.md)
-with 8 requirements covering the behaviors below. All additions are
-non-breaking and opt-in. Nothing here runs by default on an existing install
-unless the corresponding config section is populated.
+This appendix documents the DevOps layer (health, audit, maintenance,
+webhooks). All additions are non-breaking and opt-in. Nothing here runs by
+default on an existing install unless the corresponding config section is
+populated.
 
 ### A.1 Health check
 
