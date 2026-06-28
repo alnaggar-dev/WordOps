@@ -1,40 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/alnaggar-dev/WordOps/main/logo.png" width="400" alt="Wordops" /><a href="https://wordops.net">
-
-  <br>
-</p>
-
-<h2 align="center">An essential toolset that eases WordPress site and server administration</h2>
-
-<p align="center">
-<img src="https://docs.wordops.net/images/wordops-intro.gif" width="800" alt="WordOps" />
-</p>
-
-<p align="center">
-<a href="https://github.com/alnaggar-dev/WordOps/actions" target="_blank"><img src="https://github.com/alnaggar-dev/WordOps/actions/workflows/main.yml/badge.svg?branch=main" alt="CI"></a>
-<img src="https://img.shields.io/github/license/alnaggar-dev/WordOps.svg?cacheSeconds=86400" alt="MIT">
-<img src="https://img.shields.io/github/last-commit/alnaggar-dev/WordOps.svg?cacheSeconds=86400" alt="Commits">
-<img alt="GitHub release" src="https://img.shields.io/github/release/alnaggar-dev/WordOps.svg">
-<br><a href="https://pypi.org/project/wordops/" target="_blank"><img alt="PyPI - Downloads" src="https://img.shields.io/pypi/dm/wordops.svg?cacheSeconds=86400"></a>
-<a href="https://twitter.com/WordOps_" target="_blank"><img src="https://img.shields.io/badge/twitter-%40WordOps__-blue.svg?style=flat&logo=twitter&cacheSeconds=86400" alt="Badge Twitter" /></a>
-</p>
-
-<p align="center">
-  <a href="#key-features">Key Features</a> •
-  <a href="#usage">Usage</a> •
-  <a href="https://github.com/alnaggar-dev/WordOps/projects">RoadMap</a> •
-  <a href="https://github.com/alnaggar-dev/WordOps/blob/main/CHANGELOG.md">Changelog</a> •
-  <a href="#credits">Credits</a> •
-  <a href="#license">License</a>
-</p>
-<p align="center">
-<a href="https://wordops.net" target="_blank"> WordOps.net</a> •
-<a href="https://docs.wordops.net" target="_blank">Documentation</a> •
-<a href="https://community.wordops.net" target="_blank">Community Forum</a> •
-<a href="https://demo.wordops.eu" target="_blank">Dashboard demo</a>
-</p>
-
----
-
 ## Key Features
 
 -   **Easy to install** : One step automated installer with migration from EasyEngine v3 support
@@ -175,14 +138,6 @@ If you'd like to contribute, please fork the repository and make changes as you'
 There is no need to be a developer or a system administrator to contribute to WordOps project. You can still contribute by helping us to improve [WordOps documentation](https://github.com/WordOps/docs.wordops.net).
 Otherwise, you can still contribute to the project by making a donation on [Ko-Fi](https://ko-fi.com/wordops).
 
-## Sponsors
-
-Thanks to our generous sponsors for supporting the development of WordOps:
-
-| [Liquid Web](https://www.liquidweb.com/)                                                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| <a href="https://www.liquidweb.com/" target="_blank"><img src="https://docs.wordops.net/images/liquid-web.png" alt="Liquid Web logo" width="200"/></a> |
-
 ## Credits
 
 -   Source : [EasyEngine](https://github.com/easyengine/easyengine)
@@ -221,6 +176,3 @@ WordPress Cache Plugins supported by WordOps :
 -   [WP-Super-Cache](https://github.com/Automattic/wp-super-cache)
 -   [WP-Rocket](https://github.com/wp-media/wp-rocket)
 
-## License
-
--   [MIT](http://opensource.org/licenses/MIT) © [WordOps](https://wordops.net)

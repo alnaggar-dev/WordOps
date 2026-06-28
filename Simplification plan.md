@@ -4,7 +4,7 @@
 
 The current plugin (~13,000 LOC across 4 modules, 4,486 LOC of docs) was architected for multi-tenant SaaS ergonomics (audit trails, webhooks, structured JSON logs, tagging, quarantine, staging auto-gate, shared-config-as-a-service, full source-control baselines). The **core** — shared WP core via symlinks, atomic release switching, per-site wp-config with unique Redis prefix, native WordOps nginx-include reuse, SSL via WOAcme — is excellent and stays.
 
-This refactor strips the enterprise scaffolding for a **solo operator** with curated first-party plugins, adds three small safety primitives (`doctor`, preflight syntax check, plugins-dir immutability), and trims ~7–8k LOC.
+This refactor strips the enterprise scaffolding for a **solo operator** with curated first-party plugins, adds one small safety primitive (a preflight `php -l` syntax check), and trims ~7–8k LOC.
 
 Target end-state: ~3,500–4,000 LOC of plugin code, ~300 LOC of docs. Every line pays rent.
 
@@ -18,7 +18,7 @@ Target end-state: ~3,500–4,000 LOC of plugin code, ~300 LOC of docs. Every lin
 | `wo/cli/plugins/multitenancy_functions.py` | Logic (4,314 LOC) — trim ~2,200 LOC |
 | `wo/cli/plugins/multitenancy_db.py` | ORM + migrations (1,063 LOC) — trim ~350 LOC |
 | `wo/cli/plugins/multitenancy_health.py` | Health checker (356 LOC) — keep, minor edits |
-| `config/plugins.d/multitenancy.conf` | User config — drop `[logging]`, `[audit]`, `[webhooks]`, `[maintenance]` sections; add `lock_plugins_dir` |
+| `config/plugins.d/multitenancy.conf` | User config — drop `[logging]`, `[audit]`, `[webhooks]`, `[maintenance]` sections |
 | `config/logrotate.d/wo-multitenancy` | Logrotate for the JSON structured log — **delete** |
 | `wo/cli/templates/multitenancy-maintenance.mustache` | Maintenance nginx include — simplify (drop admin-IP bypass) |
 | `setup.py` | Drop `config/logrotate.d/wo-multitenancy` from `data_files` |
@@ -33,9 +33,6 @@ Target end-state: ~3,500–4,000 LOC of plugin code, ~300 LOC of docs. Every lin
 
 - **Dead SQLite columns are left in place.** SQLite 3.31 (Ubuntu 20.04 / Debian 11) lacks `DROP COLUMN`. A table-rebuild dance (`CREATE TABLE new → INSERT SELECT → DROP → RENAME`) carries non-zero outage risk on a live DB for zero payoff. Remove the columns from the ORM model + stop writing to them. `multitenancy_audit` table is also left in place (inert) — remove the ORM class and helpers only.
 - **`redis_prefix` column + its unique index stay.** Essential for cache isolation.
-- **`chattr` failure degrades gracefully.** Log a WARN, continue. ext4/xfs is the norm for solo Ubuntu hosts; a container/btrfs user just loses the lock feature.
-- **Plugins locked, themes unlocked.** Theme activation is a DB write; theme dir doesn't need immutability.
-- **`doctor` exits 1 on ERROR only.** Cron-safe; WARN doesn't page.
 - **GitHub + URL plugin/theme sources stay untouched.** User's primary workflow — no simplification there.
 - **Existing `wo_mt_baseline_version` WP option in tenant DBs is left alone.** Inert after the MU-plugin is removed.
 - **MU-plugin file is cleaned up on `init --force`** for existing installs. New installs never create it.
@@ -60,7 +57,7 @@ Create `openspec/changes/refactor-simplify-multitenancy/` with:
 Delta structure:
 - `## REMOVED Requirements` for Structured Logging, Machine-Readable Output (--json), Site Tagging, Audit Logging (+ retention scenario), Webhook Notifications, Staging Auto-Gate, Site Quarantine, Baseline MU-Plugin Enforcer, SharedConfig history/git/diff/rollback
 - `## MODIFIED Requirements` for Health Check System (drop --json scenario), Maintenance Mode (drop admin-IP bypass scenario), Baseline Apply (drop tag/quarantine/staging scenarios), Shared Configuration (now: `edit` only)
-- `## ADDED Requirements` for Preflight Syntax Check, Doctor Command, Plugins Directory Lock
+- `## ADDED Requirements` for Preflight Syntax Check
 
 Copy each MODIFIED requirement block verbatim from `openspec/specs/multitenancy/spec.md` before editing — OpenSpec replaces the full requirement on archive.
 
@@ -191,32 +188,15 @@ In `wo/cli/templates/multitenancy-maintenance.mustache`:
 In `multitenancy_functions.py::load_config`:
 - Remove the `[maintenance]` parser block (149–161).
 
-### Phase 8 — Add preflight + doctor + plugins-dir immutability
+### Phase 8 — Add preflight syntax check
 
 New in `multitenancy_functions.py`:
 
-1. `MTFunctions.preflight_shared_config(app, shared_root) -> bool`:
-   - Runs `subprocess.run(['php', '-l', f'{shared_root}/config/wp-config-shared.php'])`.
-   - On non-zero return, `Log.error(app, "wp-config-shared.php has a PHP syntax error. Fix via: wo multitenancy shared-config --action edit")` and return `False`.
-   - Returns `True` when the file doesn't yet exist (first `init` call) or validates cleanly.
-   - Called at the top of `init`, `_create_impl`, `_apply_impl`, `update`.
-
-2. `MTFunctions.lock_plugins_dir(app, shared_root)` / `unlock_plugins_dir(app, shared_root)`:
-   - Reads `lock_plugins_dir` (default `true`) from `[multitenancy]` config.
-   - Runs `chattr +i -R` / `chattr -i -R` on `{shared_root}/wp-content/plugins`.
-   - **Graceful fallback**: if `chattr` binary missing, or exit code indicates unsupported FS, or EPERM, log `Log.warn(app, "lock_plugins_dir skipped: chattr unavailable or unsupported filesystem")` and return — never raise.
-   - Wrapper pattern for mutating ops: try/finally where `unlock` is first and `lock` is in `finally`. Call sites: `seed_plugins_and_themes`, `download_plugin`, `download_plugin_from_github`, `download_plugin_from_url`, `update_plugin`, `remove_plugin`, `apply_baseline` (if it ever writes to plugins — currently only reads, so no unlock needed there).
-
-3. New `multitenancy.py::doctor` command:
-   - Runs `HealthChecker(self).register_defaults().run_all()` and renders text.
-   - Adds four local cross-checks:
-     - Read `baseline.json["version"]` and compare against `MTDatabase.get_baseline_version(self)` (which reads the `baseline_version` key from `multitenancy_config`).
-     - For each `MultitenancySite`, compare its `baseline_version` column to the file value — flag drift.
-     - For each site, `os.readlink('/var/www/<domain>/htdocs/wp')` and assert it resolves inside `{shared_root}/current`.
-     - Run `preflight_shared_config(self, shared_root)` and flag failure.
-   - Return exit code `1` on any ERROR (via `sys.exit(1)`), `0` otherwise. WARN does not fail.
-
-4. Add `lock_plugins_dir = true` under `[multitenancy]` in `config/plugins.d/multitenancy.conf` with a `###` comment explaining the chattr fallback.
+`MTFunctions.preflight_shared_config(app, shared_root) -> bool`:
+- Runs `subprocess.run(['php', '-l', f'{shared_root}/config/wp-config-shared.php'])`.
+- On non-zero return, `Log.error(app, "wp-config-shared.php has a PHP syntax error. Fix via: wo multitenancy shared-config --action edit")` and return `False`.
+- Returns `True` when the file doesn't yet exist (first `init` call) or validates cleanly.
+- Called at the top of `init`, `_create_impl`, `_apply_impl`, `update`.
 
 ### Phase 9 — Drop install script + setup cleanup
 
@@ -229,7 +209,7 @@ New in `multitenancy_functions.py`:
 Replace `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md` (4,486 lines) with a ~300-line reference:
 - **Overview** — what this does, core model (shared core + per-site wp-config).
 - **Install & activate** — one `pip install .` + activation conf.
-- **Commands** — `init | create | update | rollback | status | list | validate | remove | delete | baseline add/remove/set/update/apply/history | shared-config edit | maintenance | health | doctor`.
+- **Commands** — `init | create | update | rollback | status | list | validate | remove | delete | baseline add/remove/set/update/apply/history | shared-config edit | maintenance | health`.
 - **Directory structure** — the two canonical trees.
 - **Tenancy model caveats** — one paragraph: "This is a trust-model of one operator with curated plugins. Plugins that write to their own directory (caches, rules) will collide. Store anything mutable under `wp-content/uploads`." (User accepted the blind spot; still worth documenting for future-self.)
 - **Troubleshooting** — 5–10 common issues, not 2,000 lines.
@@ -242,13 +222,11 @@ Move the deleted 4,186 lines to `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V1-archive.md`
 
 **Delete** `tests/cli/40_test_multitenancy_devops.py` (already queued for Phase 2 to keep CI green).
 
-**Add** `tests/cli/40_test_multitenancy.py` with four unit tests — no live stack required, all mockable:
+**Add** `tests/cli/40_test_multitenancy.py` with two unit tests — no live stack required, all mockable:
 
 | Test | Asserts |
 |---|---|
 | `test_preflight_rejects_bad_php` | Write syntactically broken PHP to a tmpfile, call `MTFunctions.preflight_shared_config`, assert returns `False` and logs an error. |
-| `test_doctor_detects_version_drift` | Mock `MTDatabase.get_baseline_version` vs a site row's `baseline_version` column returning different integers; assert doctor flags the mismatch and exit code is 1. |
-| `test_chattr_wrap_order` | Mock `subprocess.run`; call `lock_plugins_dir` → plugin write → `unlock_plugins_dir`; assert exactly the two chattr invocations in order and with `-R`. |
 | `test_maintenance_enable_writes_include_without_admin_regex` | Mock `renderer.render`; call `_maintenance_enable`; assert the rendered mustache context has no `has_admin_ips` / `admin_ips_regex` keys. |
 
 All other tests in `tests/cli/` remain untouched — none reference multitenancy beyond the deleted file.
@@ -265,9 +243,6 @@ After phases 2–11 land:
 
 None of this invents fresh machinery; everything leverages what's already there:
 
-- `HealthChecker.register_defaults().run_all()` at `multitenancy_health.py:45-82` — doctor's foundation.
-- `MTDatabase.get_baseline_version` at `multitenancy_db.py:362` — for version drift check.
-- `MTFunctions.load_config` at `multitenancy_functions.py:27` — for reading new `lock_plugins_dir` flag.
 - `MTFunctions.safe_nginx_reload` at `multitenancy_functions.py:312` — used by the simplified maintenance mode unchanged.
 - `MTFunctions.validate_nginx_config` at `multitenancy_functions.py:204` — preflight for nginx after maintenance changes.
 - `WOFileUtils.create_symlink` and `WOService.reload_service` — already-plumbed WordOps primitives.
@@ -292,11 +267,10 @@ pytest tests/cli/40_test_multitenancy.py -v
 # CLI smoke (in a throwaway VM or container; do NOT run on a live host from the plan)
 wo multitenancy --help                     # no trace of --json / --tags / --since / --format
 wo multitenancy init --force               # clean init, creates wp-config-shared.php, no MU-plugin
-wo multitenancy doctor                     # exits 0, shows all checks green
 wo multitenancy create test.local --php83 --wpfc
-  # confirm: preflight ran, chattr +i applied to plugins dir, site works
+  # confirm: preflight ran, site works
 wo multitenancy baseline add-plugin hello-dolly
-  # confirm: unlock → download → lock cycle
+  # confirm: plugin downloaded into shared wp-content
 wo multitenancy shared-config --action edit
   # confirm: $EDITOR opens, php -l runs on save, .bak file created
 wo multitenancy maintenance --enable --site=test.local
@@ -335,5 +309,3 @@ openspec validate --strict
 New reliability wins:
 - No telemetry code → no telemetry bugs (10 P1/P2 bugs avoided per the A.12 history).
 - Preflight syntax check catches the "shared config typo = all sites down" class.
-- `chattr +i` closes the "WP-admin clicks 'update plugin' and nukes neighbors" class.
-- `doctor` gives one command for "is anything drifted?"
