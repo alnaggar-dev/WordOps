@@ -97,7 +97,7 @@ wo site create example.com --php81      # create example.com with php 8.1 suppor
 wo site create example.com --php82      # create example.com with php 8.2 support
 wo site create example.com --php84      # create example.com with php 8.4 support
 wo site create example.com --php85      # create example.com with php 8.5 support
-wo site create example.com --mysql    # create example.com with php 8.2 & mysql support
+wo site create example.com --mysql    # create example.com with php 8.4 & mysql support
 wo site create example.com --mysql --php83   # create example.com with php 8.3 & mysql support
 wo site create example.com --proxy=127.0.0.1:3000 #  create example.com with nginx as reverse-proxy
 ```

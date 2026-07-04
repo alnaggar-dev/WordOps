@@ -11,14 +11,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 #### Added
 
 -   Add PHP 8.4 support by @VirtuBox
+-   Add multitenancy `wp_version` config key to pin the shared WordPress core version
 
 #### Changed
 
--   Default PHP version bumped to 8.3 by @VirtuBox
+-   Default PHP version bumped to 8.4 across `wo.conf`, installer fallback, and multitenancy defaults
 
 #### Fixed
 
 -   Fix html site creation by @VirtuBox in #703
+-   Fix `wo site clone` PHP version resolution to support all current PHP versions; it was hardcoded to 7.2–7.4 and silently fell back to 7.3
 
 ### v3.21.3 - 2024-06-14
 

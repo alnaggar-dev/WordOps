@@ -167,7 +167,7 @@ class HealthChecker:
         })
         if not versions:
             # Fall back to the default configured version
-            fallback = (self.config.get('php_version') or '8.3').strip()
+            fallback = (self.config.get('php_version') or '8.4').strip()
             versions = [fallback]
         per_version = {}
         overall = STATUS_OK

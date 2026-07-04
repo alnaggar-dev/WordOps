@@ -40,9 +40,9 @@ Each generated tenant `wp-config.php` does a `require_once` of `/var/www/shared/
 3. Create sites.
 
     ```bash
-    wo multitenancy create example.com --php83 --wpfc
-    wo multitenancy create ssl.example.com --php83 --wpfc -le
-    wo multitenancy create redis.example.com --php83 --wpredis
+    wo multitenancy create example.com --php84 --wpfc
+    wo multitenancy create ssl.example.com --php84 --wpfc -le
+    wo multitenancy create redis.example.com --php84 --wpredis
     ```
 
 ## Install & activate
@@ -60,7 +60,8 @@ Enable the plugin through `/etc/wo/plugins.d/multitenancy.conf`:
 enable_plugin = true
 shared_root = /var/www/shared
 keep_releases = 3
-php_version = 8.3
+wp_version = latest
+php_version = 8.4
 baseline_plugins = redis-cache,nginx-helper
 baseline_theme = twentytwentyfour
 admin_email = admin@example.com
@@ -83,7 +84,8 @@ Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`.
 | `enable_plugin` | — | Cement plugin-loader gate; the plugin only loads when set to `true`. |
 | `shared_root` | `/var/www/shared` | Shared core, content, config, baseline, and release root. |
 | `keep_releases` | `3` | Number of WordPress core releases kept for rollback. |
-| `php_version` | `8.3` | Default PHP version when the CLI/site does not specify one. |
+| `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest` or an exact version (e.g. `6.5.2`); passed to `wp core download --version=...` when pinned. |
+| `php_version` | `8.4` | Default PHP version when the CLI/site does not specify one. |
 | `baseline_plugins` | `nginx-helper,redis-cache` | Comma-separated plugin slugs seeded during `init`. Fetched from WordPress.org unless the slug also appears in a GitHub/URL section. |
 | `baseline_theme` | `twentytwentyfour` | Theme slug seeded during `init`. Fetched from WordPress.org unless provided by a GitHub/URL section. |
 | `admin_email` | `admin@example.com` | Fallback admin email for site creation. |
@@ -105,7 +107,8 @@ Optional source sections define plugins and themes that come from GitHub or dire
 enable_plugin = true
 shared_root = /var/www/shared
 keep_releases = 3
-php_version = 8.3
+wp_version = latest
+php_version = 8.4
 baseline_plugins = redis-cache,nginx-helper
 baseline_theme = twentytwentyfour
 admin_email = admin@example.com
@@ -134,7 +137,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | --- | --- |
 | `wo multitenancy init [--force]` | Create shared directories, download core, seed baseline plugins/themes, write `baseline.json` and `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe. |
 | `wo multitenancy create <domain> [flags]` | Create a shared-core tenant. See [create options](#create-options). |
-| `wo multitenancy update [--force]` | Download a new core, update shared plugins/themes, canary-test, back up and switch release, clear caches, and bump the baseline version. `--force` skips the canary abort. |
+| `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, clear caches, and bump the baseline version. `--force` skips the canary abort. |
 | `wo multitenancy rollback [--force]` | Switch `current` back to the previous release. `--force` skips confirmation. |
 | `wo multitenancy delete <domain> [--force]` | Delete a tenant with `wo site delete ... --no-prompt`, then remove its multi-tenancy tracking row. |
 | `wo multitenancy remove [--force]` | Tear down the entire shared infrastructure. It refuses while sites remain unless `--force` is used. |
@@ -197,7 +200,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `--admin-user` | WordPress admin username. Default: `admin`. |
 | `--admin-email` | WordPress admin email. Falls back to `admin_email` in config. |
 
-If no PHP flag is passed, the default comes from `php_version` in config, which defaults to 8.3. If no cache flag is passed, the site is created with basic/no cache. SSL is `-le` or `--letsencrypt`; a copied `—le` with an em dash causes `unrecognized arguments`.
+If no PHP flag is passed, the default comes from `php_version` in config, which defaults to 8.4. If no cache flag is passed, the site is created with basic/no cache. SSL is `-le` or `--letsencrypt`; a copied `—le` with an em dash causes `unrecognized arguments`.
 
 `--force` and `--shared` are accepted globally, but `create` ignores them. A created multi-tenancy site always uses shared core. There is no command to convert an existing standalone WordPress site onto the shared core; shared-core sites must be created fresh with `create`.
 
@@ -277,7 +280,7 @@ Plugins and themes are shared read-only symlinks. A plugin that writes into its 
 | --- | --- |
 | Site cannot find WordPress core | Check the site core symlink with `ls -la /var/www/<d>/htdocs/wp` and check `/var/www/shared/current`. |
 | nginx config or vhost issue | Run `nginx -t && systemctl reload nginx`. |
-| PHP-FPM unavailable | Check `systemctl status php8.3-fpm` or the service matching the site's PHP version. |
+| PHP-FPM unavailable | Check `systemctl status php8.4-fpm` or the service matching the site's PHP version. |
 | Uploads fail or media cannot be written | Fix uploads ownership with `chown -R www-data:www-data …/wp-content/uploads`. |
 | SSL flag rejected as `unrecognized arguments` | Use `-le` or `--letsencrypt`; replace any copied em dash with a normal hyphen. |
 | Redis cross-talk or lost cache isolation | Each site needs a unique `redis_prefix`, enforced in the DB. Recreate a site whose `wp-config.php` lost its prefix. |

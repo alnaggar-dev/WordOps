@@ -34,13 +34,7 @@ class WOSiteCloneController(CementBaseController):
             (['--html'],
                 dict(help="create html site", action='store_true')),
             (['--php'],
-             dict(help="create php 7.2 site", action='store_true')),
-            (['--php72'],
-                dict(help="create php 7.2 site", action='store_true')),
-            (['--php73'],
-                dict(help="create php 7.3 site", action='store_true')),
-            (['--php74'],
-                dict(help="create php 7.4 site", action='store_true')),
+             dict(help="create php site", action='store_true')),
             (['--mysql'],
                 dict(help="create mysql site", action='store_true')),
             (['--wp'],
@@ -103,6 +97,10 @@ class WOSiteCloneController(CementBaseController):
                                    "without installing WordPress",
                                    action='store_true')),
         ]
+        for php_version, php_number in WOVar.wo_php_versions.items():
+            arguments.append(([f'--{php_version}'],
+                              dict(help=f'Create PHP {php_number} site',
+                                   action='store_true')))
 
     @expose(hide=True)
     def default(self):
@@ -169,7 +167,7 @@ class WOSiteCloneController(CementBaseController):
             data['port'] = port
             data['basic'] = True
 
-        if pargs.php72 or pargs.php73 or pargs.php74:
+        if any(getattr(pargs, v, False) for v in WOVar.wo_php_versions):
             data = dict(
                 site_name=wo_domain, www_domain=wo_www_domain,
                 static=False, basic=False,
@@ -213,35 +211,29 @@ class WOSiteCloneController(CementBaseController):
         else:
             pass
 
-        data['php73'] = False
-        data['php74'] = False
-        data['php72'] = False
+        # Initialize all PHP versions to False
+        for version in WOVar.wo_php_versions:
+            data[version] = False
 
-        if data and pargs.php73:
-            data['php73'] = True
-            data['wo_php'] = 'php73'
-        elif data and pargs.php74:
-            data['php74'] = True
-            data['wo_php'] = 'php74'
-        elif data and pargs.php72:
-            data['php72'] = True
-            data['wo_php'] = 'php72'
+        php_version = '8.4'
+
+        # Check for PHP versions in pargs
+        for pargs_version, version in WOVar.wo_php_versions.items():
+            if data and getattr(pargs, pargs_version, False):
+                data[pargs_version] = True
+                data['wo_php'] = pargs_version
+                php_version = version
+                break
         else:
             if self.app.config.has_section('php'):
-                config_php_ver = self.app.config.get(
-                    'php', 'version')
-                if config_php_ver == '7.2':
-                    data['php72'] = True
-                    data['wo_php'] = 'php72'
-                elif config_php_ver == '7.3':
-                    data['php73'] = True
-                    data['wo_php'] = 'php73'
-                elif config_php_ver == '7.4':
-                    data['php74'] = True
-                    data['wo_php'] = 'php74'
-            else:
-                data['php73'] = True
-                data['wo_php'] = 'php73'
+                config_php_ver = self.app.config.get('php', 'version')
+
+                for wo_key, php_ver in WOVar.wo_php_versions.items():
+                    if php_ver == config_php_ver:
+                        data[wo_key] = True
+                        data['wo_php'] = wo_key
+                        php_version = php_ver
+                        break
 
         if ((not pargs.wpfc) and (not pargs.wpsc) and
             (not pargs.wprocket) and
@@ -303,13 +295,6 @@ class WOSiteCloneController(CementBaseController):
                 Log.info(self, "Successfully created site"
                          " http://{0}".format(wo_domain))
                 return
-
-            if data['php72']:
-                php_version = "7.2"
-            elif data['php74']:
-                php_version = "7.4"
-            else:
-                php_version = "7.3"
 
             addNewSite(self, wo_domain, stype, cache, wo_site_webroot,
                        php_version=php_version)

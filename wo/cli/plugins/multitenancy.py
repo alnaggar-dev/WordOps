@@ -145,7 +145,7 @@ class WOMultitenancyController(CementBaseController):
             
             # Download WordPress core
             Log.info(self, "Downloading WordPress core...")
-            release_name = infra.download_wordpress_core()
+            release_name = infra.download_wordpress_core(config.get('wp_version'))
             
             # Seed plugins and themes
             Log.info(self, "Seeding plugins and themes...")
@@ -496,7 +496,7 @@ class WOMultitenancyController(CementBaseController):
         try:
             # Create new release
             Log.info(self, "Creating new WordPress release...")
-            new_release = infra.download_wordpress_core()
+            new_release = infra.download_wordpress_core(config.get('wp_version'))
             
             # Update plugins and themes
             Log.info(self, "Updating plugins and themes...")

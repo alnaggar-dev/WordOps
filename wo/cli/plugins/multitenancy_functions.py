@@ -34,7 +34,8 @@ class MTFunctions:
         defaults = {
             'shared_root': '/var/www/shared',
             'keep_releases': '3',
-            'php_version': '8.3',
+            'php_version': '8.4',
+            'wp_version': 'latest',
             'admin_email': 'admin@example.com',
             'baseline_plugins': 'nginx-helper,redis-cache',
             'baseline_theme': 'twentytwentyfour',
@@ -139,7 +140,7 @@ class MTFunctions:
         else:
             # Get default from config or WordOps default
             config = MTFunctions.load_config(app)
-            return config.get('php_version', '8.3')
+            return config.get('php_version', '8.4')
     
     @staticmethod
     def get_cache_type(app, pargs):
@@ -217,7 +218,7 @@ class MTFunctions:
                 Log.debug(app, f"Created sites-enabled directory: {sites_enabled}")
 
             # Check if PHP-FPM socket exists (using WordOps naming convention)
-            php_version = "8.3"  # Default, will be overridden by actual version
+            php_version = "8.4"  # Default, will be overridden by actual version
             php_clean = php_version.replace('.', '')
             php_socket = f"/var/run/php/php{php_clean}-fpm.sock"
             if not os.path.exists(php_socket):
@@ -1164,12 +1165,13 @@ class SharedInfrastructure:
             os.makedirs(directory, exist_ok=True)
             Log.debug(self.app, f"Created directory: {directory}")
     
-    def download_wordpress_core(self):
+    def download_wordpress_core(self, wp_version=None):
         """Download WordPress core"""
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         release_name = f"wp-{timestamp}"
         release_path = f"{self.releases_dir}/{release_name}"
         
+        version_arg = (wp_version or '').strip()
         # Download WordPress using WP-CLI
         cmd = [
             'wp', 'core', 'download',
@@ -1177,9 +1179,14 @@ class SharedInfrastructure:
             '--skip-content',  # Don't download default themes/plugins
             '--allow-root'
         ]
+        if version_arg and version_arg.lower() != 'latest':
+            cmd.append(f'--version={version_arg}')
         
         try:
-            Log.debug(self.app, f"Downloading WordPress to {release_path}")
+            if version_arg and version_arg.lower() != 'latest':
+                Log.debug(self.app, f"Downloading WordPress {version_arg} to {release_path}")
+            else:
+                Log.debug(self.app, f"Downloading WordPress to {release_path}")
             subprocess.run(cmd, check=True, capture_output=True)
             
             # Remove wp-content and create symlink to shared
@@ -2742,7 +2749,7 @@ def reload_services_after_config_change(app, shared_root):
         bool: True if nginx (and PHP-FPM) reloaded; False if nginx failed
 
     Process:
-        1. Detect all installed PHP versions (7.4, 8.0, 8.1, 8.2, 8.3)
+        1. Detect all installed PHP versions (7.4, 8.0, 8.1, 8.2, 8.3, 8.4, 8.5)
         2. Reload PHP-FPM for each version (continue on failure)
         3. Reload Nginx (critical - failure returns False)
 
@@ -2756,7 +2763,7 @@ def reload_services_after_config_change(app, shared_root):
 
     # Detect all installed PHP versions by checking for config files
     php_versions = []
-    for version in ['7.4', '8.0', '8.1', '8.2', '8.3']:
+    for version in ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']:
         config_path = f'/etc/php/{version}/fpm/php-fpm.conf'
         if os.path.exists(config_path):
             php_versions.append(version)
