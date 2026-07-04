@@ -978,7 +978,7 @@ server {{
         # Clear nginx cache
         if cache_type in ['wpfc', 'wpredis']:
             try:
-                WOShellExec.cmd_exec(app, f"wo clean --fastcgi {domain}")
+                WOShellExec.cmd_exec(app, "wo clean --fastcgi")
             except:
                 pass
 
@@ -1233,16 +1233,23 @@ die($error_msg);
         Log.debug(self.app, f"Created router wp-config.php in {release_path}")
     
     def seed_plugins_and_themes(self, config):
-        """Download initial plugins and themes"""
-        
+        """Download initial plugins and themes.
+
+        Returns a list of human-readable identifiers for items that failed to
+        download, so callers can surface them. An empty list means everything
+        succeeded (or there was nothing to seed).
+        """
+        failures = []
+
         # Download baseline plugins from WordPress.org
         plugins = config.get('baseline_plugins', ['nginx-helper', 'redis-cache'])
         if isinstance(plugins, str):
             plugins = [p.strip() for p in plugins.split(',')]
-        
+
         for plugin in plugins:
-            self.download_plugin(plugin)
-        
+            if not self.download_plugin(plugin):
+                failures.append(f"plugin '{plugin}' (WordPress.org)")
+
         # Download GitHub plugins
         github_plugins = config.get('github_plugins', {})
         if github_plugins:
@@ -1254,19 +1261,22 @@ die($error_msg);
                         github_repo = parts[0]
                         ref_type = parts[1]  # 'branch' or 'tag'
                         ref_name = parts[2] if len(parts) > 2 else None
-                        
+
                         if ref_type == 'branch' and ref_name:
-                            self.download_plugin_from_github(github_repo, plugin_slug, branch=ref_name)
+                            ok = self.download_plugin_from_github(github_repo, plugin_slug, branch=ref_name)
                         elif ref_type == 'tag' and ref_name:
-                            self.download_plugin_from_github(github_repo, plugin_slug, tag=ref_name)
+                            ok = self.download_plugin_from_github(github_repo, plugin_slug, tag=ref_name)
                         else:
-                            self.download_plugin_from_github(github_repo, plugin_slug)
-        
+                            ok = self.download_plugin_from_github(github_repo, plugin_slug)
+                        if not ok:
+                            failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
+
         # Download baseline theme from WordPress.org
         theme = config.get('baseline_theme', 'twentytwentyfour')
         if theme:
-            self.download_theme(theme)
-        
+            if not self.download_theme(theme):
+                failures.append(f"theme '{theme}' (WordPress.org)")
+
         # Download GitHub themes
         github_themes = config.get('github_themes', {})
         if github_themes:
@@ -1278,115 +1288,182 @@ die($error_msg);
                         github_repo = parts[0]
                         ref_type = parts[1]  # 'branch' or 'tag'
                         ref_name = parts[2] if len(parts) > 2 else None
-                        
+
                         if ref_type == 'branch' and ref_name:
-                            self.download_theme_from_github(github_repo, theme_slug, branch=ref_name)
+                            ok = self.download_theme_from_github(github_repo, theme_slug, branch=ref_name)
                         elif ref_type == 'tag' and ref_name:
-                            self.download_theme_from_github(github_repo, theme_slug, tag=ref_name)
+                            ok = self.download_theme_from_github(github_repo, theme_slug, tag=ref_name)
                         else:
-                            self.download_theme_from_github(github_repo, theme_slug)
-        
+                            ok = self.download_theme_from_github(github_repo, theme_slug)
+                        if not ok:
+                            failures.append(f"theme '{theme_slug}' (GitHub {github_repo})")
+
         # Download URL plugins
         url_plugins = config.get('url_plugins', {})
         if url_plugins:
             for plugin_slug, url in url_plugins.items():
                 if isinstance(url, str):
-                    self.download_plugin_from_url(url, plugin_slug)
-        
+                    if not self.download_plugin_from_url(url, plugin_slug):
+                        failures.append(f"plugin '{plugin_slug}' (URL)")
+
         # Download URL themes
         url_themes = config.get('url_themes', {})
         if url_themes:
             for theme_slug, url in url_themes.items():
                 if isinstance(url, str):
-                    self.download_theme_from_url(url, theme_slug)
+                    if not self.download_theme_from_url(url, theme_slug):
+                        failures.append(f"theme '{theme_slug}' (URL)")
+
+        return failures
     
     def download_plugin(self, plugin_slug):
-        """Download a plugin from WordPress.org"""
+        """Download a plugin from WordPress.org.
+
+        Returns True on success or if the plugin is already present, False if
+        the download or extraction failed.
+        """
         plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
 
-        if not os.path.exists(plugin_dir):
-            try:
-                # Create temp directory for plugin download
-                temp_dir = f"/tmp/wo_plugin_{plugin_slug}"
-                os.makedirs(temp_dir, exist_ok=True)
+        if os.path.exists(plugin_dir):
+            return True
 
-                # Download plugin zip from wordpress.org
-                plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.latest-stable.zip"
-                zip_file = f"{temp_dir}/{plugin_slug}.zip"
+        success = False
+        try:
+            # Create temp directory for plugin download
+            temp_dir = f"/tmp/wo_plugin_{plugin_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
 
-                # Download using curl
-                download_cmd = ['curl', '-L', '-o', zip_file, plugin_url]
-                result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
+            # Download plugin zip from wordpress.org
+            plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.latest-stable.zip"
+            zip_file = f"{temp_dir}/{plugin_slug}.zip"
 
-                if result.returncode == 0 and os.path.exists(zip_file):
-                    # Extract the plugin
-                    unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-                    subprocess.run(unzip_cmd, capture_output=True, check=False)
+            # Download using curl
+            download_cmd = ['curl', '-L', '-o', zip_file, plugin_url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
 
-                    # Move to shared plugins directory
-                    extracted_plugin = f"{temp_dir}/{plugin_slug}"
-                    if os.path.exists(extracted_plugin):
-                        shutil.move(extracted_plugin, plugin_dir)
-                        Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
-                    else:
-                        Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
+            if result.returncode == 0 and os.path.exists(zip_file):
+                # Extract the plugin
+                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                subprocess.run(unzip_cmd, capture_output=True, check=False)
+
+                # Move to shared plugins directory
+                extracted_plugin = f"{temp_dir}/{plugin_slug}"
+                if os.path.exists(extracted_plugin):
+                    shutil.move(extracted_plugin, plugin_dir)
+                    Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
+                    success = True
                 else:
-                    Log.debug(self.app, f"Plugin download failed for: {plugin_slug}")
+                    Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
+            else:
+                Log.debug(self.app, f"Plugin download failed for: {plugin_slug}")
 
-                # Cleanup temp directory
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
+            # Cleanup temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
-            except Exception as e:
-                Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
+        except Exception as e:
+            Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
+
+        return success
     
     def download_theme(self, theme_slug):
-        """Download a theme from WordPress.org"""
+        """Download a theme from WordPress.org.
+
+        Returns True on success or if the theme is already present, False if the
+        download or extraction failed.
+        """
         theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
-        if not os.path.exists(theme_dir):
-            try:
-                Log.debug(self.app, f"Downloading theme: {theme_slug}")
+        if os.path.exists(theme_dir):
+            return True
 
-                # Create temp directory for theme download
-                temp_dir = f"/tmp/wo_theme_{theme_slug}"
-                os.makedirs(temp_dir, exist_ok=True)
+        success = False
+        try:
+            Log.debug(self.app, f"Downloading theme: {theme_slug}")
 
-                # Download theme zip from wordpress.org
-                theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
-                zip_file = f"{temp_dir}/{theme_slug}.zip"
+            # Create temp directory for theme download
+            temp_dir = f"/tmp/wo_theme_{theme_slug}"
+            os.makedirs(temp_dir, exist_ok=True)
 
-                # Download using curl
-                download_cmd = ['curl', '-L', '-o', zip_file, theme_url]
-                result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
+            # Download theme zip from wordpress.org
+            theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
+            zip_file = f"{temp_dir}/{theme_slug}.zip"
 
-                if result.returncode == 0 and os.path.exists(zip_file):
-                    # Extract the theme
-                    unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-                    subprocess.run(unzip_cmd, capture_output=True, check=False)
+            # Download using curl
+            download_cmd = ['curl', '-L', '-o', zip_file, theme_url]
+            result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
 
-                    # Move to shared themes directory
-                    extracted_theme = f"{temp_dir}/{theme_slug}"
-                    if os.path.exists(extracted_theme):
-                        shutil.move(extracted_theme, theme_dir)
-                        Log.debug(self.app, f"Downloaded theme: {theme_slug}")
-                    else:
-                        Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
+            if result.returncode == 0 and os.path.exists(zip_file):
+                # Extract the theme
+                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                subprocess.run(unzip_cmd, capture_output=True, check=False)
+
+                # Move to shared themes directory
+                extracted_theme = f"{temp_dir}/{theme_slug}"
+                if os.path.exists(extracted_theme):
+                    shutil.move(extracted_theme, theme_dir)
+                    Log.debug(self.app, f"Downloaded theme: {theme_slug}")
+                    success = True
                 else:
-                    Log.debug(self.app, f"Theme download failed for: {theme_slug}")
+                    Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
+            else:
+                Log.debug(self.app, f"Theme download failed for: {theme_slug}")
 
-                # Cleanup temp directory
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
+            # Cleanup temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
-            except Exception as e:
-                Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
+        except Exception as e:
+            Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
+
+        return success
 
 
     # ==========================================
     # PHASE 3: GitHub Download Support
     # ==========================================
     
+    def _get_github_token(self):
+        """Resolve a token for authenticated GitHub downloads (private repos).
+
+        Order: GH_TOKEN / GITHUB_TOKEN environment variables, then the GitHub
+        CLI ('gh auth token'). Returns None when no token is available, in
+        which case downloads stay unauthenticated (public repos only). Cached
+        for the lifetime of this instance.
+        """
+        if hasattr(self, '_github_token'):
+            return self._github_token
+        token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+        if not token:
+            try:
+                proc = subprocess.run(
+                    ['gh', 'auth', 'token'],
+                    capture_output=True, text=True, timeout=10)
+                if proc.returncode == 0:
+                    token = proc.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        self._github_token = token or None
+        return self._github_token
+
+    def _github_curl(self, url, zip_file):
+        """Download `url` to `zip_file` with curl, authenticating with a GitHub
+        token when one is available.
+
+        '--fail' (-f) makes curl return non-zero on an HTTP error instead of
+        writing the error page into the zip (which would only fail later at
+        unzip). The Authorization header is passed via curl's stdin config
+        ('-K -') so the token never appears in the process argument list.
+        """
+        cmd = ['curl', '-fL', '-o', zip_file, url]
+        token = self._get_github_token()
+        curl_input = None
+        if token:
+            cmd += ['-K', '-']
+            curl_input = f'header = "Authorization: Bearer {token}"\n'
+        return subprocess.run(
+            cmd, capture_output=True, text=True, input=curl_input)
+
     def download_plugin_from_github(self, github_repo, plugin_slug, branch=None, tag=None):
         """
         Download a plugin from a GitHub repository
@@ -1437,16 +1514,14 @@ die($error_msg);
             os.makedirs(temp_dir, exist_ok=True)
             zip_file = f"{temp_dir}/{plugin_slug}.zip"
             
-            # Download the zip file using curl with follow redirects (-L)
-            download_cmd = ['curl', '-L', '-o', zip_file, url]
-            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            # Download the zip (authenticated when a GitHub token is available)
+            result = self._github_curl(url, zip_file)
             
             # If download failed and we were trying 'main', fallback to 'master'
             if result.returncode != 0 and not branch and not tag:
                 Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
                 url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
-                download_cmd = ['curl', '-L', '-o', zip_file, url]
-                result = subprocess.run(download_cmd, capture_output=True, text=True)
+                result = self._github_curl(url, zip_file)
             
             # Verify download was successful
             if result.returncode != 0 or not os.path.exists(zip_file):
@@ -1654,15 +1729,13 @@ die($error_msg);
             zip_file = f"{temp_dir}/{theme_slug}.zip"
             
             # Download
-            download_cmd = ['curl', '-L', '-o', zip_file, url]
-            result = subprocess.run(download_cmd, capture_output=True, text=True)
+            result = self._github_curl(url, zip_file)
             
             # Fallback to master if main failed
             if result.returncode != 0 and not branch and not tag:
                 Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
                 url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
-                download_cmd = ['curl', '-L', '-o', zip_file, url]
-                result = subprocess.run(download_cmd, capture_output=True, text=True)
+                result = self._github_curl(url, zip_file)
             
             # Verify download
             if result.returncode != 0 or not os.path.exists(zip_file):

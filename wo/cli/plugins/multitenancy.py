@@ -149,7 +149,7 @@ class WOMultitenancyController(CementBaseController):
             
             # Seed plugins and themes
             Log.info(self, "Seeding plugins and themes...")
-            infra.seed_plugins_and_themes(config)
+            seed_failures = infra.seed_plugins_and_themes(config)
             
             # Create baseline configuration
             Log.info(self, "Creating baseline configuration...")
@@ -195,7 +195,13 @@ class WOMultitenancyController(CementBaseController):
                 'baseline_version': 1
             })
             
-            Log.info(self, "✅ Multi-tenancy infrastructure initialized successfully!")
+            if seed_failures:
+                Log.warn(self, "⚠️  Multi-tenancy initialized, but some assets failed to download:")
+                for item in seed_failures:
+                    Log.warn(self, f"     - {item}")
+                Log.warn(self, "   Fix access (make private repos reachable or export GH_TOKEN) then re-run: wo multitenancy init --force")
+            else:
+                Log.info(self, "✅ Multi-tenancy infrastructure initialized successfully!")
             Log.info(self, f"   Shared root: {shared_root}")
             Log.info(self, f"   Current release: {release_name}")
             
@@ -420,9 +426,6 @@ class WOMultitenancyController(CementBaseController):
                     pass
             MTDatabase.update_site_baseline(self, wo_domain, current_version)
 
-            # Clear cache
-            MTFunctions.clear_cache(self, wo_domain, cache_type)
-            
             # Git commit
             WOGit.add(self, ["/etc/nginx"], 
                      msg=f"Created shared WordPress site: {wo_domain}")
