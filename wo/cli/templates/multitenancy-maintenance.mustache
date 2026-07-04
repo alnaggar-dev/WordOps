@@ -2,11 +2,6 @@
 # Generated {{generated_at}}
 # Dropped into /var/www/{{domain}}/conf/nginx/ ; loaded by the main vhost.
 set $wo_mt_maintenance 1;
-{{#has_admin_ips}}
-if ($remote_addr ~ "^({{admin_ips_regex}})$") {
-    set $wo_mt_maintenance 0;
-}
-{{/has_admin_ips}}
 
 if ($wo_mt_maintenance = 1) {
     return 503;

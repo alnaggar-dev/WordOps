@@ -277,7 +277,6 @@ def _check_single_site(site):
                 'url': url,
                 'http_status': status_code,
                 'duration_ms': int((time.monotonic() - start) * 1000),
-                'quarantined': bool(site.get('is_quarantined')),
                 'enabled': bool(site.get('is_enabled')),
             }
     except urllib.error.HTTPError as exc:
@@ -289,7 +288,6 @@ def _check_single_site(site):
             'url': url,
             'http_status': status_code,
             'duration_ms': int((time.monotonic() - start) * 1000),
-            'quarantined': bool(site.get('is_quarantined')),
             'enabled': bool(site.get('is_enabled')),
         }
     except (urllib.error.URLError, socket.timeout) as exc:
@@ -298,7 +296,6 @@ def _check_single_site(site):
             'url': url,
             'error': str(exc),
             'duration_ms': int((time.monotonic() - start) * 1000),
-            'quarantined': bool(site.get('is_quarantined')),
             'enabled': bool(site.get('is_enabled')),
         }
     except Exception as exc:
@@ -307,7 +304,6 @@ def _check_single_site(site):
             'url': url,
             'error': str(exc),
             'duration_ms': int((time.monotonic() - start) * 1000),
-            'quarantined': bool(site.get('is_quarantined')),
             'enabled': bool(site.get('is_enabled')),
         }
 

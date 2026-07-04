@@ -4,11 +4,10 @@ Handles database operations for multi-tenancy infrastructure.
 
 import os
 import json
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from wo.core.logging import Log
 from wo.core.database import db_session, Base
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, Index
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text
 
 
 class MultitenancyConfig(Base):
@@ -47,48 +46,10 @@ class MultitenancySite(Base):
     baseline_version = Column(Integer, default=0)
     is_enabled = Column(Boolean, default=True)
     is_ssl = Column(Boolean, default=False)
-    is_staging = Column(Boolean, default=False)
-    is_quarantined = Column(Boolean, default=False)
-    quarantine_reason = Column(Text)
-    quarantine_date = Column(DateTime)
     # Phase 1: Redis Object Cache prefix (unique per site for cache isolation)
     redis_prefix = Column(Text)
-    # DevOps improvements: comma-separated tags for selective operations
-    tags = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
-
-class MultitenancyAudit(Base):
-    """Privileged-operation audit log with SHA-256 tamper detection.
-
-    Indexes are declared via `__table_args__` so SQLAlchemy's `create_all`
-    installs them on fresh installs. On existing installs the explicit
-    ALTER-path migration below also runs `CREATE INDEX IF NOT EXISTS` so the
-    audit table ends up with the same four indexes regardless of whether it
-    was created by ORM metadata or by the ALTER path.
-    """
-    __tablename__ = 'multitenancy_audit'
-
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.now, nullable=False)
-    event_id = Column(String(36))           # correlation UUID shared with structured log
-    actor = Column(String(255))             # username or "system"
-    actor_ip = Column(String(45))           # SSH_CLIENT address or "local"
-    action = Column(String(100), nullable=False)   # e.g. site_created
-    target = Column(String(255))            # e.g. example.com or "baseline"
-    target_type = Column(String(50))        # site | baseline | config | maintenance
-    result = Column(String(50))             # success | failure | error
-    duration_ms = Column(Integer, default=0)
-    details = Column(Text)                  # JSON extra data
-    checksum = Column(String(64))           # SHA-256 of canonicalized record
-
-    __table_args__ = (
-        Index('idx_audit_timestamp', 'timestamp'),
-        Index('idx_audit_actor', 'actor'),
-        Index('idx_audit_action', 'action'),
-        Index('idx_audit_target', 'target'),
-    )
 
 
 class MTDatabase:
@@ -110,115 +71,34 @@ class MTDatabase:
                 inspector = inspect(db_session.bind)
                 existing_columns = [col['name'] for col in inspector.get_columns('multitenancy_sites')]
                 
-                migration_needed = False
-                
-                if 'is_staging' not in existing_columns:
-                    migration_needed = True
-                    Log.info(app, "Running Phase 2 database migration...")
-                    
-                    # Add columns one by one with proper error handling
-                    try:
-                        db_session.execute(text("""
-                            ALTER TABLE multitenancy_sites 
-                            ADD COLUMN is_staging BOOLEAN DEFAULT 0
-                        """))
-                        Log.debug(app, "Added is_staging column")
-                    except Exception:
-                        pass  # Column might already exist
-                    
-                    try:
-                        db_session.execute(text("""
-                            ALTER TABLE multitenancy_sites 
-                            ADD COLUMN is_quarantined BOOLEAN DEFAULT 0
-                        """))
-                        Log.debug(app, "Added is_quarantined column")
-                    except Exception:
-                        pass
-                    
-                    try:
-                        db_session.execute(text("""
-                            ALTER TABLE multitenancy_sites 
-                            ADD COLUMN quarantine_reason TEXT
-                        """))
-                        Log.debug(app, "Added quarantine_reason column")
-                    except Exception:
-                        pass
-                    
-                    try:
-                        db_session.execute(text("""
-                            ALTER TABLE multitenancy_sites 
-                            ADD COLUMN quarantine_date DATETIME
-                        """))
-                        Log.debug(app, "Added quarantine_date column")
-                    except Exception:
-                        pass
-                    
-                    # Phase 1: Add redis_prefix column for Redis Object Cache isolation
-                    try:
-                        db_session.execute(text("""
-                            ALTER TABLE multitenancy_sites 
-                            ADD COLUMN redis_prefix TEXT
-                        """))
-                        Log.debug(app, "Added redis_prefix column")
-                    except Exception:
-                        pass  # Column might already exist
-                    
-                    # Phase 1: Create unique index on redis_prefix for collision prevention
-                    # This ensures no two sites can have the same Redis prefix
-                    try:
-                        db_session.execute(text('''
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_redis_prefix_unique 
-                            ON multitenancy_sites(redis_prefix) 
-                            WHERE redis_prefix IS NOT NULL
-                        '''))
-                        Log.debug(app, "Created unique index on redis_prefix")
-                    except Exception:
-                        pass  # Index might already exist
-                    
-                    # Phase 1: Create regular index for faster lookups
-                    try:
-                        db_session.execute(text('''
-                            CREATE INDEX IF NOT EXISTS idx_redis_prefix
-                            ON multitenancy_sites(redis_prefix)
-                        '''))
-                        Log.debug(app, "Created index on redis_prefix")
-                    except Exception:
-                        pass  # Index might already exist
-
-                    db_session.commit()
-                    Log.info(app, "✅ Phase 2 database migration completed")
-                    Log.info(app, "   Added: is_staging, is_quarantined, quarantine_reason, quarantine_date")
-
-                # DevOps improvements: tags column on multitenancy_sites
-                if 'tags' not in existing_columns:
+                if 'redis_prefix' not in existing_columns:
+                    Log.info(app, "Adding redis_prefix column...")
                     try:
                         db_session.execute(text("""
                             ALTER TABLE multitenancy_sites
-                            ADD COLUMN tags TEXT
+                            ADD COLUMN redis_prefix TEXT
                         """))
                         db_session.commit()
-                        Log.debug(app, "Added tags column to multitenancy_sites")
+                        Log.debug(app, "Added redis_prefix column")
                     except Exception:
-                        pass
+                        pass  # Column might already exist
 
-                # DevOps improvements: multitenancy_audit table + indexes.
-                # `Base.metadata.create_all` above will have created the table
-                # for fresh installs (with indexes from __table_args__).
-                # For *existing* installs where the table was created before
-                # indexes were declared, we still need to backfill them —
-                # CREATE INDEX IF NOT EXISTS is cheap and idempotent, so just
-                # always run it.
+                # Ensure redis_prefix indexes exist (idempotent — covers fresh
+                # installs where create_all() makes the column but not the index).
                 try:
-                    for idx_sql in (
-                        "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON multitenancy_audit(timestamp)",
-                        "CREATE INDEX IF NOT EXISTS idx_audit_actor ON multitenancy_audit(actor)",
-                        "CREATE INDEX IF NOT EXISTS idx_audit_action ON multitenancy_audit(action)",
-                        "CREATE INDEX IF NOT EXISTS idx_audit_target ON multitenancy_audit(target)",
-                    ):
-                        db_session.execute(text(idx_sql))
+                    db_session.execute(text('''
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_redis_prefix_unique
+                        ON multitenancy_sites(redis_prefix)
+                        WHERE redis_prefix IS NOT NULL
+                    '''))
+                    db_session.execute(text('''
+                        CREATE INDEX IF NOT EXISTS idx_redis_prefix
+                        ON multitenancy_sites(redis_prefix)
+                    '''))
                     db_session.commit()
+                    Log.debug(app, "Ensured redis_prefix indexes")
                 except Exception:
-                    pass
+                    pass  # Indexes might already exist
 
             except Exception as migration_error:
                 Log.debug(app, f"Migration check/execution: {migration_error}")
@@ -423,7 +303,6 @@ class MTDatabase:
                     shared_release=site_data.get('shared_release'),
                     is_ssl=site_data.get('is_ssl', False),
                     redis_prefix=site_data.get('redis_prefix'),  # Phase 2: Store Redis prefix
-                    tags=site_data.get('tags')
                 )
                 session.add(site)
             
@@ -452,10 +331,7 @@ class MTDatabase:
                     'baseline_version': site.baseline_version,
                     'is_enabled': site.is_enabled,
                     'is_ssl': site.is_ssl,
-                    'is_staging': getattr(site, 'is_staging', False),
-                    'is_quarantined': getattr(site, 'is_quarantined', False),
                     'redis_prefix': getattr(site, 'redis_prefix', None),
-                    'tags': [t for t in (getattr(site, 'tags', '') or '').split(',') if t],
                     'created_at': site.created_at,
                     'updated_at': site.updated_at
                 })
@@ -582,136 +458,6 @@ class MTDatabase:
             Log.debug(app, f"Failed to get stats: {e}")
             return {}
 
-    @staticmethod
-    def migrate_schema(app):
-        """Migrate database schema to add new columns if they don't exist"""
-        try:
-            from sqlalchemy import inspect
-            session = db_session
-            inspector = inspect(session.bind)
-            
-            # Get current columns
-            columns = [col['name'] for col in inspector.get_columns('multitenancy_sites')]
-            
-            # Check which columns need to be added
-            new_columns = []
-            if 'is_staging' not in columns:
-                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN is_staging BOOLEAN DEFAULT 0")
-            if 'is_quarantined' not in columns:
-                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN is_quarantined BOOLEAN DEFAULT 0")
-            if 'quarantine_reason' not in columns:
-                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN quarantine_reason TEXT")
-            if 'quarantine_date' not in columns:
-                new_columns.append("ALTER TABLE multitenancy_sites ADD COLUMN quarantine_date DATETIME")
-            
-            # Execute migrations
-            if new_columns:
-                for sql in new_columns:
-                    session.execute(sql)
-                session.commit()
-                Log.debug(app, f"Migrated database: added {len(new_columns)} new columns")
-                return True
-            else:
-                Log.debug(app, "Database schema is up to date")
-                return False
-                
-        except Exception as e:
-            Log.debug(app, f"Schema migration error: {e}")
-            return False
-    
-    @staticmethod
-    def get_staging_site(app):
-        """Get the staging site"""
-        try:
-            session = db_session
-            site = session.query(MultitenancySite).filter_by(
-                is_staging=True,
-                is_enabled=True
-            ).first()
-            
-            if site:
-                return {
-                    'id': site.id,
-                    'domain': site.domain,
-                    'site_type': site.site_type,
-                    'cache_type': site.cache_type,
-                    'site_path': site.site_path,
-                    'php_version': site.php_version,
-                    'shared_release': site.shared_release,
-                    'baseline_version': site.baseline_version,
-                    'is_enabled': site.is_enabled,
-                    'is_ssl': site.is_ssl,
-                    'is_staging': site.is_staging,
-                    'is_quarantined': site.is_quarantined
-                }
-            return None
-            
-        except Exception as e:
-            Log.debug(app, f"Error getting staging site: {e}")
-            return None
-    
-    @staticmethod
-    def mark_site_quarantined(app, domain, reason):
-        """Mark a site as quarantined"""
-        try:
-            session = db_session
-            site = session.query(MultitenancySite).filter_by(domain=domain).first()
-            
-            if site:
-                site.is_quarantined = True
-                site.quarantine_reason = reason
-                site.quarantine_date = datetime.now()
-                site.updated_at = datetime.now()
-                session.commit()
-                Log.debug(app, f"Quarantined site: {domain}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            Log.debug(app, f"Error quarantining site: {e}")
-            return False
-    
-    @staticmethod
-    def unquarantine_site(app, domain):
-        """Remove quarantine status from a site"""
-        try:
-            session = db_session
-            site = session.query(MultitenancySite).filter_by(domain=domain).first()
-            
-            if site:
-                site.is_quarantined = False
-                site.quarantine_reason = None
-                site.quarantine_date = None
-                site.updated_at = datetime.now()
-                session.commit()
-                Log.debug(app, f"Unquarantined site: {domain}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            Log.debug(app, f"Error unquarantining site: {e}")
-            return False
-    
-    @staticmethod
-    def get_quarantined_sites(app):
-        """Get all quarantined sites"""
-        try:
-            session = db_session
-            sites = session.query(MultitenancySite).filter_by(
-                is_quarantined=True
-            ).order_by(MultitenancySite.quarantine_date.desc()).all()
-            
-            return [{
-                'domain': site.domain,
-                'quarantine_reason': site.quarantine_reason,
-                'quarantine_date': site.quarantine_date.isoformat() if site.quarantine_date else None
-            } for site in sites]
-            
-        except Exception as e:
-            Log.debug(app, f"Error getting quarantined sites: {e}")
-            return []
 
     # ========================================================================
     # PHASE 1: REDIS PREFIX MANAGEMENT
@@ -928,136 +674,3 @@ class MTDatabase:
             Log.debug(app, f"Error retrieving Redis prefixes: {e}")
             return {}
 
-    # ------------------------------------------------------------------
-    # DevOps improvements: tag helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def update_site_tags(app, domain, tags):
-        """Set the tag list for a site. `tags` is an iterable of strings."""
-        try:
-            session = db_session
-            site = session.query(MultitenancySite).filter_by(domain=domain).first()
-            if not site:
-                return False
-            site.tags = ','.join(sorted({t.strip() for t in tags if t and t.strip()}))
-            site.updated_at = datetime.now()
-            session.commit()
-            return True
-        except Exception as e:
-            Log.debug(app, f"Failed to update tags for {domain}: {e}")
-            return False
-
-    @staticmethod
-    def get_sites_by_tags(app, tags):
-        """Return shared sites whose tag set intersects any supplied tag."""
-        try:
-            all_sites = MTDatabase.get_shared_sites(app)
-            wanted = {t.strip() for t in tags if t and t.strip()}
-            if not wanted:
-                return all_sites
-            return [
-                s for s in all_sites
-                if wanted.intersection(set(s.get('tags') or []))
-            ]
-        except Exception as e:
-            Log.debug(app, f"Failed to filter sites by tags: {e}")
-            return []
-
-    # ------------------------------------------------------------------
-    # DevOps improvements: audit helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def insert_audit_record(app, record):
-        """Insert one audit row. `record` is a dict of column values."""
-        try:
-            session = db_session
-            entry = MultitenancyAudit(
-                timestamp=record.get('timestamp') or datetime.now(),
-                event_id=record.get('event_id'),
-                actor=record.get('actor'),
-                actor_ip=record.get('actor_ip'),
-                action=record.get('action'),
-                target=record.get('target'),
-                target_type=record.get('target_type'),
-                result=record.get('result'),
-                duration_ms=int(record.get('duration_ms') or 0),
-                details=record.get('details'),
-                checksum=record.get('checksum'),
-            )
-            session.add(entry)
-            session.commit()
-            return entry.id
-        except Exception as e:
-            Log.debug(app, f"Failed to insert audit record: {e}")
-            try:
-                db_session.rollback()
-            except Exception:
-                pass
-            return None
-
-    @staticmethod
-    def query_audit(app, since=None, action=None, target=None, limit=500):
-        """Query audit entries with optional filters.
-
-        `since` is a datetime (entries with timestamp >= since are returned).
-        Returns a list of dicts ordered newest first.
-        """
-        try:
-            session = db_session
-            q = session.query(MultitenancyAudit)
-            if since is not None:
-                q = q.filter(MultitenancyAudit.timestamp >= since)
-            if action:
-                q = q.filter(MultitenancyAudit.action == action)
-            if target:
-                q = q.filter(MultitenancyAudit.target == target)
-            q = q.order_by(MultitenancyAudit.timestamp.desc()).limit(limit)
-            rows = []
-            for r in q.all():
-                rows.append({
-                    'id': r.id,
-                    'timestamp': r.timestamp,
-                    'event_id': r.event_id,
-                    'actor': r.actor,
-                    'actor_ip': r.actor_ip,
-                    'action': r.action,
-                    'target': r.target,
-                    'target_type': r.target_type,
-                    'result': r.result,
-                    'duration_ms': r.duration_ms,
-                    'details': r.details,
-                    'checksum': r.checksum,
-                })
-            return rows
-        except Exception as e:
-            Log.debug(app, f"Failed to query audit: {e}")
-            return []
-
-    @staticmethod
-    def prune_audit(app, retention_days, sample_rate=0.05, force=False):
-        """Opportunistically delete audit rows older than the retention window.
-
-        Runs on ~5% of writes by default so the hot path is fast; pass
-        force=True for an on-demand full prune.
-        """
-        try:
-            if not force and random.random() > sample_rate:
-                return 0
-            cutoff = datetime.now() - timedelta(days=int(retention_days))
-            session = db_session
-            deleted = session.query(MultitenancyAudit).filter(
-                MultitenancyAudit.timestamp < cutoff
-            ).delete(synchronize_session=False)
-            session.commit()
-            if deleted:
-                Log.debug(app, f"Pruned {deleted} audit rows older than {retention_days}d")
-            return deleted
-        except Exception as e:
-            Log.debug(app, f"Failed to prune audit: {e}")
-            try:
-                db_session.rollback()
-            except Exception:
-                pass
-            return 0

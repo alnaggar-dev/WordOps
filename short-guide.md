@@ -112,23 +112,9 @@ wo multitenancy baseline apply
 ## Shared Config Management
 
 ```bash
-# View config
-wo multitenancy shared-config --action show
-
-# Get value
-wo multitenancy shared-config --action get --key WP_DEBUG
-
-# Set value (preview)
-wo multitenancy shared-config --action set --key WP_DEBUG --value false --dry-run
-
-# Set value (apply)
-wo multitenancy shared-config --action set --key WP_DEBUG --value false
-
-# Rollback
-wo multitenancy shared-config --action rollback
-
-# History
-wo multitenancy shared-config --action history
+# Edit shared config (opens $EDITOR; on save runs php -l and reloads
+# services; a timestamped .bak is kept, broken edits auto-revert)
+wo multitenancy shared-config --action edit
 ```
 
 ---

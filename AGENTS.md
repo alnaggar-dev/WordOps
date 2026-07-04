@@ -35,7 +35,7 @@ Built on the **Cement 2.10.14** CLI framework (pinned; dependabot ignores cement
 | `wo/cli/plugins/` | One module per command area: `site*`, `stack*`, `debug`, `update`, `secure`, `log`, `clean`, `maintenance`, `sync`, `info`, `multitenancy*` |
 | `wo/core/` | ~27 flat service modules (`variables`, `logging`, `exc`, `shellexec`, `services`, `aptget`, `mysql`, `acme`, `fileutils`, `template`, `nginx`, `wpcli`, …) |
 | `wo/utils/` | `test.py` — Cement test harness (`WOTestCase`) |
-| `config/` | `wo.conf` (Cement app config), `plugins.d/*.conf` (per-plugin toggles), `logrotate.d/`, `bash_completion.d/` |
+| `config/` | `wo.conf` (Cement app config), `plugins.d/*.conf` (per-plugin toggles), `bash_completion.d/` |
 | `tests/cli/` | nose + unittest test modules (`tests/core/` is empty) |
 | `docs/` | `wo.8` man page |
 
@@ -89,7 +89,7 @@ tail -f /var/log/wo/wordops.log
 - **Site command**: `wo/cli/plugins/site.py`, `site_create.py`, `site_functions.py`, `sitedb.py`, `models.py`
 - **Multitenancy**: `wo/cli/plugins/multitenancy.py`, `multitenancy_functions.py`, `multitenancy_db.py`, `multitenancy_health.py`, `config/plugins.d/multitenancy.conf`
 - **Packaging/config**: `setup.py`, `setup.cfg`, `requirements.txt`, `config/wo.conf`
-- **AI context**: `AGENTS.md`; deep plugin reference `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md`; operator cheat sheet `short-guide.md`
+- **AI context**: `AGENTS.md`; plugin reference `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md`; operator cheat sheet `short-guide.md`
 
 ## Runtime/Tooling Preferences
 
@@ -101,15 +101,15 @@ tail -f /var/log/wo/wordops.log
 ## Testing & QA
 
 - **Frameworks**: nose + Cement `WOTestCase` (`wo/utils/test.py`) for CLI smoke tests; stdlib `unittest`(+`mock`) for multitenancy helpers. No pytest/tox/codecov in official config.
-- **Naming**: files `{order}_test_{area}.py`; CLI classes `CliTestCase{Area}`, methods `test_wo_cli_{command}_{variant}` (e.g. `tests/cli/18_test_site_create.py`); multitenancy classes `{Feature}Tests`, methods `test_{behavior}` (`tests/cli/40_test_multitenancy_devops.py`).
+- **Naming**: files `{order}_test_{area}.py`; CLI classes `CliTestCase{Area}`, methods `test_wo_cli_{command}_{variant}` (e.g. `tests/cli/18_test_site_create.py`); multitenancy classes `{Feature}Tests`, methods `test_{behavior}` (`tests/cli/40_test_multitenancy.py`).
 - **CLI test pattern**: `with WOTestApp(argv=['site', 'create', …]) as app: app.run()`.
 
 ```bash
 nosetests                                              # full suite + HTML coverage → coverage_report/
 python3 setup.py test                                 # nose.collector
-nosetests tests/cli/40_test_multitenancy_devops.py    # single module (nose)
-python3 -m unittest tests.cli.40_test_multitenancy_devops   # single module (stdlib, no live stack)
+nosetests tests/cli/40_test_multitenancy.py    # single module (nose)
+python3 -m unittest tests.cli.40_test_multitenancy   # single module (stdlib, no live stack)
 ```
 
 - **Coverage** via the nose plugin (`setup.cfg [nosetests]`, `cover-package=wo`); artifacts are gitignored.
-- **CI does not run the Python unit suite.** `.github/workflows/main.yml` runs the **integration smoke** `tests/travis.sh --actions` — a full `wo stack install` + `wo site create/update` matrix on a live server — on Ubuntu 22.04/24.04. Multitenancy unit tests (`40_test_multitenancy_devops.py`) are the only ones runnable without a live stack. `pypi.yml` (release) builds sdist/wheel and does not run tests.
+- **CI does not run the Python unit suite.** `.github/workflows/main.yml` runs the **integration smoke** `tests/travis.sh --actions` — a full `wo stack install` + `wo site create/update` matrix on a live server — on Ubuntu 22.04/24.04. Multitenancy unit tests (`40_test_multitenancy.py`) are the only ones runnable without a live stack. `pypi.yml` (release) builds sdist/wheel and does not run tests.
