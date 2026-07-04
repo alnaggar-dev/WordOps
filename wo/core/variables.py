@@ -70,8 +70,14 @@ class WOVar():
     wo_php_user = 'www-data'
 
     # WordOps git configuration management
-    config = configparser.ConfigParser()
-    config.read(os.path.expanduser("~") + '/.gitconfig')
+    config = configparser.ConfigParser(strict=False)
+    try:
+        config.read(os.path.expanduser("~") + '/.gitconfig')
+    except configparser.Error:
+        # A malformed ~/.gitconfig (e.g. the duplicate 'helper' keys written
+        # by `gh auth setup-git`) must never crash WordOps; fall back to the
+        # defaults handled in the except block below.
+        pass
     try:
         wo_user = config['user']['name']
         wo_email = config['user']['email']
