@@ -127,12 +127,22 @@ class SSL:
         certfile = open('/var/lib/wo/cert.csv', mode='r', encoding='utf-8')
         reader = csv.reader(certfile, 'acmeconf')
         wo_wildcard_domain = ("*.{0}".format(wo_domain_name))
+        # acme.sh --listraw layout differs across versions (a Profile
+        # column was added); locate the Created column via the header
+        created_index = 3
+        wildcard_exist = False
         for row in reader:
+            if not row:
+                continue
+            if row[0] == 'Main_Domain':
+                if 'Created' in row:
+                    created_index = row.index('Created')
+                continue
             if wo_wildcard_domain == row[2]:
-                if not row[3] == "":
-                    return True
+                if len(row) > created_index and row[created_index] != '':
+                    wildcard_exist = True
         certfile.close()
-        return False
+        return wildcard_exist
 
     def setuphsts(self, wo_domain_name, enable=True):
         """Enable or disable htsts for a site"""

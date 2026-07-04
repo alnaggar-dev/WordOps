@@ -208,11 +208,20 @@ class WOAcme:
         certfile = open('/var/lib/wo/cert.csv',
                         mode='r', encoding='utf-8')
         reader = csv.reader(certfile, 'acmeconf')
+        # acme.sh --listraw layout differs across versions (a Profile
+        # column was added); locate the Created column via the header
+        created_index = 3
         for row in reader:
+            if not row:
+                continue
+            if row[0] == 'Main_Domain':
+                if 'Created' in row:
+                    created_index = row.index('Created')
+                continue
             # check if domain exist
             if wo_domain_name == row[0]:
-                # check if cert expiration exist
-                if not row[3] == '':
+                # check if cert creation date exist
+                if len(row) > created_index and row[created_index] != '':
                     acme_cert = True
         certfile.close()
         if acme_cert is True:

@@ -255,6 +255,15 @@ class WOMultitenancyController(CementBaseController):
         # Determine cache type
         cache_type = MTFunctions.get_cache_type(self, pargs)
 
+        # Ensure required stack packages (nginx, PHP-FPM, MariaDB, WP-CLI,
+        # redis) are installed, exactly like `wo site create` does.
+        # site_package_check reads pargs flags the multitenancy parser
+        # doesn't define, so default them first.
+        for flag in ('php85', 'ngxblocker'):
+            if not hasattr(pargs, flag):
+                setattr(pargs, flag, False)
+        site_package_check(self, 'wp')
+
         Log.info(self, f"Creating shared WordPress site: {wo_domain}")
         Log.info(self, f"   PHP version: {php_version}")
         Log.info(self, f"   Cache type: {cache_type}")
@@ -864,6 +873,18 @@ class WOMultitenancyController(CementBaseController):
         
         Log.info(self, f"Deleting site: {domain}")
 
+        # Preserve the acme.sh certificate store across deletion so a
+        # future recreate reuses the certificate instead of burning a
+        # Let's Encrypt issuance (tenant domains get recreated often).
+        # Hiding the renewal dir makes WOAcme.cert_check() report no
+        # cert, so `wo site delete` skips its certificate purge.
+        cert_store = f'/etc/letsencrypt/renewal/{domain}_ecc'
+        cert_stash = f'{cert_store}.preserved'
+        preserve_cert = os.path.isdir(cert_store)
+        if preserve_cert:
+            Log.debug(self, f"Preserving SSL certificate store for {domain}")
+            os.rename(cert_store, cert_stash)
+
         # Delete the site using regular WO command
         try:
             import subprocess
@@ -885,6 +906,9 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"Error deleting site: {e}")
             Log.info(self, f"site_delete_failed target={domain} result=failure")
             return
+        finally:
+            if preserve_cert and os.path.isdir(cert_stash):
+                os.rename(cert_stash, cert_store)
 
         # Remove from multitenancy tracking
         try:

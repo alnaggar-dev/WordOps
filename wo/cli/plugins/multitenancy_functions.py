@@ -836,12 +836,22 @@ server {{
         from wo.core.acme import WOAcme
         from wo.core.sslutils import SSL
         from wo.cli.plugins.sitedb import updateSiteInfo
+        from wo.core.domainvalidate import WODomain
+        from wo.cli.plugins.site_functions import copyWildcardCert
 
         try:
             Log.debug(app, f"Starting SSL setup for {domain}")
 
-            # Prepare acme domains list
-            acme_domains = [domain, f'www.{domain}']
+            # Prepare acme domains list: subdomains get a single-domain
+            # certificate, apex domains also cover www
+            # (same logic as `wo site create --le`)
+            (domain_type, root_domain) = WODomain.getlevel(app, domain)
+            if domain_type == 'subdomain':
+                Log.debug(app, f"{domain} is a subdomain, "
+                          "issuing single-domain certificate")
+                acme_domains = [domain]
+            else:
+                acme_domains = [domain, f'www.{domain}']
 
             # Prepare acmedata dict as expected by setupletsencrypt
             acmedata = {
@@ -864,47 +874,74 @@ server {{
                     Log.debug(app, f"DNS API: {pargs.dns}")
                     acmedata['acme_dns'] = pargs.dns
 
-            # Configure Let's Encrypt SSL
-            if WOAcme.setupletsencrypt(app, acme_domains, acmedata):
-                Log.debug(app, f"Let's Encrypt certificates obtained for {domain}")
-
-                # Deploy certificate files and create ssl.conf with listen 443 directives
-                # Note: deploycert() returns 0 on success, not True
-                deploy_result = WOAcme.deploycert(app, domain)
-                if deploy_result == 0:
-                    Log.debug(app, f"SSL certificates deployed for {domain}")
-
-                    # Test nginx configuration before applying SSL changes
-                    if MTFunctions.validate_nginx_config(app):
-                        # Configure HTTPS redirect
-                        SSL.httpsredirect(app, domain, acme_domains, redirect=True)
-                        SSL.siteurlhttps(app, domain)
-
-                        # Enable HSTS if requested
-                        if hasattr(pargs, 'hsts') and pargs.hsts:
-                            SSL.setuphsts(app, domain)
-
-                        # Final validation after all SSL changes
-                        if MTFunctions.validate_nginx_config(app):
-                            # Reload nginx to apply SSL configuration using our robust function
-                            if MTFunctions.safe_nginx_reload(app, domain):
-                                Log.info(app, f"SSL configured successfully for {domain}")
-                                return True
-                            else:
-                                Log.error(app, f"Failed to reload nginx after SSL setup for {domain}")
-                                return False
-                        else:
-                            Log.error(app, f"Nginx configuration invalid after SSL setup for {domain}")
-                            return False
-                    else:
-                        Log.error(app, f"Nginx configuration invalid after certificate deployment for {domain}")
-                        return False
+            # Reuse an existing certificate when possible, mirroring
+            # `wo site create --le` (avoids Let's Encrypt duplicate
+            # certificate rate limits on site recreation)
+            if WOAcme.cert_check(app, domain):
+                if getattr(pargs, 'force', False):
+                    # --force skips confirmations: reinstall existing cert
+                    Log.info(app, f"Reusing existing SSL certificate "
+                             f"for {domain}")
+                    WOAcme.deploycert(app, domain)
                 else:
-                    Log.error(app, f"Failed to deploy SSL certificates for {domain}")
-                    return False
+                    SSL.archivedcertificatehandle(app, domain, acme_domains)
+            elif (domain_type == 'subdomain' and
+                    SSL.checkwildcardexist(app, root_domain)):
+                Log.info(app, f"Using existing wildcard SSL certificate "
+                         f"from {root_domain} to secure {domain}")
+                copyWildcardCert(app, domain, root_domain)
             else:
-                Log.warn(app, f"Failed to obtain SSL certificates for {domain}")
+                # Verify DNS records point to this server before issuing
+                # (bypassed with --force or when using DNS validation)
+                if not acmedata['dns'] and not getattr(pargs, 'force', False):
+                    if not WOAcme.check_dns(app, acme_domains):
+                        Log.warn(app, f"Aborting SSL setup for {domain}")
+                        return False
+
+                if not WOAcme.setupletsencrypt(app, acme_domains, acmedata):
+                    Log.warn(app, f"Failed to obtain SSL certificates "
+                             f"for {domain}")
+                    return False
+                Log.debug(app, f"Let's Encrypt certificates obtained "
+                          f"for {domain}")
+
+                # Deploy certificate files and create ssl.conf with
+                # listen 443 directives.
+                # Note: deploycert() returns 0 on success, not True
+                if WOAcme.deploycert(app, domain) != 0:
+                    Log.error(app, f"Failed to deploy SSL certificates "
+                              f"for {domain}")
+                    return False
+                Log.debug(app, f"SSL certificates deployed for {domain}")
+
+            # Test nginx configuration before applying SSL changes
+            if not MTFunctions.validate_nginx_config(app):
+                Log.error(app, f"Nginx configuration invalid after "
+                          f"certificate deployment for {domain}")
                 return False
+
+            # Configure HTTPS redirect
+            SSL.httpsredirect(app, domain, acme_domains, redirect=True)
+            SSL.siteurlhttps(app, domain)
+
+            # Enable HSTS if requested
+            if hasattr(pargs, 'hsts') and pargs.hsts:
+                SSL.setuphsts(app, domain)
+
+            # Final validation after all SSL changes
+            if not MTFunctions.validate_nginx_config(app):
+                Log.error(app, f"Nginx configuration invalid after "
+                          f"SSL setup for {domain}")
+                return False
+
+            # Reload nginx to apply SSL configuration
+            if not MTFunctions.safe_nginx_reload(app, domain):
+                Log.error(app, f"Failed to reload nginx after "
+                          f"SSL setup for {domain}")
+                return False
+
+            Log.info(app, f"SSL configured successfully for {domain}")
+            return True
 
         except Exception as e:
             Log.debug(app, f"SSL setup error: {e}")
