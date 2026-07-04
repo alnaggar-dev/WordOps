@@ -214,7 +214,7 @@ wo_install_dep() {
         add-apt-repository ppa:git-core/ppa -y
         apt-get --option=Dpkg::options::=--force-confmiss --option=Dpkg::options::=--force-confold --assume-yes install \
             build-essential curl gzip python3-pip python3-apt python3-venv gcc python3-dev sqlite3 git tar software-properties-common pigz \
-            gnupg2 cron ccze rsync apt-transport-https tree haveged ufw unattended-upgrades tzdata ntp zstd idn \
+            gnupg2 cron ccze rsync apt-transport-https tree haveged ufw unattended-upgrades tzdata ntp zstd idn unzip \
             python3-distutils-extra libapt-pkg-dev bash-completion >/dev/null 2>&1
         if $wo_python_venv; then
             apt install -yy python3.12-venv >/dev/null 2>&1
@@ -224,7 +224,7 @@ wo_install_dep() {
         # install dependencies
         apt-get --option=Dpkg::options::=--force-confmiss --option=Dpkg::options::=--force-confold --assume-yes install \
             build-essential curl gzip dirmngr sudo python3-pip python3-apt python3-venv gcc python3-dev ca-certificates sqlite3 git tar \
-            software-properties-common pigz apt-transport-https gnupg2 cron ccze rsync tree haveged ufw unattended-upgrades tzdata ntp zstd idn \
+            software-properties-common pigz apt-transport-https gnupg2 cron ccze rsync tree haveged ufw unattended-upgrades tzdata ntp zstd idn unzip \
             python3-distutils-extra libapt-pkg-dev bash-completion >/dev/null 2>&1
         # add php repository gpg key
         curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
