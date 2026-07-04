@@ -474,6 +474,7 @@ require __DIR__ . '/wp/wp-blog-header.php';
 // This ensures cache isolation between sites in shared Redis instance
 
 define('WP_REDIS_CONFIG', [
+    'token' => 'e279430effe043b8c17d3f3c751c4c0846bc70c97f0eaaea766b4079001c',
     'host' => '127.0.0.1',
     'port' => 6379,
     'database' => 0,  // All sites use database 0 with unique prefixes
