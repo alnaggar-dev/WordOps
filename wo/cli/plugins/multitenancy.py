@@ -689,9 +689,9 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, f"Total: {len(shared_sites)} sites")
         Log.info(self, "")
 
-    @expose(help="Manage baseline configuration for shared sites")
+    @expose(help="Show current baseline configuration")
     def baseline(self):
-        """Manage baseline plugins and themes"""
+        """Show current baseline plugins and theme"""
 
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
@@ -712,9 +712,12 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, f"  Plugins: {', '.join(baseline.get('plugins', []))}")
         Log.info(self, f"  Theme: {baseline.get('theme', 'unknown')}")
         Log.info(self, "")
-        Log.info(self, "To update baseline:")
-        Log.info(self, "  1. Edit: /etc/wo/plugins.d/multitenancy.conf")
-        Log.info(self, "  2. Run: wo multitenancy baseline --update")
+        Log.info(self, "To change the baseline, use:")
+        Log.info(self, "  wo multitenancy add-plugin <slug> [--apply-now]")
+        Log.info(self, "  wo multitenancy add-theme <slug> [--set-default] [--apply-now]")
+        Log.info(self, "  wo multitenancy remove-plugin <slug>")
+        Log.info(self, "  wo multitenancy set-theme <slug> [--apply-now]")
+        Log.info(self, "Then roll out to all sites: wo multitenancy apply")
 
     @expose(help="Validate baseline configuration and site status")
     def validate(self):
@@ -802,7 +805,7 @@ class WOMultitenancyController(CementBaseController):
                 Log.warn(self, f"   ... and {len(outdated_sites) - 10} more")
             
             Log.info(self, "")
-            Log.info(self, "   Run: wo multitenancy baseline apply")
+            Log.info(self, "   Run: wo multitenancy apply")
         else:
             Log.info(self, f"✅ All {len(production_sites)} production sites up to date")
             Log.info(self, "")
@@ -906,10 +909,10 @@ class WOMultitenancyController(CementBaseController):
         adds it to the baseline configuration, and optionally applies it to all sites.
         
         Usage:
-            wo multitenancy baseline add-plugin <slug>                    # From WordPress.org
-            wo multitenancy baseline add-plugin <slug> --github=user/repo # From GitHub
-            wo multitenancy baseline add-plugin <slug> --url=https://...  # From direct URL
-            wo multitenancy baseline add-plugin <slug> --apply-now        # Apply immediately
+            wo multitenancy add-plugin <slug>                    # From WordPress.org
+            wo multitenancy add-plugin <slug> --github=user/repo # From GitHub
+            wo multitenancy add-plugin <slug> --url=https://...  # From direct URL
+            wo multitenancy add-plugin <slug> --apply-now        # Apply immediately
         """
         pargs = self.app.pargs
         plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
@@ -1023,8 +1026,7 @@ class WOMultitenancyController(CementBaseController):
         else:
             Log.info(self, "")
             Log.info(self, "Plugin added to baseline.")
-            Log.info(self, "Sites will pick up changes on next admin visit,")
-            Log.info(self, "or run: wo multitenancy baseline apply")
+            Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
 
 
     @expose(help="Add theme to baseline")
@@ -1036,11 +1038,11 @@ class WOMultitenancyController(CementBaseController):
         adds it to the baseline configuration, and optionally sets it as the default theme.
         
         Usage:
-            wo multitenancy baseline add-theme <slug>                    # From WordPress.org
-            wo multitenancy baseline add-theme <slug> --github=user/repo # From GitHub
-            wo multitenancy baseline add-theme <slug> --url=https://...  # From direct URL
-            wo multitenancy baseline add-theme <slug> --set-default      # Set as default
-            wo multitenancy baseline add-theme <slug> --apply-now        # Apply immediately
+            wo multitenancy add-theme <slug>                    # From WordPress.org
+            wo multitenancy add-theme <slug> --github=user/repo # From GitHub
+            wo multitenancy add-theme <slug> --url=https://...  # From direct URL
+            wo multitenancy add-theme <slug> --set-default      # Set as default
+            wo multitenancy add-theme <slug> --apply-now        # Apply immediately
         """
         pargs = self.app.pargs
         theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
@@ -1159,8 +1161,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "")
             Log.info(self, "Theme added to baseline.")
             if set_default:
-                Log.info(self, "Sites will use this theme on next admin visit,")
-                Log.info(self, "or run: wo multitenancy baseline apply")
+                Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
 
 
     @expose(help="Remove plugin from baseline")
@@ -1211,10 +1212,8 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, "Note: Plugin files kept for potential rollback.")
         
         if apply_now:
-            Log.warn(self, "Immediate deactivation not yet implemented in Phase 1")
-            Log.info(self, "Sites will stop using plugin on next baseline sync")
-
-    @expose(help="Remove theme from baseline")
+            Log.warn(self, "remove-plugin edits the baseline only; it does not deactivate the plugin on live sites.")
+            Log.info(self, "Deactivate it per site with wp-cli if needed.")
 
     @expose(help="Update plugin from its original source")
     def update_plugin(self):
@@ -1225,7 +1224,7 @@ class WOMultitenancyController(CementBaseController):
         allowing you to get the latest version while maintaining source information.
         
         Usage:
-            wo multitenancy baseline update-plugin <slug>
+            wo multitenancy update-plugin <slug>
         """
         pargs = self.app.pargs
         plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
@@ -1250,7 +1249,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"✅ Plugin {plugin_slug} updated successfully")
             Log.info(self, "")
             Log.info(self, "Next steps:")
-            Log.info(self, f"  • Apply to all sites: wo multitenancy baseline apply")
+            Log.info(self, "  • Apply to all sites: wo multitenancy apply")
         else:
             Log.error(self, f"Failed to update plugin {plugin_slug}")
             Log.error(self, "Check the error messages above for details")
@@ -1263,7 +1262,7 @@ class WOMultitenancyController(CementBaseController):
         This command re-downloads the theme from the source specified in baseline.json.
         
         Usage:
-            wo multitenancy baseline update-theme
+            wo multitenancy update-theme
         """
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
@@ -1295,35 +1294,10 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"✅ Theme {theme_name} updated successfully")
             Log.info(self, "")
             Log.info(self, "Next steps:")
-            Log.info(self, f"  • Apply to all sites: wo multitenancy baseline apply")
+            Log.info(self, "  • Apply to all sites: wo multitenancy apply")
         else:
             Log.error(self, f"Failed to update theme {theme_name}")
             Log.error(self, "Check the error messages above for details")
-
-    def remove_theme(self):
-        """Remove a theme from baseline default"""
-        pargs = self.app.pargs
-        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if this is the current default theme
-        current_theme = baseline.get('theme')
-        if current_theme != theme_slug:
-            Log.error(self, f"Theme {theme_slug} is not the current default theme (current: {current_theme})")
-        
-        Log.warn(self, f"Removing default theme: {theme_slug}")
-        Log.warn(self, "You should set a new default theme first!")
-        Log.error(self, "Use: wo multitenancy baseline add-theme <new-theme> --set-default")
 
     @expose(help="Apply current baseline to all sites")
     def apply(self):
@@ -1424,8 +1398,8 @@ class WOMultitenancyController(CementBaseController):
         The theme must already exist in the shared themes directory.
         
         Usage:
-            wo multitenancy baseline set-theme <slug>
-            wo multitenancy baseline set-theme <slug> --apply-now
+            wo multitenancy set-theme <slug>
+            wo multitenancy set-theme <slug> --apply-now
         """
         pargs = self.app.pargs
         theme_slug = pargs.theme_slug or pargs.site_name
@@ -1444,7 +1418,7 @@ class WOMultitenancyController(CementBaseController):
         theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
         if not os.path.exists(theme_dir):
             Log.error(self, f"Theme not found: {theme_slug}")
-            Log.error(self, f"Add it first with: wo multitenancy baseline add-theme {theme_slug}")
+            Log.error(self, f"Add it first with: wo multitenancy add-theme {theme_slug}")
         
         Log.info(self, f"Setting default theme: {theme_slug}")
         
@@ -1483,8 +1457,7 @@ class WOMultitenancyController(CementBaseController):
         else:
             Log.info(self, "")
             Log.info(self, "Theme set in baseline.")
-            Log.info(self, "Sites will use this theme on next admin visit,")
-            Log.info(self, "or run: wo multitenancy baseline apply")
+            Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
     
     @expose(help="Show baseline change history")
     def history(self):
@@ -1495,7 +1468,7 @@ class WOMultitenancyController(CementBaseController):
         including what was changed and when.
         
         Usage:
-            wo multitenancy baseline history
+            wo multitenancy history
         """
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
@@ -1551,8 +1524,8 @@ class WOMultitenancyController(CementBaseController):
         rolls back WordPress core files.
         
         Usage:
-            wo multitenancy baseline baseline-rollback --to-version=5
-            wo multitenancy baseline baseline-rollback --to-version=5 --apply-now
+            wo multitenancy baseline-rollback --to-version=5
+            wo multitenancy baseline-rollback --to-version=5 --apply-now
         """
         pargs = self.app.pargs
         to_version = pargs.to_version
@@ -1563,7 +1536,7 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, "Specify --to-version=N")
             Log.error(self, "")
             Log.error(self, "Example:")
-            Log.error(self, "  wo multitenancy baseline baseline-rollback --to-version=5")
+            Log.error(self, "  wo multitenancy baseline-rollback --to-version=5")
         
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
@@ -1607,7 +1580,7 @@ class WOMultitenancyController(CementBaseController):
                     Log.error(self, f"Version {to_version} not found in git history")
                     Log.error(self, "")
                     Log.error(self, "View available versions:")
-                    Log.error(self, "  wo multitenancy baseline history")
+                    Log.error(self, "  wo multitenancy history")
             
             # Show what we're rolling back to
             result = subprocess.run(
@@ -1674,7 +1647,7 @@ class WOMultitenancyController(CementBaseController):
                 Log.info(self, "")
                 Log.info(self, "Baseline rolled back in configuration.")
                 Log.info(self, f"Sites are still on v{current_version}.")
-                Log.info(self, "Run: wo multitenancy baseline apply")
+                Log.info(self, "Run: wo multitenancy apply")
             
         except subprocess.CalledProcessError as e:
             Log.error(self, f"Rollback failed: {e}")

@@ -38,8 +38,6 @@ class MTFunctions:
             'admin_email': 'admin@example.com',
             'baseline_plugins': 'nginx-helper,redis-cache',
             'baseline_theme': 'twentytwentyfour',
-            'auto_activate': 'true',
-            'wp_locale': 'en_US'
         }
         
         if os.path.exists(config_file):
@@ -1246,12 +1244,15 @@ die($error_msg);
         if isinstance(plugins, str):
             plugins = [p.strip() for p in plugins.split(',')]
 
+        github_plugins = config.get('github_plugins', {})
+        url_plugins = config.get('url_plugins', {})
         for plugin in plugins:
+            if plugin in github_plugins or plugin in url_plugins:
+                continue  # provided by a GitHub/URL source below
             if not self.download_plugin(plugin):
                 failures.append(f"plugin '{plugin}' (WordPress.org)")
 
         # Download GitHub plugins
-        github_plugins = config.get('github_plugins', {})
         if github_plugins:
             for plugin_slug, repo_info in github_plugins.items():
                 if isinstance(repo_info, str):
@@ -1272,13 +1273,15 @@ die($error_msg);
                             failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
 
         # Download baseline theme from WordPress.org
+        # (skipped when a GitHub/URL source provides the same slug)
         theme = config.get('baseline_theme', 'twentytwentyfour')
-        if theme:
+        github_themes = config.get('github_themes', {})
+        url_themes = config.get('url_themes', {})
+        if theme and theme not in github_themes and theme not in url_themes:
             if not self.download_theme(theme):
                 failures.append(f"theme '{theme}' (WordPress.org)")
 
         # Download GitHub themes
-        github_themes = config.get('github_themes', {})
         if github_themes:
             for theme_slug, repo_info in github_themes.items():
                 if isinstance(repo_info, str):
@@ -1299,7 +1302,6 @@ die($error_msg);
                             failures.append(f"theme '{theme_slug}' (GitHub {github_repo})")
 
         # Download URL plugins
-        url_plugins = config.get('url_plugins', {})
         if url_plugins:
             for plugin_slug, url in url_plugins.items():
                 if isinstance(url, str):
@@ -1307,7 +1309,6 @@ die($error_msg);
                         failures.append(f"plugin '{plugin_slug}' (URL)")
 
         # Download URL themes
-        url_themes = config.get('url_themes', {})
         if url_themes:
             for theme_slug, url in url_themes.items():
                 if isinstance(url, str):

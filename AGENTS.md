@@ -89,7 +89,7 @@ tail -f /var/log/wo/wordops.log
 - **Site command**: `wo/cli/plugins/site.py`, `site_create.py`, `site_functions.py`, `sitedb.py`, `models.py`
 - **Multitenancy**: `wo/cli/plugins/multitenancy.py`, `multitenancy_functions.py`, `multitenancy_db.py`, `multitenancy_health.py`, `config/plugins.d/multitenancy.conf`
 - **Packaging/config**: `setup.py`, `setup.cfg`, `requirements.txt`, `config/wo.conf`
-- **AI context**: `AGENTS.md`; plugin reference `WORDOPS-MULTITENANCY-PLUGIN-DOCS-V2.md`; operator cheat sheet `short-guide.md`
+- **AI context**: `AGENTS.md`; multi-tenancy plugin reference `MULTITENANCY.md`; fork install/update notes `FORK.md`
 
 ## Runtime/Tooling Preferences
 
