@@ -2393,7 +2393,7 @@ class BaselineApplicator:
             )
             
             if plugins_result.returncode != 0:
-                result['error'] = "Could not read current plugins"
+                result['error'] = "Could not read current plugins: " + plugins_result.stderr.strip()
                 return result
             
             current_plugins = plugins_result.stdout.strip()
@@ -2561,6 +2561,9 @@ class BaselineApplicator:
         for site in production_sites:
             domain = site['domain']
             site_path = site['site_path']
+            # DB site_path is the site root; WordPress (and wp-cli --path)
+            # lives in <root>/htdocs.
+            wp_path = os.path.join(site_path, 'htdocs')
 
             if dry_run:
                 option_names = list(baseline.get('options', {}).keys())
@@ -2570,7 +2573,7 @@ class BaselineApplicator:
                     try:
                         baseline_plugins = set(baseline.get('plugins', []))
                         active_plugins = set(
-                            BaselineApplicator._get_active_plugin_slugs(app, site_path)
+                            BaselineApplicator._get_active_plugin_slugs(app, wp_path)
                         )
                         plugins_to_deactivate = sorted(active_plugins - baseline_plugins)
                     except Exception as e:
@@ -2603,7 +2606,7 @@ class BaselineApplicator:
 
             start = _time.monotonic()
             result = BaselineApplicator.apply_baseline_to_site(
-                app, domain, site_path, baseline, prune=prune,
+                app, domain, wp_path, baseline, prune=prune,
             )
             dur = int((_time.monotonic() - start) * 1000)
 

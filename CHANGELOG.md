@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 -   Fix html site creation by @VirtuBox in #703
 -   Fix `wo site clone` PHP version resolution to support all current PHP versions; it was hardcoded to 7.2–7.4 and silently fell back to 7.3
+-   Fix `wo multitenancy apply` failing on every site with "Could not read current plugins"; it passed the DB site root to wp-cli `--path` instead of the `htdocs` WordPress install directory
 
 ### v3.21.3 - 2024-06-14
 

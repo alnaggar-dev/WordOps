@@ -557,6 +557,87 @@ class BaselineApplicatorTests(unittest.TestCase):
 
         self.assertEqual(result, {'success': True, 'error': None})
 
+
+class BaselineApplicatorSitesTests(unittest.TestCase):
+
+    def setUp(self):
+        self.app = mock.Mock()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.config = {'shared_root': self.tmp}
+        config_dir = os.path.join(self.tmp, 'config')
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, 'baseline.json'), 'w') as fh:
+            json.dump({
+                'plugins': ['kept-plugin'],
+                'theme': '',
+                'options': {},
+            }, fh)
+
+    def _session_with_enabled_site(self):
+        site = mock.Mock()
+        site.domain = 'example.com'
+        site.site_path = '/var/www/example.com'
+        site.is_enabled = True
+        session = mock.Mock()
+        query = session.query.return_value
+        query.filter_by.return_value = query
+        query.all.return_value = [site]
+        query.first.return_value = site
+        return session
+
+    def test_apply_baseline_to_sites_passes_htdocs_path_to_site_apply(self):
+        """DB site_path is the site root; apply uses the WordPress htdocs dir."""
+        session = self._session_with_enabled_site()
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(
+                    BaselineApplicator,
+                    'apply_baseline_to_site',
+                    return_value={'success': True, 'error': None},
+                ) as apply_site, \
+                mock.patch('wo.core.shellexec.WOShellExec.cmd_exec'), \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app, self.config, baseline_version=7,
+            )
+
+        self.assertEqual(result['succeeded'], 1)
+        apply_site.assert_called_once()
+        self.assertEqual(
+            apply_site.call_args.args[2],
+            '/var/www/example.com/htdocs',
+        )
+
+    def test_apply_baseline_to_sites_dry_run_prune_reads_active_plugins_from_htdocs(self):
+        """Dry-run prune probes active plugins in the WordPress htdocs dir."""
+        session = self._session_with_enabled_site()
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(
+                    BaselineApplicator,
+                    '_get_active_plugin_slugs',
+                    return_value=[],
+                ) as get_active_plugin_slugs, \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app,
+                self.config,
+                baseline_version=7,
+                dry_run=True,
+                prune=True,
+            )
+
+        self.assertEqual(result['status'], 'dry_run')
+        get_active_plugin_slugs.assert_called_once()
+        self.assertEqual(
+            get_active_plugin_slugs.call_args.args[1],
+            '/var/www/example.com/htdocs',
+        )
+
 class ReloadServicesAfterConfigChangeTests(unittest.TestCase):
 
     def setUp(self):
