@@ -37,8 +37,6 @@ class MTFunctions:
             'php_version': '8.4',
             'wp_version': 'latest',
             'admin_email': 'admin@example.com',
-            'baseline_plugins': 'nginx-helper,redis-cache',
-            'baseline_theme': 'twentytwentyfour',
         }
         
         if os.path.exists(config_file):
@@ -64,6 +62,20 @@ class MTFunctions:
         # Parse list values
         if 'baseline_plugins' in result:
             result['baseline_plugins'] = [p.strip() for p in result['baseline_plugins'].split(',')]
+        
+        # Add WordPress.org plugin source section. Presence matters: an
+        # empty section disables legacy baseline-based WordPress.org seeding.
+        if config.has_section('wordpress_plugins'):
+            result['wordpress_plugins'] = {
+                key: value for key, value in config.items('wordpress_plugins')
+            }
+        
+        # Add WordPress.org theme source section. Presence matters: an
+        # empty section disables legacy baseline-based WordPress.org seeding.
+        if config.has_section('wordpress_themes'):
+            result['wordpress_themes'] = {
+                key: value for key, value in config.items('wordpress_themes')
+            }
         
         # Add GitHub plugins section
         if config.has_section('github_plugins'):
@@ -756,36 +768,6 @@ server {{
         return "Check /var/www/{domain}/.admin_pass"
     
     @staticmethod
-    def apply_baseline(app, domain, site_htdocs, config):
-        """Apply baseline configuration to site"""
-        
-        # Activate baseline plugins (run from htdocs where wp-config.php shim exists)
-        plugins = config.get('baseline_plugins', [])
-        for plugin in plugins:
-            try:
-                cmd = [
-                    'wp', 'plugin', 'activate', plugin,
-                    '--allow-root'
-                ]
-                subprocess.run(cmd, cwd=site_htdocs, capture_output=True, check=False)
-                Log.debug(app, f"Activated plugin {plugin} for {domain}")
-            except:
-                Log.debug(app, f"Could not activate plugin {plugin}")
-        
-        # Activate baseline theme (run from htdocs where wp-config.php shim exists)
-        theme = config.get('baseline_theme', 'twentytwentyfour')
-        if not MTFunctions.ensure_and_activate_theme(app, domain, site_htdocs, theme):
-            Log.warn(app, f"Failed to activate theme {theme}, trying fallback themes")
-            # Try fallback themes if primary theme fails
-            fallback_themes = ['twentytwentyfour', 'twentytwentythree', 'twentytwentytwo']
-            for fallback_theme in fallback_themes:
-                if MTFunctions.ensure_and_activate_theme(app, domain, site_htdocs, fallback_theme):
-                    Log.info(app, f"Successfully activated fallback theme {fallback_theme} for {domain}")
-                    break
-            else:
-                Log.warn(app, f"All theme activation attempts failed for {domain}")
-
-    @staticmethod
     def ensure_and_activate_theme(app, domain, site_htdocs, theme):
         """Ensure theme exists and activate it"""
         try:
@@ -1283,10 +1265,15 @@ die($error_msg);
         """
         failures = []
 
-        # Download baseline plugins from WordPress.org
-        plugins = config.get('baseline_plugins', ['nginx-helper', 'redis-cache'])
-        if isinstance(plugins, str):
-            plugins = [p.strip() for p in plugins.split(',')]
+        # Download WordPress.org plugin sources. New configs use
+        # [wordpress_plugins]; legacy configs fall back to baseline_plugins.
+        if 'wordpress_plugins' in config:
+            plugins = list(config.get('wordpress_plugins', {}).keys())
+        else:
+            plugins = config.get('baseline_plugins', ['nginx-helper', 'redis-cache'])
+            if isinstance(plugins, str):
+                plugins = [p.strip() for p in plugins.split(',')]
+        plugins = [p for p in plugins if p]
 
         github_plugins = config.get('github_plugins', {})
         url_plugins = config.get('url_plugins', {})
@@ -1316,12 +1303,18 @@ die($error_msg);
                         if not ok:
                             failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
 
-        # Download baseline theme from WordPress.org
-        # (skipped when a GitHub/URL source provides the same slug)
-        theme = config.get('baseline_theme', 'twentytwentyfour')
+        # Download WordPress.org theme sources. New configs use
+        # [wordpress_themes]; legacy configs fall back to baseline_theme.
         github_themes = config.get('github_themes', {})
         url_themes = config.get('url_themes', {})
-        if theme and theme not in github_themes and theme not in url_themes:
+        if 'wordpress_themes' in config:
+            themes = list(config.get('wordpress_themes', {}).keys())
+        else:
+            themes = [config.get('baseline_theme', 'twentytwentyfour')]
+        themes = [t for t in themes if t]
+        for theme in themes:
+            if theme in github_themes or theme in url_themes:
+                continue  # provided by a GitHub/URL source below
             if not self.download_theme(theme):
                 failures.append(f"theme '{theme}' (WordPress.org)")
 
@@ -1965,64 +1958,85 @@ die($error_msg);
             return ""
 
     def create_baseline_config(self, config):
-        """Create baseline configuration file"""
-        # Collect all plugins: baseline + GitHub + URL
-        all_plugins = list(config.get('baseline_plugins', ['nginx-helper']))
-        
-        # Add GitHub plugins
-        github_plugins = config.get('github_plugins', {})
-        if github_plugins:
-            for plugin_slug in github_plugins.keys():
-                if plugin_slug not in all_plugins:
-                    all_plugins.append(plugin_slug)
-        
-        # Add URL plugins
-        url_plugins = config.get('url_plugins', {})
-        if url_plugins:
-            for plugin_slug in url_plugins.keys():
-                if plugin_slug not in all_plugins:
-                    all_plugins.append(plugin_slug)
-        
-        # Determine baseline version (increment if config changed)
+        """Bootstrap baseline configuration file if it does not exist"""
         baseline_file = f"{self.config_dir}/baseline.json"
-        current_version = 1
-        
         if os.path.exists(baseline_file):
-            try:
-                with open(baseline_file, 'r') as f:
-                    old_baseline = json.load(f)
-                    old_version = old_baseline.get('version', 1)
-                    old_plugins = old_baseline.get('plugins', [])
-                    old_theme = old_baseline.get('theme', '')
-                    
-                    # Check if configuration changed
-                    plugins_changed = set(old_plugins) != set(all_plugins)
-                    theme_changed = old_theme != config.get('baseline_theme', 'twentytwentyfour')
-                    
-                    if plugins_changed or theme_changed:
-                        current_version = old_version + 1
-                        Log.info(self.app, f"   Baseline configuration changed - incrementing version to {current_version}")
-                    else:
-                        current_version = old_version
-            except:
-                current_version = 1
-        
+            Log.info(
+                self.app,
+                "baseline.json exists — left untouched; it is the source of truth"
+            )
+            return True
+
+        # baseline.json tracks plugins activated by default, not every
+        # downloaded source. Legacy conf keys seed the first file only; when
+        # absent, seed a one-time starting template from source sections.
+        source_seeded = False
+        if 'baseline_plugins' in config:
+            baseline_plugins = config.get('baseline_plugins', [])
+            if isinstance(baseline_plugins, str):
+                baseline_plugins = [p.strip() for p in baseline_plugins.split(',')]
+            all_plugins = [p for p in baseline_plugins if p]
+        else:
+            all_plugins = []
+            seen_plugins = set()
+            for section_name in ('wordpress_plugins', 'github_plugins', 'url_plugins'):
+                for plugin_slug in config.get(section_name, {}).keys():
+                    if plugin_slug and plugin_slug not in seen_plugins:
+                        all_plugins.append(plugin_slug)
+                        seen_plugins.add(plugin_slug)
+            source_seeded = bool(all_plugins)
+
+        if 'baseline_theme' in config:
+            theme = config.get('baseline_theme', '')
+        else:
+            theme = ''
+            wordpress_themes = list(config.get('wordpress_themes', {}).keys())
+            github_themes = list(config.get('github_themes', {}).keys())
+            url_themes = list(config.get('url_themes', {}).keys())
+            if wordpress_themes:
+                theme = wordpress_themes[0]
+            else:
+                child_themes = [slug for slug in github_themes if slug.endswith('-child')]
+                if child_themes:
+                    theme = child_themes[0]
+                elif github_themes:
+                    theme = github_themes[0]
+                elif url_themes:
+                    theme = url_themes[0]
+            source_seeded = source_seeded or bool(theme)
+
+        if source_seeded:
+            Log.info(
+                self.app,
+                "Seeded baseline.json from source sections as a starting "
+                "template; baseline.json is now operator-owned"
+            )
+
+        if not all_plugins and not theme:
+            Log.warn(
+                self.app,
+                "Bootstrapping baseline.json with no plugins or theme; populate "
+                "it via 'wo multitenancy add-plugin' / 'wo multitenancy set-theme' "
+                "or hand-edit baseline.json"
+            )
+
         baseline = {
-            'version': current_version,
+            'version': 1,
             'generated': datetime.now().isoformat(),
             'plugins': all_plugins,
-            'theme': config.get('baseline_theme', 'twentytwentyfour'),
+            'theme': theme,
             'options': {
                 'blog_public': 1,
                 'default_comment_status': 'closed',
                 'default_ping_status': 'closed'
             }
         }
-        
+
         with open(baseline_file, 'w') as f:
             json.dump(baseline, f, indent=2)
-        
+
         Log.debug(self.app, "Created baseline configuration")
+        return True
     
     def switch_release(self, release_name):
         """Switch to a specific release"""
@@ -2062,8 +2076,20 @@ die($error_msg);
                 except:
                     pass
         
-        # Re-download baseline plugins to ensure latest versions
-        for plugin in config.get('baseline_plugins', []):
+        # Re-download WordPress.org plugin sources to ensure latest versions.
+        # New configs use [wordpress_plugins]; legacy configs fall back to
+        # baseline_plugins.
+        if 'wordpress_plugins' in config:
+            wordpress_plugins = list(config.get('wordpress_plugins', {}).keys())
+        else:
+            wordpress_plugins = config.get('baseline_plugins', [])
+            if isinstance(wordpress_plugins, str):
+                wordpress_plugins = [p.strip() for p in wordpress_plugins.split(',')]
+        github_plugins = config.get('github_plugins', {})
+        url_plugins = config.get('url_plugins', {})
+        for plugin in [p for p in wordpress_plugins if p]:
+            if plugin in github_plugins or plugin in url_plugins:
+                continue
             self.download_plugin(plugin)
     
     def set_permissions(self):
@@ -2308,7 +2334,44 @@ class BaselineApplicator:
             Log.debug(app, f"Failed to restore plugins: {e}")
     
     @staticmethod
-    def apply_baseline_to_site(app, domain, site_path, baseline):
+    def _get_active_plugin_slugs(app, site_path):
+        """Return active plugin slugs for a site"""
+        active_cmd = [
+            'wp', 'plugin', 'list',
+            '--status=active',
+            '--field=name',
+            '--path=' + site_path,
+            '--allow-root'
+        ]
+
+        active_result = subprocess.run(
+            active_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if active_result.returncode != 0:
+            raise RuntimeError(
+                "Failed to list active plugins: " + active_result.stderr
+            )
+
+        return [
+            plugin.strip() for plugin in active_result.stdout.splitlines()
+            if plugin.strip()
+        ]
+
+    @staticmethod
+    def _option_value_for_wp_cli(value):
+        """Convert a baseline option value to a WP-CLI argument."""
+        if isinstance(value, bool):
+            return '1' if value else '0', False
+        if isinstance(value, (dict, list)):
+            return json.dumps(value), True
+        return str(value), False
+
+    @staticmethod
+    def apply_baseline_to_site(app, domain, site_path, baseline, prune=False):
         """Apply baseline configuration to a single site via WP-CLI"""
         
         result = {'success': False, 'error': None}
@@ -2391,6 +2454,58 @@ class BaselineApplicator:
                 if theme_result.returncode != 0:
                     result['error'] = f"Failed to activate theme {theme_slug}"
                     return result
+
+            for option_name, option_value in baseline.get('options', {}).items():
+                wp_value, use_json_format = BaselineApplicator._option_value_for_wp_cli(
+                    option_value
+                )
+                option_cmd = [
+                    'wp', 'option', 'update', option_name, wp_value,
+                    '--path=' + site_path,
+                    '--allow-root'
+                ]
+                if use_json_format:
+                    option_cmd.append('--format=json')
+
+                option_result = subprocess.run(
+                    option_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                if option_result.returncode != 0:
+                    Log.warn(
+                        app,
+                        f"Failed to update option {option_name} for {domain}: "
+                        f"{option_result.stderr.strip()}"
+                    )
+
+            if prune:
+                baseline_plugins = set(baseline.get('plugins', []))
+                active_plugins = set(
+                    BaselineApplicator._get_active_plugin_slugs(app, site_path)
+                )
+                plugins_to_deactivate = sorted(active_plugins - baseline_plugins)
+                if plugins_to_deactivate:
+                    deactivate_cmd = [
+                        'wp', 'plugin', 'deactivate',
+                    ] + plugins_to_deactivate + [
+                        '--path=' + site_path,
+                        '--allow-root'
+                    ]
+                    deactivate_result = subprocess.run(
+                        deactivate_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if deactivate_result.returncode != 0:
+                        result['error'] = "Failed to prune plugins: " + \
+                                        deactivate_result.stderr
+                        return result
+                    for plugin_slug in plugins_to_deactivate:
+                        Log.info(app, f"Deactivated plugin {plugin_slug} for {domain}")
             
             result['success'] = True
             return result
@@ -2403,7 +2518,7 @@ class BaselineApplicator:
             return result
     
     @staticmethod
-    def apply_baseline_to_sites(app, config, baseline_version, dry_run=False, verbose=False):
+    def apply_baseline_to_sites(app, config, baseline_version, dry_run=False, verbose=False, prune=False):
         """Apply current baseline to all enabled sites via WP-CLI.
 
         Returns a summary dict with attempted/succeeded/failed counts and a
@@ -2448,19 +2563,47 @@ class BaselineApplicator:
             site_path = site['site_path']
 
             if dry_run:
-                if verbose:
+                option_names = list(baseline.get('options', {}).keys())
+                plugins_to_deactivate = []
+                prune_error = None
+                if prune:
+                    try:
+                        baseline_plugins = set(baseline.get('plugins', []))
+                        active_plugins = set(
+                            BaselineApplicator._get_active_plugin_slugs(app, site_path)
+                        )
+                        plugins_to_deactivate = sorted(active_plugins - baseline_plugins)
+                    except Exception as e:
+                        prune_error = str(e)
+                        Log.warn(
+                            app,
+                            f"  [dry-run] could not determine prune set for {domain}: {prune_error}"
+                        )
+                Log.info(
+                    app,
+                    f"  [dry-run] would apply baseline to {domain} "
+                    f"(plugins={','.join(baseline.get('plugins', []))}, "
+                    f"theme={baseline.get('theme', '')}, "
+                    f"options={','.join(option_names)})"
+                )
+                if prune:
                     Log.info(
                         app,
-                        f"  [dry-run] would apply baseline to {domain} "
-                        f"(plugins={','.join(baseline.get('plugins', []))}, "
-                        f"theme={baseline.get('theme', '')})",
+                        f"  [dry-run] would deactivate for {domain}: "
+                        f"{','.join(plugins_to_deactivate) if plugins_to_deactivate else '(none)'}"
                     )
-                per_site.append({'domain': domain, 'status': 'dry_run'})
+                per_site.append({
+                    'domain': domain,
+                    'status': 'dry_run',
+                    'options': option_names,
+                    'prune_deactivate': plugins_to_deactivate,
+                    'prune_error': prune_error,
+                })
                 continue
 
             start = _time.monotonic()
             result = BaselineApplicator.apply_baseline_to_site(
-                app, domain, site_path, baseline,
+                app, domain, site_path, baseline, prune=prune,
             )
             dur = int((_time.monotonic() - start) * 1000)
 

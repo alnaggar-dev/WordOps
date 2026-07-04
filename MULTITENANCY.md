@@ -17,27 +17,46 @@ Operating model: this fork assumes a trust model of one — a solo operator runn
 | Mutable content | Not shared | `wp-content/uploads`, `wp-content/cache`, `wp-content/upgrade` real directories |
 | Web server | Not shared | nginx vhost and cache configuration |
 
+Multi-tenancy has three configuration layers:
+
+- `/etc/wo/plugins.d/multitenancy.conf` configures infrastructure and download sources only: shared root, release retention, WordPress/PHP defaults, health thresholds, and where plugin/theme zip files come from.
+- `/var/www/shared/config/baseline.json` is the source of truth for the active baseline: active plugins, active theme, and fleet-wide WordPress `options`. Site creation and `wo multitenancy apply` enforce this file through wp-cli.
+- `/var/www/shared/config/wp-config-shared.php` contains PHP constants and shared PHP config that every generated tenant loads.
+
 Each generated tenant `wp-config.php` does a `require_once` of `/var/www/shared/config/wp-config-shared.php` before defining its DB constants. The require is guarded by `WO_BYPASS_SHARED_CONFIG`, and risky paths lint the shared file with `php -l` before proceeding. The shared core is `current -> releases/wp-<timestamp>`; `update` builds a new release and repoints `current`, while `rollback` repoints it to the previous release.
 
 ## Quick start
 
-1. Write `/etc/wo/plugins.d/multitenancy.conf`.
+1. Configure shared infrastructure and download sources in `/etc/wo/plugins.d/multitenancy.conf`.
 
     ```ini
     [multitenancy]
     enable_plugin = true
     shared_root = /var/www/shared
-    baseline_plugins = redis-cache,nginx-helper
-    baseline_theme = twentytwentyfour
+
+    [wordpress_plugins]
+    redis-cache = latest
+    nginx-helper = latest
+
+    [wordpress_themes]
+    twentytwentyfour = latest
     ```
 
-2. Initialize the shared infrastructure.
+2. Initialize the shared infrastructure. This creates `/var/www/shared/config/baseline.json` only if it is missing.
 
     ```bash
     wo multitenancy init
     ```
 
-3. Create sites.
+3. Choose the baseline activation state with CLI helpers, or edit `baseline.json` by hand.
+
+    ```bash
+    wo multitenancy add-plugin redis-cache
+    wo multitenancy add-plugin nginx-helper
+    wo multitenancy set-theme twentytwentyfour
+    ```
+
+4. Create sites. New sites receive the plugins, theme, and options from `baseline.json`.
 
     ```bash
     wo multitenancy create example.com --php84 --wpfc
@@ -53,7 +72,7 @@ This plugin ships with this fork's `wo` CLI (see `FORK.md` for fork install and 
 wo update --force
 ```
 
-Enable the plugin through `/etc/wo/plugins.d/multitenancy.conf`:
+Enable the plugin and configure infrastructure/download sources through `/etc/wo/plugins.d/multitenancy.conf`:
 
 ```ini
 [multitenancy]
@@ -62,22 +81,27 @@ shared_root = /var/www/shared
 keep_releases = 3
 wp_version = latest
 php_version = 8.4
-baseline_plugins = redis-cache,nginx-helper
-baseline_theme = twentytwentyfour
 admin_email = admin@example.com
+
+[wordpress_plugins]
+redis-cache = latest
+nginx-helper = latest
+
+[wordpress_themes]
+twentytwentyfour = latest
 ```
 
-Initialize the shared core, baseline, config, database metadata, permissions, and git tracking:
+Initialize the shared core, baseline file, config, database metadata, permissions, and git tracking:
 
 ```bash
 wo multitenancy init
 ```
 
-Re-running `wo multitenancy init --force` is safe. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
+Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` is safe for infrastructure repair, but it never overwrites an existing `baseline.json`. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
 
 ## Configuration
 
-Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`.
+Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`. This file controls infrastructure settings and download sources only; it does not control which plugins or theme are active on tenants.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -86,17 +110,17 @@ Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`.
 | `keep_releases` | `3` | Number of WordPress core releases kept for rollback. |
 | `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest`, an exact version (e.g. `6.5.2`), or `nightly`; passed to `wp core download --version=...` when pinned. |
 | `php_version` | `8.4` | Default PHP version when the CLI/site does not specify one. |
-| `baseline_plugins` | `nginx-helper,redis-cache` | Comma-separated plugin slugs seeded during `init`. Fetched from WordPress.org unless the slug also appears in a GitHub/URL section. |
-| `baseline_theme` | `twentytwentyfour` | Theme slug seeded during `init`. Fetched from WordPress.org unless provided by a GitHub/URL section. |
 | `admin_email` | `admin@example.com` | Fallback admin email for site creation. |
 | `min_free_space_gb` | `2` | Free-disk threshold (GB) below which the `health` disk check warns. |
 
-Defaults are the code fallbacks used when a key is missing. The packaged conf in this fork sets `baseline_plugins = nginx-helper,woocommerce,plausible-analytics,safe-svg` and `baseline_theme = woodmart-child` (provided by `[github_themes]`, so WordPress.org is skipped for it).
+Defaults are the code fallbacks used when a key is missing. The packaged conf in this fork lists WordPress.org plugin sources in `[wordpress_plugins]` and sources `woodmart`/`woodmart-child` from `[github_themes]`; the active baseline lives in `/var/www/shared/config/baseline.json`.
 
-Optional source sections define plugins and themes that come from GitHub or direct zip URLs:
+Optional source sections define plugins and themes downloaded from WordPress.org, GitHub, or direct zip URLs:
 
 | Section | Value format |
 | --- | --- |
+| `[wordpress_plugins]` | `slug = latest` |
+| `[wordpress_themes]` | `slug = latest` or `slug = <version>` |
 | `[github_plugins]` | `slug = user/repo,tag|branch,ref` |
 | `[github_themes]` | `slug = user/repo,tag|branch,ref` |
 | `[url_plugins]` | `slug = https://example.com/plugin.zip` |
@@ -109,9 +133,14 @@ shared_root = /var/www/shared
 keep_releases = 3
 wp_version = latest
 php_version = 8.4
-baseline_plugins = redis-cache,nginx-helper
-baseline_theme = twentytwentyfour
 admin_email = admin@example.com
+
+[wordpress_plugins]
+redis-cache = latest
+nginx-helper = latest
+
+[wordpress_themes]
+twentytwentyfour = latest
 
 [github_plugins]
 private-plugin = owner/private-plugin,tag,1.2.3
@@ -121,11 +150,42 @@ branch-plugin = owner/branch-plugin,branch,main
 custom-theme = https://example.com/custom-theme.zip
 ```
 
-Ordering quirk: put all `[multitenancy]` scalar keys before any `[github_*]` or `[url_*]` section. Place the GitHub and URL sections at the end of the file so later scalar keys are not parsed into the wrong section.
+Ordering quirk: put all `[multitenancy]` scalar keys before any `[wordpress_plugins]`, `[wordpress_themes]`, `[github_*]`, or `[url_*]` section. Place the source sections at the end of the file so later scalar keys are not parsed into the wrong section.
 
 For private GitHub repositories, token resolution is `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. The token is sent as `Authorization: Bearer <token>`.
 
-Older templates may contain extra keys such as `auto_ssl`, `default_cache`, `enable_hsts`, `wp_memory_limit`, `disable_file_edit`, and others that the current code ignores.
+Older templates may contain extra keys such as `baseline_plugins`, `baseline_theme`, `auto_ssl`, `default_cache`, `enable_hsts`, `wp_memory_limit`, `disable_file_edit`, and others. Legacy `baseline_plugins`/`baseline_theme` values are read only as one-time bootstrap seeds when `wo multitenancy init` must create a missing `baseline.json`; current activation is controlled by `baseline.json`.
+
+## Baseline configuration
+
+`/var/www/shared/config/baseline.json` is the git-tracked source of truth for tenant activation and fleet-wide WordPress options:
+
+```json
+{
+  "version": 3,
+  "generated": "2026-07-04T12:00:00Z",
+  "plugins": [
+    "redis-cache",
+    "nginx-helper"
+  ],
+  "theme": "twentytwentyfour",
+  "options": {
+    "blog_public": false,
+    "timezone_string": "UTC",
+    "woocommerce_allowed_countries": ["US", "CA"],
+    "my_plugin_settings": {
+      "enabled": true,
+      "mode": "fleet"
+    }
+  }
+}
+```
+
+`plugins` is the additive activation list unless `apply --prune` is used. `theme` is the active theme slug. `options` is applied with `wp option update` during site creation and `wo multitenancy apply`: scalar values become strings (`true`/`false` become `1`/`0`), while arrays and objects are written as JSON.
+
+`wo multitenancy init` creates `baseline.json` only when the file is missing. It never overwrites an existing baseline, even with `--force`. The first file is a starting template: legacy `baseline_plugins` or `baseline_theme` keys take precedence when present; otherwise plugins are seeded from the keys in `[wordpress_plugins]`, `[github_plugins]`, and `[url_plugins]`, and the theme is seeded from the first `[wordpress_themes]` entry, the `-child` entry in `[github_themes]`, or the first available theme source. After that first write, the file is operator-owned and init does not rewrite it.
+
+Hand-editing `baseline.json` is supported. Keep it under git tracking, bump `version` when changing plugins, theme, or options by hand so `validate` can report site drift correctly, and commit the change through the normal baseline workflow. `history` and `baseline-rollback --to-version=N` operate on `config/baseline.json` regardless of whether the change came from a CLI helper or a hand edit.
 
 ## Commands
 
@@ -135,9 +195,9 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 
 | Command | Purpose |
 | --- | --- |
-| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), seed baseline plugins/themes, write `baseline.json` and `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe. |
-| `wo multitenancy create <domain> [flags]` | Create a shared-core tenant. See [create options](#create-options). |
-| `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, clear caches, and bump the baseline version. `--force` skips the canary abort. |
+| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe but never overwrites an existing baseline. |
+| `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. See [create options](#create-options). |
+| `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, and clear caches. `--force` skips the canary abort. This command does not bump the baseline version. |
 | `wo multitenancy rollback [--force]` | Switch `current` back to the previous release. `--force` skips confirmation. |
 | `wo multitenancy delete <domain> [--force]` | Delete a tenant with `wo site delete ... --no-prompt`, then remove its multi-tenancy tracking row. |
 | `wo multitenancy remove [--force]` | Tear down the entire shared infrastructure. It refuses while sites remain unless `--force` is used. |
@@ -162,7 +222,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `wo multitenancy update-plugin <slug>` | Re-fetch a plugin from its original source. |
 | `wo multitenancy update-theme` | Re-fetch the configured baseline theme from its original source. Takes no slug. |
 | `wo multitenancy set-theme <slug> [--apply-now]` | Set an already-present shared theme as the baseline default, commit it, and optionally apply. |
-| `wo multitenancy apply [--dry-run] [--verbose]` | Apply the current baseline to every enabled site by activating plugins and theme through wp-cli. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. On plugin activation failure it restores that site's previous active plugins and reports failure. |
+| `wo multitenancy apply [--dry-run] [--prune] [--verbose]` | Apply the current baseline to every enabled site by activating plugins, activating the theme, and updating `options` through wp-cli. Default behavior is additive: plugins already active but absent from the baseline stay active. `--prune` is destructive and deactivates active plugins not listed in `baseline.json`; run `--dry-run --prune` first to see the exact would-be-deactivated set. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. |
 | `wo multitenancy history` | Show the last 20 git commits of `config/baseline.json`. |
 | `wo multitenancy baseline-rollback --to-version=N [--apply-now] [--force]` | Find the git commit for baseline version `N`, check out `baseline.json` from it, commit the rollback, and optionally apply to sites. |
 
@@ -220,7 +280,7 @@ Shared tree:
 │   └── languages/                   # shared
 ├── config/
 │   ├── wp-config-shared.php         # fleet-wide, require_once'd
-│   └── baseline.json                # baseline set + version
+│   └── baseline.json                # active plugins/theme, options, version
 └── .git/                            # tracks config/baseline.json only
 ```
 
@@ -254,9 +314,9 @@ Per-site tree:
 
 Core update and rollback are atomic symlink operations. `update` builds a new `releases/wp-<timestamp>` tree and repoints `current`; `rollback` repoints `current` to the previous release. By default, `keep_releases = 3` keeps three releases for rollback. When `wp_version` pins a version, `update` re-downloads that pinned version rather than the latest; change the pin or set it back to `latest` to move the core forward.
 
-Baseline changes are git-committed under `shared_root/.git`, with tracking limited to `config/baseline.json`. `history` shows recent baseline commits, and `baseline-rollback --to-version=N` checks out `baseline.json` from the commit for version `N` and commits that rollback.
+Baseline changes are git-committed under `shared_root/.git`, with tracking limited to `config/baseline.json`. `history` shows recent baseline commits, and `baseline-rollback --to-version=N` checks out `baseline.json` from the commit for version `N` and commits that rollback. `update` changes the shared core and shared plugin/theme files only; it does not bump the baseline version.
 
-Sites do not auto-upgrade on visit. Run `wo multitenancy apply`, or use `--apply-now` on baseline-changing commands that support it.
+Sites do not auto-upgrade on visit. Run `wo multitenancy apply`, or use `--apply-now` on baseline-changing commands that support it. By default `apply` is additive; include `--prune` only when you intentionally want plugins outside `baseline.json` deactivated.
 
 ## Shared config safety & recovery
 

@@ -99,6 +99,7 @@ class WOMultitenancyController(CementBaseController):
             # Phase 3: Shared configuration management
             (['--action'], dict(help="Shared-config action (only 'edit' supported)", dest='config_action')),
             (['--dry-run'], dict(help='Preview changes without applying', action='store_true', dest='dry_run')),
+            (['--prune'], dict(help='Deactivate plugins not listed in baseline during apply', action='store_true', dest='prune')),
             # DevOps improvements: cross-cutting flags
             (['--json'], dict(help='Emit machine-readable JSON output', action='store_true', dest='json_output')),
             (['--enable'], dict(help='Enable maintenance mode', action='store_true', dest='enable_flag')),
@@ -336,8 +337,38 @@ class WOMultitenancyController(CementBaseController):
             )
             
             # Apply baseline configuration
-            Log.info(self, "Applying baseline configuration...")
-            MTFunctions.apply_baseline(self, wo_domain, site_htdocs, config)
+            baseline_path = f"{shared_root}/config/baseline.json"
+            baseline = None
+            current_version = MTDatabase.get_baseline_version(self)
+            if os.path.exists(baseline_path):
+                try:
+                    with open(baseline_path, 'r') as baseline_file:
+                        baseline = json.load(baseline_file)
+                    if not baseline.get('theme'):
+                        Log.warn(
+                            self,
+                            "Site has no baseline theme; set one with "
+                            "'wo multitenancy set-theme'"
+                        )
+                    Log.info(self, "Applying baseline configuration...")
+                    baseline_result = BaselineApplicator.apply_baseline_to_site(
+                        self, wo_domain, site_htdocs, baseline, prune=False
+                    )
+                    if not baseline_result.get('success'):
+                        Log.warn(
+                            self,
+                            f"Baseline configuration failed for {wo_domain}: "
+                            f"{baseline_result.get('error')}"
+                        )
+                    current_version = baseline.get('version', current_version)
+                except Exception as e:
+                    baseline = None
+                    Log.warn(
+                        self,
+                        f"Could not read baseline.json; skipping baseline activation: {e}"
+                    )
+            else:
+                Log.warn(self, "baseline.json missing; skipping baseline activation")
             
             # Set permissions
             Log.info(self, "Setting permissions...")
@@ -424,15 +455,8 @@ class WOMultitenancyController(CementBaseController):
                     else:
                         Log.debug(self, "Nginx reloaded successfully after SSL deployment")
             
+
             # Record current baseline version so validate doesn't flag the new site
-            baseline_path = f"{shared_root}/config/baseline.json"
-            current_version = MTDatabase.get_baseline_version(self)
-            if os.path.exists(baseline_path):
-                try:
-                    with open(baseline_path) as _bf:
-                        current_version = json.load(_bf).get('version', current_version)
-                except Exception:
-                    pass
             MTDatabase.update_site_baseline(self, wo_domain, current_version)
 
             # Git commit
@@ -528,8 +552,6 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Cleaning up old releases...")
             release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
             
-            # Update baseline version to trigger reapplication
-            MTDatabase.increment_baseline_version(self)
 
             Log.info(self, "✅ Update completed successfully!")
             Log.info(self, f"   New release: {new_release}")
@@ -1346,6 +1368,7 @@ class WOMultitenancyController(CementBaseController):
 
         dry_run = bool(getattr(pargs, 'dry_run', False))
         verbose = bool(getattr(pargs, 'verbose', False))
+        prune = bool(getattr(pargs, 'prune', False))
 
         header = f"Applying baseline v{baseline_version} to all sites"
         if dry_run:
@@ -1354,7 +1377,7 @@ class WOMultitenancyController(CementBaseController):
 
         result = BaselineApplicator.apply_baseline_to_sites(
             self, config, baseline_version,
-            dry_run=dry_run, verbose=verbose,
+            dry_run=dry_run, verbose=verbose, prune=prune,
         )
         summary = result if isinstance(result, dict) else {}
         summary.setdefault('baseline_version', baseline_version)

@@ -248,33 +248,6 @@ class MTDatabase:
         except:
             return 1
     
-    @staticmethod
-    def increment_baseline_version(app):
-        """Increment baseline version to trigger reapplication"""
-        try:
-            current = MTDatabase.get_baseline_version(app)
-            new_version = current + 1
-            
-            session = db_session
-            config = session.query(MultitenancyConfig).filter_by(
-                key='baseline_version'
-            ).first()
-            
-            if config:
-                config.value = str(new_version)
-                config.updated_at = datetime.now()
-            else:
-                config = MultitenancyConfig(
-                    key='baseline_version',
-                    value=str(new_version)
-                )
-                session.add(config)
-            
-            session.commit()
-            Log.debug(app, f"Incremented baseline version to {new_version}")
-                
-        except Exception as e:
-            Log.error(app, f"Failed to increment baseline version: {e}")
     
     @staticmethod
     def add_shared_site(app, domain, site_data):
