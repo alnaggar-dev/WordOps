@@ -84,7 +84,7 @@ Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`.
 | `enable_plugin` | — | Cement plugin-loader gate; the plugin only loads when set to `true`. |
 | `shared_root` | `/var/www/shared` | Shared core, content, config, baseline, and release root. |
 | `keep_releases` | `3` | Number of WordPress core releases kept for rollback. |
-| `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest` or an exact version (e.g. `6.5.2`); passed to `wp core download --version=...` when pinned. |
+| `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest`, an exact version (e.g. `6.5.2`), or `nightly`; passed to `wp core download --version=...` when pinned. |
 | `php_version` | `8.4` | Default PHP version when the CLI/site does not specify one. |
 | `baseline_plugins` | `nginx-helper,redis-cache` | Comma-separated plugin slugs seeded during `init`. Fetched from WordPress.org unless the slug also appears in a GitHub/URL section. |
 | `baseline_theme` | `twentytwentyfour` | Theme slug seeded during `init`. Fetched from WordPress.org unless provided by a GitHub/URL section. |
@@ -135,7 +135,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 
 | Command | Purpose |
 | --- | --- |
-| `wo multitenancy init [--force]` | Create shared directories, download core, seed baseline plugins/themes, write `baseline.json` and `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe. |
+| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), seed baseline plugins/themes, write `baseline.json` and `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe. |
 | `wo multitenancy create <domain> [flags]` | Create a shared-core tenant. See [create options](#create-options). |
 | `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, clear caches, and bump the baseline version. `--force` skips the canary abort. |
 | `wo multitenancy rollback [--force]` | Switch `current` back to the previous release. `--force` skips confirmation. |
@@ -252,7 +252,7 @@ Per-site tree:
 
 ## Updates, rollback & baseline history
 
-Core update and rollback are atomic symlink operations. `update` builds a new `releases/wp-<timestamp>` tree and repoints `current`; `rollback` repoints `current` to the previous release. By default, `keep_releases = 3` keeps three releases for rollback.
+Core update and rollback are atomic symlink operations. `update` builds a new `releases/wp-<timestamp>` tree and repoints `current`; `rollback` repoints `current` to the previous release. By default, `keep_releases = 3` keeps three releases for rollback. When `wp_version` pins a version, `update` re-downloads that pinned version rather than the latest; change the pin or set it back to `latest` to move the core forward.
 
 Baseline changes are git-committed under `shared_root/.git`, with tracking limited to `config/baseline.json`. `history` shows recent baseline commits, and `baseline-rollback --to-version=N` checks out `baseline.json` from the commit for version `N` and commits that rollback.
 
