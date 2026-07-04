@@ -2508,6 +2508,10 @@ class BaselineApplicator:
                     for plugin_slug in plugins_to_deactivate:
                         Log.info(app, f"Deactivated plugin {plugin_slug} for {domain}")
             
+            BaselineApplicator.enable_object_cache_dropin(
+                app, domain, site_path, baseline
+            )
+
             result['success'] = True
             return result
             
@@ -2517,6 +2521,67 @@ class BaselineApplicator:
         except Exception as e:
             result['error'] = str(e)
             return result
+
+    @staticmethod
+    def enable_object_cache_dropin(app, domain, site_path, baseline):
+        """Enable the Object Cache Pro drop-in for a site.
+
+        Object Cache Pro ships its drop-in as a stub; WordPress only routes
+        caching through Redis once ``wp-content/object-cache.php`` exists.
+        ``WP_REDIS_CONFIG`` in ``wp-config.php`` is inert without it. Runs on
+        both create and apply, so new and existing sites converge.
+
+        Best-effort: any failure is logged as a warning and never aborts
+        baseline application or site provisioning.
+        """
+        if 'object-cache-pro' not in baseline.get('plugins', []):
+            return
+
+        dropin = os.path.join(site_path, 'wp-content', 'object-cache.php')
+
+        # --force overwrites an existing/stale drop-in (OCP errors without it
+        # once object-cache.php exists), making this safe to re-run. Skip the
+        # per-site flush: cache is empty on create and cleared globally on apply.
+        try:
+            enable_result = subprocess.run(
+                [
+                    'wp', 'redis', 'enable', '--force',
+                    '--skip-flush', '--skip-flush-notice',
+                    '--path=' + site_path,
+                    '--allow-root'
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        except Exception as e:
+            Log.warn(
+                app,
+                f"Could not enable Object Cache Pro drop-in for {domain}: {e}"
+            )
+            return
+
+        if enable_result.returncode != 0 or not os.path.exists(dropin):
+            Log.warn(
+                app,
+                f"Could not enable Object Cache Pro drop-in for {domain}: "
+                f"{(enable_result.stderr or enable_result.stdout).strip()}"
+            )
+            return
+
+        # wp-cli ran with --allow-root, so the drop-in is root-owned; the web
+        # server runs as www-data and must own it for later drop-in updates.
+        try:
+            shutil.chown(dropin, user='www-data', group='www-data')
+        except Exception as e:
+            Log.warn(
+                app,
+                f"Enabled Object Cache Pro drop-in for {domain} but could "
+                f"not set ownership: {e}"
+            )
+            return
+
+        Log.info(app, f"Enabled Object Cache Pro drop-in for {domain}")
     
     @staticmethod
     def apply_baseline_to_sites(app, config, baseline_version, dry_run=False, verbose=False, prune=False):

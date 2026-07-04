@@ -558,6 +558,246 @@ class BaselineApplicatorTests(unittest.TestCase):
         self.assertEqual(result, {'success': True, 'error': None})
 
 
+
+class ObjectCacheDropinTests(unittest.TestCase):
+
+    def setUp(self):
+        self.app = mock.Mock()
+        self.domain = 'example.com'
+        self.site_path = '/var/www/example.com/htdocs'
+        self.dropin = os.path.join(
+            self.site_path, 'wp-content', 'object-cache.php'
+        )
+
+    def _wp_result(self, returncode=0, stdout='', stderr=''):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _enable_cmd(self):
+        return [
+            'wp', 'redis', 'enable', '--force',
+            '--skip-flush', '--skip-flush-notice',
+            '--path=' + self.site_path,
+            '--allow-root',
+        ]
+
+    def test_gate_skips_when_ocp_not_in_baseline(self):
+        baseline = {'plugins': ['redis-cache'], 'theme': None, 'options': {}}
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run') as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.shutil.chown') as chown, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.path.exists') as exists, \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+        run.assert_not_called()
+        chown.assert_not_called()
+        exists.assert_not_called()
+
+    def test_enable_happy_path_runs_force_command_and_chowns(self):
+        baseline = {'plugins': ['object-cache-pro'], 'theme': None, 'options': {}}
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ) as chown, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=True,
+                ), \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+        run.assert_called_once_with(
+            self._enable_cmd(), capture_output=True, text=True, timeout=30
+        )
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ['wp', 'redis', 'enable'])
+        self.assertIn('--force', argv)
+        chown.assert_called_once_with(
+            self.dropin, user='www-data', group='www-data'
+        )
+
+    def test_enable_nonzero_returncode_is_nonfatal(self):
+        baseline = {'plugins': ['object-cache-pro'], 'theme': None, 'options': {}}
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(returncode=1, stderr='failed'),
+        ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ) as chown, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=True,
+                ), \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+        chown.assert_not_called()
+
+    def test_enable_missing_dropin_is_nonfatal(self):
+        baseline = {'plugins': ['object-cache-pro'], 'theme': None, 'options': {}}
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(),
+        ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ) as chown, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=False,
+                ), \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+        chown.assert_not_called()
+
+    def test_chown_failure_is_nonfatal(self):
+        baseline = {'plugins': ['object-cache-pro'], 'theme': None, 'options': {}}
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(),
+        ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown',
+                    side_effect=OSError('permission denied'),
+                ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=True,
+                ), \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+    def test_subprocess_exception_is_nonfatal(self):
+        baseline = {'plugins': ['object-cache-pro'], 'theme': None, 'options': {}}
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                side_effect=OSError('wp failed'),
+        ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ) as chown, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.path.exists'), \
+                mock.patch.object(BaselineApplicator, 'find_plugin_main_file'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            BaselineApplicator.enable_object_cache_dropin(
+                self.app, self.domain, self.site_path, baseline
+            )
+
+        chown.assert_not_called()
+
+    def test_apply_baseline_invokes_dropin_enable_with_force(self):
+        baseline = {
+            'plugins': ['object-cache-pro'],
+            'theme': None,
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'redis', 'enable']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                side_effect=run_wp,
+        ) as run, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=True,
+                ), \
+                mock.patch.object(
+                    BaselineApplicator,
+                    'find_plugin_main_file',
+                    return_value='object-cache-pro/object-cache-pro.php',
+                ), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'x.com', self.site_path, baseline, prune=False
+            )
+
+        self.assertEqual(result, {'success': True, 'error': None})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(self._enable_cmd(), commands)
+
+    def test_apply_baseline_success_even_if_dropin_enable_fails(self):
+        baseline = {
+            'plugins': ['object-cache-pro'],
+            'theme': None,
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'redis', 'enable']:
+                return self._wp_result(returncode=1, stderr='redis failed')
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                side_effect=run_wp,
+        ), \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.shutil.chown'
+                ) as chown, \
+                mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.os.path.exists',
+                    return_value=True,
+                ), \
+                mock.patch.object(
+                    BaselineApplicator,
+                    'find_plugin_main_file',
+                    return_value='object-cache-pro/object-cache-pro.php',
+                ), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.info'):
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'x.com', self.site_path, baseline, prune=False
+            )
+
+        self.assertEqual(result, {'success': True, 'error': None})
+        chown.assert_not_called()
 class BaselineApplicatorSitesTests(unittest.TestCase):
 
     def setUp(self):
