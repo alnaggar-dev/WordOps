@@ -2372,7 +2372,8 @@ class BaselineApplicator:
         return str(value), False
 
     @staticmethod
-    def apply_baseline_to_site(app, domain, site_path, baseline, prune=False):
+    def apply_baseline_to_site(app, domain, site_path, baseline, prune=False,
+                               cache_type=None):
         """Apply baseline configuration to a single site via WP-CLI"""
         
         result = {'success': False, 'error': None}
@@ -2512,6 +2513,15 @@ class BaselineApplicator:
                 app, domain, site_path, baseline
             )
 
+            if 'nginx-helper' in baseline.get('plugins', []):
+                BaselineApplicator.ensure_nginx_helper_caps(
+                    app, domain, site_path
+                )
+                if cache_type:
+                    BaselineApplicator.configure_nginx_helper(
+                        app, domain, site_path, cache_type
+                    )
+
             result['success'] = True
             return result
             
@@ -2521,6 +2531,121 @@ class BaselineApplicator:
         except Exception as e:
             result['error'] = str(e)
             return result
+
+    @staticmethod
+    def configure_nginx_helper(app, domain, site_path, cache_type):
+        """Enable Nginx Helper cache purging for FastCGI/Redis tenants.
+
+        The Nginx Helper plugin ships with purging disabled, so
+        rt_wp_nginx_helper_options must be seeded for cache purge to work.
+        Stock `wo site create` does this in site_functions.setupwordpress;
+        the shared-core create/apply path must do the same. cache_method
+        tracks the tenant cache type; cache types that do not use Nginx
+        Helper (wprocket/wpce/wpsc/basic) are skipped. Failures warn only.
+        """
+        cache_method = {
+            'wpfc': 'enable_fastcgi',
+            'wpredis': 'enable_redis',
+        }.get(cache_type)
+        if not cache_method:
+            return
+
+        helper_options = {
+            "log_level": "INFO",
+            "log_filesize": 5,
+            "enable_purge": 1,
+            "enable_map": "0",
+            "enable_log": 0,
+            "enable_stamp": 1,
+            "purge_homepage_on_new": 1,
+            "purge_homepage_on_edit": 1,
+            "purge_homepage_on_del": 1,
+            "purge_archive_on_new": 1,
+            "purge_archive_on_edit": 1,
+            "purge_archive_on_del": 1,
+            "purge_archive_on_new_comment": 0,
+            "purge_archive_on_deleted_comment": 0,
+            "purge_page_on_mod": 1,
+            "purge_page_on_new_comment": 1,
+            "purge_page_on_deleted_comment": 1,
+            "cache_method": cache_method,
+            "purge_method": "get_request",
+            "redis_hostname": "127.0.0.1",
+            "redis_port": "6379",
+            "redis_prefix": "nginx-cache:",
+        }
+
+        option_cmd = [
+            'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+            json.dumps(helper_options),
+            '--path=' + site_path,
+            '--allow-root',
+            '--format=json',
+        ]
+        try:
+            option_result = subprocess.run(
+                option_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            Log.warn(
+                app,
+                f"Failed to enable Nginx Helper purge for {domain}: {e}"
+            )
+            return
+        if option_result.returncode != 0:
+            Log.warn(
+                app,
+                f"Failed to enable Nginx Helper purge for {domain}: "
+                f"{option_result.stderr.strip()}"
+            )
+        else:
+            Log.debug(app, f"Enabled Nginx Helper purge for {domain}")
+
+    @staticmethod
+    def ensure_nginx_helper_caps(app, domain, site_path):
+        """Grant Nginx Helper's custom caps to the administrator role.
+
+        Nginx Helper 2.x gates cache purging and its settings page behind the
+        custom caps 'Nginx Helper | Purge cache' and 'Nginx Helper | Config'.
+        Its activation hook only grants them to the administrator role when
+        current_user_can('activate_plugins') is true, which never holds when the
+        plugin is activated through WP-CLI without a user context (as the
+        shared-core create/apply path does). Admins then hit "you do not have
+        the necessary privileges" on the purge button. Grant the caps
+        explicitly; `wp cap add` is idempotent, so this is safe on every apply.
+        """
+        for cap in ('Nginx Helper | Purge cache', 'Nginx Helper | Config'):
+            cap_cmd = [
+                'wp', 'cap', 'add', 'administrator', cap,
+                '--path=' + site_path,
+                '--allow-root',
+            ]
+            try:
+                cap_result = subprocess.run(
+                    cap_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                Log.warn(
+                    app,
+                    f"Failed to grant Nginx Helper cap '{cap}' for {domain}: {e}"
+                )
+                continue
+            if cap_result.returncode != 0:
+                Log.warn(
+                    app,
+                    f"Failed to grant Nginx Helper cap '{cap}' for {domain}: "
+                    f"{cap_result.stderr.strip()}"
+                )
+            else:
+                Log.debug(
+                    app, f"Ensured Nginx Helper cap '{cap}' for {domain}"
+                )
 
     @staticmethod
     def enable_object_cache_dropin(app, domain, site_path, baseline):
@@ -2604,7 +2729,8 @@ class BaselineApplicator:
         session = db_session
         sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
         production_sites = [
-            {'domain': s.domain, 'site_path': s.site_path} for s in sites
+            {'domain': s.domain, 'site_path': s.site_path,
+             'cache_type': s.cache_type} for s in sites
         ]
 
         if not production_sites:
@@ -2627,6 +2753,7 @@ class BaselineApplicator:
         for site in production_sites:
             domain = site['domain']
             site_path = site['site_path']
+            cache_type = site.get('cache_type')
             # DB site_path is the site root; WordPress (and wp-cli --path)
             # lives in <root>/htdocs.
             wp_path = os.path.join(site_path, 'htdocs')
@@ -2655,6 +2782,18 @@ class BaselineApplicator:
                     f"theme={baseline.get('theme', '')}, "
                     f"options={','.join(option_names)})"
                 )
+                if 'nginx-helper' in baseline.get('plugins', []):
+                    Log.info(
+                        app,
+                        f"  [dry-run] would grant Nginx Helper admin "
+                        f"capabilities for {domain}"
+                    )
+                    if cache_type in ('wpfc', 'wpredis'):
+                        Log.info(
+                            app,
+                            f"  [dry-run] would enable Nginx Helper purge "
+                            f"(cache_type={cache_type}) for {domain}"
+                        )
                 if prune:
                     Log.info(
                         app,
@@ -2673,6 +2812,7 @@ class BaselineApplicator:
             start = _time.monotonic()
             result = BaselineApplicator.apply_baseline_to_site(
                 app, domain, wp_path, baseline, prune=prune,
+                cache_type=cache_type,
             )
             dur = int((_time.monotonic() - start) * 1000)
 

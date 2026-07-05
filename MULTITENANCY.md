@@ -196,7 +196,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | Command | Purpose |
 | --- | --- |
 | `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe but never overwrites an existing baseline. |
-| `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. See [create options](#create-options). |
+| `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. For `--wpfc`/`--wpredis` sites that include `nginx-helper` in the baseline, it also enables Nginx Helper cache purging automatically. See [create options](#create-options). |
 | `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, and clear caches. `--force` skips the canary abort. This command does not bump the baseline version. |
 | `wo multitenancy rollback [--force]` | Switch `current` back to the previous release. `--force` skips confirmation. |
 | `wo multitenancy delete <domain> [--force]` | Delete a tenant with `wo site delete ... --no-prompt`, then remove its multi-tenancy tracking row. |
@@ -222,7 +222,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `wo multitenancy update-plugin <slug>` | Re-fetch a plugin from its original source. |
 | `wo multitenancy update-theme` | Re-fetch the configured baseline theme from its original source. Takes no slug. |
 | `wo multitenancy set-theme <slug> [--apply-now]` | Set an already-present shared theme as the baseline default, commit it, and optionally apply. |
-| `wo multitenancy apply [--dry-run] [--prune] [--verbose]` | Apply the current baseline to every enabled site by activating plugins, activating the theme, and updating `options` through wp-cli. Default behavior is additive: plugins already active but absent from the baseline stay active. `--prune` is destructive and deactivates active plugins not listed in `baseline.json`; run `--dry-run --prune` first to see the exact would-be-deactivated set. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. |
+| `wo multitenancy apply [--dry-run] [--prune] [--verbose]` | Apply the current baseline to every enabled site by activating plugins, activating the theme, and updating `options` through wp-cli. Default behavior is additive: plugins already active but absent from the baseline stay active. `--prune` is destructive and deactivates active plugins not listed in `baseline.json`; run `--dry-run --prune` first to see the exact would-be-deactivated set. For `--wpfc`/`--wpredis` sites with `nginx-helper` in the baseline, it also (re)enables Nginx Helper cache purging. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. |
 | `wo multitenancy history` | Show the last 20 git commits of `config/baseline.json`. |
 | `wo multitenancy baseline-rollback --to-version=N [--apply-now] [--force]` | Find the git commit for baseline version `N`, check out `baseline.json` from it, commit the rollback, and optionally apply to sites. |
 
@@ -261,6 +261,8 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `--admin-email` | WordPress admin email. Falls back to `admin_email` in config. |
 
 If no PHP flag is passed, the default comes from `php_version` in config, which defaults to 8.4. If no cache flag is passed, the site is created with basic/no cache. SSL is `-le` or `--letsencrypt`; a copied `—le` with an em dash causes `unrecognized arguments`.
+
+Cache purging is automatic: when a site uses `--wpfc` or `--wpredis` and `nginx-helper` is in the baseline `plugins`, both `create` and `apply` seed the Nginx Helper option `rt_wp_nginx_helper_options` with purging enabled and the matching cache method (`enable_fastcgi` or `enable_redis`). Because Nginx Helper 2.3.4+ also gates the purge button behind a custom capability that WP-CLI plugin activation does not grant (activation only adds it for a logged-in admin), `create` and `apply` additionally grant the `Nginx Helper | Purge cache` and `Nginx Helper | Config` capabilities to the administrator role whenever `nginx-helper` is in the baseline — without this the button reports "you do not have the necessary privileges" even with purge enabled. You no longer need to open wp-admin → Nginx Helper and tick "Enable Purge" per site. To retrofit sites created before this behavior, run `wo multitenancy apply`.
 
 `--force` and `--shared` are accepted globally, but `create` ignores them. A created multi-tenancy site always uses shared core. There is no command to convert an existing standalone WordPress site onto the shared core; shared-core sites must be created fresh with `create`.
 

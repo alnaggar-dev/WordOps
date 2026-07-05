@@ -7,6 +7,7 @@ render context. Run with:
     python3 -m unittest tests.cli.40_test_multitenancy -v
 """
 
+import contextlib
 import io
 import json
 import os
@@ -108,6 +109,80 @@ class MultitenancyTests(unittest.TestCase):
         self.assertNotIn('has_admin_ips', ctx)
         self.assertNotIn('admin_ips_regex', ctx)
         self.assertEqual(ctx.get('retry_after_seconds'), 600)
+
+    def test_create_forwards_computed_cache_type_to_baseline_apply(self):
+        """create threads the tenant cache type into baseline activation."""
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+        cache_type = 'wpfc'
+        domain = 'example.com'
+        shared_root = '/var/www/shared'
+        baseline = {'plugins': ['nginx-helper'], 'theme': 't', 'options': {}}
+        pargs = mock.Mock()
+        pargs.site_name = domain
+        pargs.letsencrypt = False
+        pargs.admin_user = 'admin'
+        pargs.admin_email = 'admin@example.com'
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+
+        with contextlib.ExitStack() as stack:
+            for method in ('info', 'warn', 'error', 'debug'):
+                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+            stack.enter_context(mock.patch.object(mt.WODomain, 'validate', return_value=domain))
+            stack.enter_context(mock.patch.object(mt, 'check_domain_exists', return_value=False))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'load_config',
+                return_value={'shared_root': shared_root, 'admin_email': 'fallback@example.com'},
+            ))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_php_version', return_value='8.4'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_cache_type', return_value=cache_type))
+            stack.enter_context(mock.patch.object(mt, 'site_package_check'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_site_directories'))
+            stack.enter_context(mock.patch.object(
+                mt,
+                'setupdatabase',
+                return_value={
+                    'wo_db_name': 'db',
+                    'wo_db_user': 'user',
+                    'wo_db_pass': 'pass',
+                    'wo_db_host': 'localhost',
+                },
+            ))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_shared_symlinks'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'generate_redis_prefix', return_value='wp_example_'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_baseline_version', return_value=7))
+            stack.enter_context(mock.patch.object(mt.os.path, 'exists', return_value=True))
+            stack.enter_context(mock.patch('builtins.open', mock.mock_open(read_data='{}')))
+            stack.enter_context(mock.patch.object(mt.json, 'load', return_value=baseline))
+            apply_baseline = stack.enter_context(mock.patch.object(
+                mt.BaselineApplicator,
+                'apply_baseline_to_site',
+                return_value={'success': True, 'error': None},
+            ))
+            stack.enter_context(mock.patch.object(mt, 'setwebrootpermissions'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'validate_nginx_config', return_value=True))
+            stack.enter_context(mock.patch.object(mt.WOFileUtils, 'create_symlink'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'safe_nginx_reload', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_current_release', return_value='current'))
+            stack.enter_context(mock.patch.object(mt, 'addNewSite'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'add_shared_site'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'update_site_baseline'))
+            stack.enter_context(mock.patch.object(mt.WOGit, 'add'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_admin_password', return_value='secret'))
+
+            ctrl._create_impl()
+
+        apply_baseline.assert_called_once()
+        self.assertEqual(apply_baseline.call_args.kwargs['cache_type'], cache_type)
+
 
     def test_load_config_parses_wordpress_sources_without_legacy_defaults(self):
         """Source sections parse independently; removed legacy baseline keys stay absent."""
@@ -417,6 +492,361 @@ class BaselineApplicatorTests(unittest.TestCase):
 
     def _wp_result(self, returncode=0, stdout='', stderr=''):
         return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _assert_nginx_helper_update(self, run, expected_cache_method):
+        run.assert_called_once()
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:4], [
+            'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+        ])
+        self.assertEqual(cmd[5:], [
+            '--path=' + self.site_path, '--allow-root', '--format=json',
+        ])
+        payload = json.loads(cmd[4])
+        self.assertEqual(payload['enable_purge'], 1)
+        self.assertEqual(payload['cache_method'], expected_cache_method)
+        self.assertEqual(payload['purge_method'], 'get_request')
+
+    def _nginx_helper_update_commands(self, run):
+        return [
+            call.args[0] for call in run.call_args_list
+            if call.args[0][:4] == [
+                'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+            ]
+        ]
+
+    def _nginx_helper_cap_commands(self, run):
+        return [
+            call.args[0] for call in run.call_args_list
+            if call.args[0][:3] == ['wp', 'cap', 'add']
+        ]
+
+    def test_ensure_nginx_helper_caps_grants_required_administrator_caps(self):
+        """Nginx Helper caps are granted through exact WP-CLI cap-add calls."""
+        expected_commands = [
+            [
+                'wp', 'cap', 'add', 'administrator',
+                'Nginx Helper | Purge cache',
+                '--path=' + self.site_path, '--allow-root',
+            ],
+            [
+                'wp', 'cap', 'add', 'administrator',
+                'Nginx Helper | Config',
+                '--path=' + self.site_path, '--allow-root',
+            ],
+        ]
+
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch('wo.core.logging.Log.debug'):
+            BaselineApplicator.ensure_nginx_helper_caps(
+                self.app, 'example.com', self.site_path
+            )
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    expected_commands[0],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
+                mock.call(
+                    expected_commands[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
+            ],
+        )
+
+    def test_ensure_nginx_helper_caps_warns_and_continues_on_failed_cap_add(self):
+        """Rejected cap grants warn but do not abort remaining Nginx Helper caps."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                side_effect=[
+                    self._wp_result(returncode=1, stderr='denied'),
+                    self._wp_result(),
+                ],
+        ) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            BaselineApplicator.ensure_nginx_helper_caps(
+                self.app, 'example.com', self.site_path
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                [
+                    'wp', 'cap', 'add', 'administrator',
+                    'Nginx Helper | Purge cache',
+                    '--path=' + self.site_path, '--allow-root',
+                ],
+                [
+                    'wp', 'cap', 'add', 'administrator',
+                    'Nginx Helper | Config',
+                    '--path=' + self.site_path, '--allow-root',
+                ],
+            ],
+        )
+        log_warn.assert_called_once()
+
+    def test_ensure_nginx_helper_caps_warns_and_continues_on_timeout(self):
+        """WP-CLI cap-add exceptions are warn-only and the second cap is still tried."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                side_effect=mtf.subprocess.TimeoutExpired('wp', 30),
+        ) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            BaselineApplicator.ensure_nginx_helper_caps(
+                self.app, 'example.com', self.site_path
+            )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(log_warn.call_count, 2)
+
+    def test_ensure_nginx_helper_caps_propagates_unexpected_subprocess_errors(self):
+        """Unexpected subprocess errors must not be hidden by cap grant warnings."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                side_effect=ValueError('boom'),
+        ):
+            with self.assertRaises(ValueError):
+                BaselineApplicator.ensure_nginx_helper_caps(
+                    self.app, 'example.com', self.site_path
+                )
+
+
+    def test_configure_nginx_helper_wpfc_updates_purge_options(self):
+        """FastCGI tenants get Nginx Helper purge enabled via WP-CLI JSON."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch('wo.core.logging.Log.debug'):
+            BaselineApplicator.configure_nginx_helper(
+                self.app, 'example.com', self.site_path, 'wpfc'
+            )
+
+        self._assert_nginx_helper_update(run, 'enable_fastcgi')
+
+    def test_configure_nginx_helper_wpredis_uses_redis_cache_method(self):
+        """Redis tenants select the Redis Nginx Helper cache backend."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch('wo.core.logging.Log.debug'):
+            BaselineApplicator.configure_nginx_helper(
+                self.app, 'example.com', self.site_path, 'wpredis'
+            )
+
+        self._assert_nginx_helper_update(run, 'enable_redis')
+
+    def test_configure_nginx_helper_skips_non_nginx_helper_cache_types(self):
+        """Cache types that do not purge through Nginx Helper do no WP-CLI work."""
+        for cache_type in ('basic', 'wprocket', None):
+            with self.subTest(cache_type=cache_type), \
+                    mock.patch.object(mtf.subprocess, 'run') as run:
+                BaselineApplicator.configure_nginx_helper(
+                    self.app, 'example.com', self.site_path, cache_type
+                )
+
+            run.assert_not_called()
+
+    def test_configure_nginx_helper_warns_and_returns_on_failed_wp_cli_update(self):
+        """A rejected helper option update warns but does not raise."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                return_value=self._wp_result(returncode=1, stderr='rejected'),
+        ), \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            BaselineApplicator.configure_nginx_helper(
+                self.app, 'example.com', self.site_path, 'wpfc'
+            )
+
+        log_warn.assert_called_once()
+
+    def test_configure_nginx_helper_catches_timeout_and_warns(self):
+        """WP-CLI timeout while seeding helper options is warn-only."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                side_effect=mtf.subprocess.TimeoutExpired('wp', 30),
+        ), \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            BaselineApplicator.configure_nginx_helper(
+                self.app, 'example.com', self.site_path, 'wpfc'
+            )
+
+        log_warn.assert_called_once()
+
+    def test_configure_nginx_helper_propagates_unexpected_subprocess_errors(self):
+        """Unexpected subprocess errors must not be hidden while configuring purge."""
+        with mock.patch.object(
+                mtf.subprocess,
+                'run',
+                side_effect=ValueError('boom'),
+        ):
+            with self.assertRaises(ValueError):
+                BaselineApplicator.configure_nginx_helper(
+                    self.app, 'example.com', self.site_path, 'wpfc'
+                )
+
+    def test_apply_baseline_to_site_configures_nginx_helper_for_wpfc_baseline(self):
+        """Applying a wpfc baseline with nginx-helper enables purge and stays successful."""
+        baseline = {
+            'plugins': ['nginx-helper'],
+            'theme': '',
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:4] == [
+                    'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+            ]:
+                return self._wp_result()
+            if cmd[:4] == ['wp', 'cap', 'add', 'administrator']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               return_value='nginx-helper/nginx-helper.php'), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app,
+                'example.com',
+                self.site_path,
+                baseline,
+                cache_type='wpfc',
+            )
+
+        self.assertEqual(result, {'success': True, 'error': None})
+        nginx_helper_commands = self._nginx_helper_update_commands(run)
+        self.assertEqual(len(nginx_helper_commands), 1)
+        payload = json.loads(nginx_helper_commands[0][4])
+        self.assertEqual(payload['enable_purge'], 1)
+        self.assertEqual(payload['cache_method'], 'enable_fastcgi')
+        self.assertEqual(payload['purge_method'], 'get_request')
+        self.assertEqual(self._nginx_helper_cap_commands(run), [
+            [
+                'wp', 'cap', 'add', 'administrator',
+                'Nginx Helper | Purge cache',
+                '--path=' + self.site_path, '--allow-root',
+            ],
+            [
+                'wp', 'cap', 'add', 'administrator',
+                'Nginx Helper | Config',
+                '--path=' + self.site_path, '--allow-root',
+            ],
+        ])
+
+    def test_apply_baseline_to_site_nginx_helper_gates_options_and_caps_separately(self):
+        """Option updates require plugin plus cache type; caps require only the plugin."""
+        cases = [
+            ('plugin_absent', {'plugins': ['kept-plugin'], 'theme': '', 'options': {}}, 'wpfc'),
+            ('cache_type_missing', {'plugins': ['nginx-helper'], 'theme': '', 'options': {}}, None),
+        ]
+
+        for name, baseline, cache_type in cases:
+            with self.subTest(name=name):
+                def run_wp(cmd, **kwargs):
+                    if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                        return self._wp_result(stdout='[]')
+                    if cmd[:3] == ['wp', 'plugin', 'activate']:
+                        return self._wp_result()
+                    if cmd[:4] == [
+                            'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+                    ]:
+                        self.fail('nginx-helper purge must not be configured')
+                    if cmd[:4] == ['wp', 'cap', 'add', 'administrator']:
+                        return self._wp_result()
+                    self.fail(f'unexpected wp command: {cmd!r}')
+
+                with mock.patch.object(
+                        BaselineApplicator,
+                        'find_plugin_main_file',
+                        side_effect=lambda site_path, slug: f'{slug}/{slug}.php',
+                ), \
+                        mock.patch.object(mtf.subprocess, 'run',
+                                          side_effect=run_wp) as run:
+                    result = BaselineApplicator.apply_baseline_to_site(
+                        self.app,
+                        'example.com',
+                        self.site_path,
+                        baseline,
+                        cache_type=cache_type,
+                    )
+
+                self.assertEqual(result, {'success': True, 'error': None})
+                self.assertEqual(self._nginx_helper_update_commands(run), [])
+                if name == 'plugin_absent':
+                    self.assertEqual(self._nginx_helper_cap_commands(run), [])
+                else:
+                    self.assertEqual(self._nginx_helper_cap_commands(run), [
+                        [
+                            'wp', 'cap', 'add', 'administrator',
+                            'Nginx Helper | Purge cache',
+                            '--path=' + self.site_path, '--allow-root',
+                        ],
+                        [
+                            'wp', 'cap', 'add', 'administrator',
+                            'Nginx Helper | Config',
+                            '--path=' + self.site_path, '--allow-root',
+                        ],
+                    ])
+
+    def test_apply_baseline_to_site_success_when_nginx_helper_update_fails(self):
+        """A failed helper option update warns but does not fail the baseline apply."""
+        baseline = {
+            'plugins': ['nginx-helper'],
+            'theme': '',
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:4] == [
+                    'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+            ]:
+                return self._wp_result(returncode=1, stderr='rejected')
+            if cmd[:4] == ['wp', 'cap', 'add', 'administrator']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               return_value='nginx-helper/nginx-helper.php'), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp), \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app,
+                'example.com',
+                self.site_path,
+                baseline,
+                cache_type='wpfc',
+            )
+
+        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertTrue(log_warn.called)
 
     def test_apply_baseline_to_site_updates_options_and_continues_after_option_failure(self):
         """options are serialized for WP-CLI; one failed option only logs and does not roll back."""
@@ -825,6 +1255,159 @@ class BaselineApplicatorSitesTests(unittest.TestCase):
         query.all.return_value = [site]
         query.first.return_value = site
         return session
+
+    def _write_baseline(self, baseline):
+        with open(os.path.join(self.tmp, 'config', 'baseline.json'), 'w') as fh:
+            json.dump(baseline, fh)
+
+    def _enabled_site_from_session(self, session):
+        return session.query.return_value.filter_by.return_value.all.return_value[0]
+
+    def test_apply_baseline_to_sites_passes_db_cache_type_to_site_apply(self):
+        """Each DB row's cache_type is threaded into per-site baseline apply."""
+        session = self._session_with_enabled_site()
+        self._enabled_site_from_session(session).cache_type = 'wpfc'
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(
+                    BaselineApplicator,
+                    'apply_baseline_to_site',
+                    return_value={'success': True, 'error': None},
+                ) as apply_site, \
+                mock.patch('wo.core.shellexec.WOShellExec.cmd_exec'), \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app, self.config, baseline_version=7,
+            )
+
+        self.assertEqual(result['succeeded'], 1)
+        apply_site.assert_called_once()
+        self.assertEqual(apply_site.call_args.kwargs['cache_type'], 'wpfc')
+
+    def test_apply_baseline_to_sites_dry_run_reports_nginx_helper_purge(self):
+        """Dry-run previews caps and purge for wpfc/nginx-helper sites."""
+        self._write_baseline({
+            'plugins': ['nginx-helper'],
+            'theme': '',
+            'options': {},
+        })
+        session = self._session_with_enabled_site()
+        self._enabled_site_from_session(session).cache_type = 'wpfc'
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(BaselineApplicator, 'apply_baseline_to_site') as apply_site, \
+                mock.patch('wo.core.shellexec.WOShellExec.cmd_exec') as cmd_exec, \
+                mock.patch('wo.core.logging.Log.info') as log_info, \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app,
+                self.config,
+                baseline_version=7,
+                dry_run=True,
+            )
+
+        messages = [call.args[1] for call in log_info.call_args_list]
+        self.assertEqual(result['status'], 'dry_run')
+        apply_site.assert_not_called()
+        cmd_exec.assert_not_called()
+        self.assertTrue(
+            any(
+                'would grant Nginx Helper admin capabilities' in message
+                for message in messages
+            ),
+            'dry-run must announce Nginx Helper capability grants',
+        )
+        self.assertTrue(
+            any(
+                'would enable Nginx Helper purge' in message
+                for message in messages
+            ),
+            'dry-run must announce Nginx Helper purge enablement',
+        )
+
+    def test_apply_baseline_to_sites_dry_run_reports_nginx_helper_caps_for_basic_cache(self):
+        """Dry-run previews caps for nginx-helper even when purge is not enabled."""
+        self._write_baseline({
+            'plugins': ['nginx-helper'],
+            'theme': '',
+            'options': {},
+        })
+        session = self._session_with_enabled_site()
+        self._enabled_site_from_session(session).cache_type = 'basic'
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(BaselineApplicator, 'apply_baseline_to_site') as apply_site, \
+                mock.patch('wo.core.shellexec.WOShellExec.cmd_exec') as cmd_exec, \
+                mock.patch('wo.core.logging.Log.info') as log_info, \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app,
+                self.config,
+                baseline_version=7,
+                dry_run=True,
+            )
+
+        messages = [call.args[1] for call in log_info.call_args_list]
+        self.assertEqual(result['status'], 'dry_run')
+        apply_site.assert_not_called()
+        cmd_exec.assert_not_called()
+        self.assertTrue(
+            any(
+                'would grant Nginx Helper admin capabilities' in message
+                for message in messages
+            ),
+            'dry-run must announce Nginx Helper capability grants',
+        )
+        self.assertFalse(
+            any(
+                'would enable Nginx Helper purge' in message
+                for message in messages
+            ),
+            'dry-run must not announce purge for non-purge cache types',
+        )
+
+    def test_apply_baseline_to_sites_dry_run_omits_nginx_helper_preview_without_plugin(self):
+        """Dry-run does not preview nginx-helper work when the plugin is absent."""
+        self._write_baseline({
+            'plugins': ['kept-plugin'],
+            'theme': '',
+            'options': {},
+        })
+        session = self._session_with_enabled_site()
+        self._enabled_site_from_session(session).cache_type = 'wpfc'
+
+        with mock.patch('wo.core.database.db_session', session), \
+                mock.patch.object(BaselineApplicator, 'apply_baseline_to_site') as apply_site, \
+                mock.patch('wo.core.shellexec.WOShellExec.cmd_exec') as cmd_exec, \
+                mock.patch('wo.core.logging.Log.info') as log_info, \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_sites(
+                self.app,
+                self.config,
+                baseline_version=7,
+                dry_run=True,
+            )
+
+        messages = [call.args[1] for call in log_info.call_args_list]
+        self.assertEqual(result['status'], 'dry_run')
+        apply_site.assert_not_called()
+        cmd_exec.assert_not_called()
+        self.assertFalse(
+            any(
+                'would grant Nginx Helper admin capabilities' in message
+                for message in messages
+            ),
+            'dry-run must not announce Nginx Helper caps without the plugin',
+        )
+        self.assertFalse(
+            any(
+                'would enable Nginx Helper purge' in message
+                for message in messages
+            ),
+            'dry-run must not announce Nginx Helper purge without the plugin',
+        )
 
     def test_apply_baseline_to_sites_passes_htdocs_path_to_site_apply(self):
         """DB site_path is the site root; apply uses the WordPress htdocs dir."""

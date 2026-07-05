@@ -352,7 +352,8 @@ class WOMultitenancyController(CementBaseController):
                         )
                     Log.info(self, "Applying baseline configuration...")
                     baseline_result = BaselineApplicator.apply_baseline_to_site(
-                        self, wo_domain, site_htdocs, baseline, prune=False
+                        self, wo_domain, site_htdocs, baseline, prune=False,
+                        cache_type=cache_type
                     )
                     if not baseline_result.get('success'):
                         Log.warn(
