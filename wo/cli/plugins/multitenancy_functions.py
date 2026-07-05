@@ -798,6 +798,60 @@ server {{
             raise
 
     @staticmethod
+    def purge_site_cache(app, domain, redis_prefix=None):
+        """Purge a tenant's stale caches so a (re)created domain never inherits them.
+
+        The nginx FastCGI page cache (keyed by ``$scheme$request_method$host``)
+        and the Redis object cache (keyed by the per-site prefix) both survive
+        ``wo multitenancy delete`` and key deterministically on the domain.
+        Recreating the same domain would otherwise serve the previous
+        incarnation's cached pages/options -- e.g. stale plain-permalink HTML
+        even when the database is correct. Best-effort and strictly
+        tenant-scoped: never flushes the shared Redis database or other tenants'
+        page cache.
+        """
+        import re
+        # nginx FastCGI page cache: each cache file stores
+        # "KEY: <scheme>GET<host><uri>". Matching GET<host> (page bodies never
+        # contain that literal) removes every cached URI for this domain only.
+        cache_dir = '/var/run/nginx-cache'
+        if os.path.isdir(cache_dir):
+            try:
+                found = subprocess.run(
+                    ['grep', '-rlaE', 'GET(www\\.)?' + re.escape(domain), cache_dir],
+                    capture_output=True, text=True, timeout=30
+                )
+                files = [f for f in found.stdout.splitlines() if f]
+                for path in files:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                if files:
+                    Log.debug(
+                        app, f"Purged {len(files)} FastCGI cache entries for {domain}")
+            except Exception as e:
+                Log.debug(app, f"FastCGI cache purge for {domain} failed: {e}")
+        # Redis object cache: delete only this tenant's prefixed keys.
+        if redis_prefix:
+            try:
+                scan = subprocess.run(
+                    ['redis-cli', '--scan', '--pattern', redis_prefix + '*'],
+                    capture_output=True, text=True, timeout=30
+                )
+                keys = [k for k in scan.stdout.splitlines() if k]
+                for i in range(0, len(keys), 500):
+                    subprocess.run(
+                        ['redis-cli', 'unlink', *keys[i:i + 500]],
+                        capture_output=True, text=True, timeout=30
+                    )
+                if keys:
+                    Log.debug(
+                        app, f"Purged {len(keys)} Redis object-cache keys for {redis_prefix}")
+            except Exception as e:
+                Log.debug(app, f"Redis object-cache purge for {redis_prefix} failed: {e}")
+
+    @staticmethod
     def get_admin_password(app, domain):
         """Retrieve admin password for a site"""
         pass_file = f"/var/www/{domain}/.admin_pass"

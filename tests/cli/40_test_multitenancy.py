@@ -100,6 +100,7 @@ class MultitenancyTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'purge_site_cache'))
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_baseline_version', return_value=7))
             stack.enter_context(mock.patch.object(mt.os.path, 'exists', return_value=True))
             stack.enter_context(mock.patch('builtins.open', mock.mock_open(read_data='{}')))
@@ -617,6 +618,108 @@ class InstallWordpressPermalinkTests(unittest.TestCase):
         )
         self.assertLess(core_index, permalink_index)
         set_permalink.assert_called_once_with(app, 'example.com', site_htdocs)
+
+
+class PurgeSiteCacheTests(unittest.TestCase):
+    """MTFunctions.purge_site_cache: tenant-scoped, best-effort cache purge."""
+
+    def test_fastcgi_purge_greps_and_removes_matching_cache_files(self):
+        found = mock.Mock(
+            returncode=0,
+            stdout='/var/run/nginx-cache/a\n/var/run/nginx-cache/b\n',
+            stderr='',
+        )
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=True), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', return_value=found) as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.remove') as rm, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            MTFunctions.purge_site_cache(mock.Mock(), 'example.com')
+
+        argv = run.call_args_list[0].args[0]
+        self.assertEqual(argv[0], 'grep')
+        self.assertEqual(argv[-1], '/var/run/nginx-cache')
+        self.assertIn('GET', argv[2])
+        self.assertIn('example\\.com', argv[2])  # re.escape'd domain in the KEY pattern
+        self.assertEqual(
+            sorted(c.args[0] for c in rm.call_args_list),
+            ['/var/run/nginx-cache/a', '/var/run/nginx-cache/b'],
+        )
+
+    def test_fastcgi_skipped_when_cache_dir_absent(self):
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=False), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run') as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.remove') as rm, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            MTFunctions.purge_site_cache(mock.Mock(), 'example.com')  # no redis_prefix
+        run.assert_not_called()
+        rm.assert_not_called()
+
+    def test_redis_purge_scans_by_prefix_and_unlinks_only_those_keys(self):
+        scan = mock.Mock(returncode=0, stdout='example_com_k1\nexample_com_k2\n', stderr='')
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ['redis-cli', '--scan']:
+                return scan
+            return mock.Mock(returncode=0, stdout='', stderr='')
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=False), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=fake_run), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            MTFunctions.purge_site_cache(mock.Mock(), 'example.com', redis_prefix='example_com_')
+
+        self.assertIn(['redis-cli', '--scan', '--pattern', 'example_com_*'], calls)
+        unlink = [c for c in calls if c[:2] == ['redis-cli', 'unlink']]
+        self.assertEqual(len(unlink), 1)
+        self.assertEqual(unlink[0], ['redis-cli', 'unlink', 'example_com_k1', 'example_com_k2'])
+
+    def test_purge_is_best_effort_on_subprocess_error(self):
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=True), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=OSError('boom')), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            # Best-effort: a failing purge must never abort provisioning.
+            MTFunctions.purge_site_cache(mock.Mock(), 'example.com', redis_prefix='example_com_')
+
+
+class MultitenancyDeleteCacheTests(unittest.TestCase):
+    """`wo multitenancy delete` purges the domain's caches only on success."""
+
+    def _run_delete(self, returncode):
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        pargs = mock.Mock()
+        pargs.site_name = 'example.com'
+        pargs.force = True
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+        site = mock.Mock()
+        site.redis_prefix = 'example_com_'
+        session = mock.Mock()
+        session.query.return_value.filter_by.return_value.first.return_value = site
+        with contextlib.ExitStack() as stack:
+            for method in ('info', 'warn', 'error', 'debug'):
+                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch('wo.core.database.db_session', session))
+            stack.enter_context(mock.patch.object(mt.os.path, 'isdir', return_value=False))
+            stack.enter_context(mock.patch.object(
+                mt.subprocess, 'run',
+                return_value=mock.Mock(returncode=returncode, stdout='', stderr='err'),
+            ))
+            purge = stack.enter_context(mock.patch.object(mt.MTFunctions, 'purge_site_cache'))
+            ctrl._delete_impl()
+        return purge, ctrl
+
+    def test_delete_purges_cache_on_success(self):
+        purge, ctrl = self._run_delete(returncode=0)
+        purge.assert_called_once_with(ctrl, 'example.com', 'example_com_')
+
+    def test_delete_skips_purge_when_site_delete_fails(self):
+        purge, ctrl = self._run_delete(returncode=1)
+        purge.assert_not_called()
+
 
 class BaselineApplicatorTests(unittest.TestCase):
 

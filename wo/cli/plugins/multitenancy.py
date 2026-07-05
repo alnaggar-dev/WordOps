@@ -307,6 +307,12 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Generating Redis cache prefix...")
             redis_prefix = MTDatabase.generate_redis_prefix(self, wo_domain)
             Log.debug(self, f"Redis prefix for {wo_domain}: {redis_prefix}")
+
+            # A previous site with this exact domain leaves FastCGI page-cache
+            # entries and Redis object-cache keys behind (delete does not purge
+            # them, and both key on the domain). Clear them now so this fresh
+            # site never serves the old incarnation's cached pages/options.
+            MTFunctions.purge_site_cache(self, wo_domain, redis_prefix)
             
             # ================================================================
             # Generate wp-config.php with Redis prefix and shared config
@@ -940,6 +946,12 @@ class WOMultitenancyController(CementBaseController):
         finally:
             if preserve_cert and os.path.isdir(cert_stash):
                 os.rename(cert_stash, cert_store)
+
+        # `wo site delete` leaves the FastCGI page cache and Redis object-cache
+        # keys behind (both key on the domain); purge them so a future recreate
+        # of this domain never inherits stale pages/options.
+        MTFunctions.purge_site_cache(
+            self, domain, getattr(site, 'redis_prefix', None))
 
         # Remove from multitenancy tracking
         try:
