@@ -759,19 +759,44 @@ server {{
             Log.error(app, f"Failed to install WordPress: {e.stderr}")
             raise
 
-        # Set permalink structure to Post name (matches wo site create default)
+        # Force the permalink into the DB before the object-cache drop-in
+        # exists, so update_option writes the row regardless of any value
+        # cached under this tenant's Redis prefix. _create_impl re-runs this
+        # after baseline to refresh the cache.
+        MTFunctions.set_permalink_structure(app, domain, site_htdocs)
+    
+    @staticmethod
+    def set_permalink_structure(app, domain, site_htdocs):
+        """Set the WordPress permalink structure to Post name.
+
+        Run twice per site create, by design:
+
+        * From ``install_wordpress`` before the Object Cache Pro drop-in
+          exists, so ``update_option`` compares against the DB (no cache) and
+          guarantees the ``permalink_structure`` row is Post name even if a
+          stale value is cached under this tenant's Redis prefix.
+        * From ``_create_impl`` after baseline enables the drop-in with
+          ``--skip-flush``, so the write routes through the now-active object
+          cache and overwrites any stale ``permalink_structure`` /
+          ``rewrite_rules``. A cache flush is unsafe here: all tenants share one
+          Redis database, so flushing would evict every tenant's cache.
+
+        Raises on failure to surface a broken wp-cli setup.
+        """
         try:
-            rewrite_cmd = [
-                'wp', 'rewrite', 'structure', '/%postname%/',
-                '--allow-root'
-            ]
-            subprocess.run(rewrite_cmd, cwd=site_htdocs,
-                           capture_output=True, text=True, check=True)
+            subprocess.run(
+                [
+                    'wp', 'rewrite', 'structure', '/%postname%/',
+                    '--path=' + site_htdocs,
+                    '--allow-root'
+                ],
+                capture_output=True, text=True, check=True
+            )
             Log.debug(app, f"Permalink structure set to Post name for {domain}")
         except subprocess.CalledProcessError as e:
             Log.error(app, f"Failed to set permalink structure: {e.stderr}")
             raise
-    
+
     @staticmethod
     def get_admin_password(app, domain):
         """Retrieve admin password for a site"""

@@ -54,6 +54,86 @@ class MultitenancyTests(unittest.TestCase):
         with open(os.path.join(cfg_dir, 'wp-config-shared.php'), 'w') as fh:
             fh.write(content)
 
+
+    def _run_create_impl_with_mocks(self, cache_type='wpfc', baseline=None, manager=None):
+        domain = 'example.com'
+        shared_root = '/var/www/shared'
+        if baseline is None:
+            baseline = {'plugins': ['nginx-helper'], 'theme': 't', 'options': {}}
+        pargs = mock.Mock()
+        pargs.site_name = domain
+        pargs.letsencrypt = False
+        pargs.admin_user = 'admin'
+        pargs.admin_email = 'admin@example.com'
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+
+        with contextlib.ExitStack() as stack:
+            for method in ('info', 'warn', 'error', 'debug'):
+                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+            stack.enter_context(mock.patch.object(mt.WODomain, 'validate', return_value=domain))
+            stack.enter_context(mock.patch.object(mt, 'check_domain_exists', return_value=False))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'load_config',
+                return_value={'shared_root': shared_root, 'admin_email': 'fallback@example.com'},
+            ))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_php_version', return_value='8.4'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_cache_type', return_value=cache_type))
+            stack.enter_context(mock.patch.object(mt, 'site_package_check'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_site_directories'))
+            stack.enter_context(mock.patch.object(
+                mt,
+                'setupdatabase',
+                return_value={
+                    'wo_db_name': 'db',
+                    'wo_db_user': 'user',
+                    'wo_db_pass': 'pass',
+                    'wo_db_host': 'localhost',
+                },
+            ))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_shared_symlinks'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'generate_redis_prefix', return_value='wp_example_'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_baseline_version', return_value=7))
+            stack.enter_context(mock.patch.object(mt.os.path, 'exists', return_value=True))
+            stack.enter_context(mock.patch('builtins.open', mock.mock_open(read_data='{}')))
+            stack.enter_context(mock.patch.object(mt.json, 'load', return_value=baseline))
+            apply_baseline = stack.enter_context(mock.patch.object(
+                mt.BaselineApplicator,
+                'apply_baseline_to_site',
+                return_value={'success': True, 'error': None},
+            ))
+            set_permalink = stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'set_permalink_structure',
+            ))
+            if manager is not None:
+                manager.attach_mock(apply_baseline, 'apply_baseline_to_site')
+                manager.attach_mock(set_permalink, 'set_permalink_structure')
+            stack.enter_context(mock.patch.object(mt, 'setwebrootpermissions'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'validate_nginx_config', return_value=True))
+            stack.enter_context(mock.patch.object(mt.WOFileUtils, 'create_symlink'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'safe_nginx_reload', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_current_release', return_value='current'))
+            stack.enter_context(mock.patch.object(mt, 'addNewSite'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'add_shared_site'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'update_site_baseline'))
+            stack.enter_context(mock.patch.object(mt.WOGit, 'add'))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_admin_password', return_value='secret'))
+
+            ctrl._create_impl()
+
+        return {
+            'apply_baseline': apply_baseline,
+            'set_permalink_structure': set_permalink,
+        }
+
     @unittest.skipIf(shutil.which('php') is None, 'php not on PATH')
     def test_preflight_rejects_bad_php(self):
         """A syntax error in the shared config must fail the preflight."""
@@ -115,73 +195,30 @@ class MultitenancyTests(unittest.TestCase):
         if mt is None:
             self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
         cache_type = 'wpfc'
-        domain = 'example.com'
-        shared_root = '/var/www/shared'
-        baseline = {'plugins': ['nginx-helper'], 'theme': 't', 'options': {}}
-        pargs = mock.Mock()
-        pargs.site_name = domain
-        pargs.letsencrypt = False
-        pargs.admin_user = 'admin'
-        pargs.admin_email = 'admin@example.com'
-        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
-        ctrl.app = mock.Mock()
-        ctrl.app.pargs = pargs
 
-        with contextlib.ExitStack() as stack:
-            for method in ('info', 'warn', 'error', 'debug'):
-                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
-            stack.enter_context(mock.patch.object(mt.WODomain, 'validate', return_value=domain))
-            stack.enter_context(mock.patch.object(mt, 'check_domain_exists', return_value=False))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
-            stack.enter_context(mock.patch.object(
-                mt.MTFunctions,
-                'load_config',
-                return_value={'shared_root': shared_root, 'admin_email': 'fallback@example.com'},
-            ))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_php_version', return_value='8.4'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_cache_type', return_value=cache_type))
-            stack.enter_context(mock.patch.object(mt, 'site_package_check'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_site_directories'))
-            stack.enter_context(mock.patch.object(
-                mt,
-                'setupdatabase',
-                return_value={
-                    'wo_db_name': 'db',
-                    'wo_db_user': 'user',
-                    'wo_db_pass': 'pass',
-                    'wo_db_host': 'localhost',
-                },
-            ))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_shared_symlinks'))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'generate_redis_prefix', return_value='wp_example_'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_baseline_version', return_value=7))
-            stack.enter_context(mock.patch.object(mt.os.path, 'exists', return_value=True))
-            stack.enter_context(mock.patch('builtins.open', mock.mock_open(read_data='{}')))
-            stack.enter_context(mock.patch.object(mt.json, 'load', return_value=baseline))
-            apply_baseline = stack.enter_context(mock.patch.object(
-                mt.BaselineApplicator,
-                'apply_baseline_to_site',
-                return_value={'success': True, 'error': None},
-            ))
-            stack.enter_context(mock.patch.object(mt, 'setwebrootpermissions'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'validate_nginx_config', return_value=True))
-            stack.enter_context(mock.patch.object(mt.WOFileUtils, 'create_symlink'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'safe_nginx_reload', return_value=True))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_current_release', return_value='current'))
-            stack.enter_context(mock.patch.object(mt, 'addNewSite'))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'add_shared_site'))
-            stack.enter_context(mock.patch.object(mt.MTDatabase, 'update_site_baseline'))
-            stack.enter_context(mock.patch.object(mt.WOGit, 'add'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_admin_password', return_value='secret'))
+        calls = self._run_create_impl_with_mocks(cache_type=cache_type)
 
-            ctrl._create_impl()
-
+        apply_baseline = calls['apply_baseline']
         apply_baseline.assert_called_once()
         self.assertEqual(apply_baseline.call_args.kwargs['cache_type'], cache_type)
+
+    def test_create_sets_permalink_after_baseline_application(self):
+        """late permalink write must follow baseline activation to refresh Redis."""
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+        manager = mock.Mock()
+
+        self._run_create_impl_with_mocks(manager=manager)
+
+        apply_index = next(
+            index for index, call in enumerate(manager.mock_calls)
+            if call[0] == 'apply_baseline_to_site'
+        )
+        permalink_index = next(
+            index for index, call in enumerate(manager.mock_calls)
+            if call[0] == 'set_permalink_structure'
+        )
+        self.assertLess(apply_index, permalink_index)
 
 
     def test_load_config_parses_wordpress_sources_without_legacy_defaults(self):
@@ -490,79 +527,96 @@ class InstallWordpressPermalinkTests(unittest.TestCase):
     def _wp_result(self, returncode=0, stdout='', stderr=''):
         return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
 
-    def test_install_wordpress_sets_postname_permalink_after_core_install(self):
+    def test_set_permalink_structure_runs_wp_rewrite_with_path(self):
         site_htdocs = '/var/www/example.com/htdocs'
-        rewrite_cmd = ['wp', 'rewrite', 'structure', '/%postname%/', '--allow-root']
+        expected_cmd = [
+            'wp', 'rewrite', 'structure', '/%postname%/',
+            '--path=' + site_htdocs,
+            '--allow-root',
+        ]
 
         with mock.patch(
                 'wo.cli.plugins.multitenancy_functions.subprocess.run',
                 return_value=self._wp_result(),
         ) as run, \
-                mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod'), \
-                mock.patch('builtins.open', mock.mock_open()), \
-                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'), \
-                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
-            MTFunctions.install_wordpress(
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            MTFunctions.set_permalink_structure(
                 mock.Mock(),
                 'example.com',
                 site_htdocs,
-                'admin',
-                'admin@example.com',
             )
 
-        commands = [call.args[0] for call in run.call_args_list]
-        core_index = next(
-            (
-                index for index, argv in enumerate(commands)
-                if argv[:3] == ['wp', 'core', 'install']
-            ),
-            None,
-        )
-        rewrite_index = next(
-            (
-                index for index, argv in enumerate(commands)
-                if argv[:4] == ['wp', 'rewrite', 'structure', '/%postname%/']
-            ),
-            None,
-        )
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], expected_cmd)
+        self.assertIs(run.call_args.kwargs['check'], True)
+        self.assertNotIn('cwd', run.call_args.kwargs)
 
-        self.assertIsNotNone(core_index)
-        self.assertIsNotNone(rewrite_index)
-        self.assertLess(core_index, rewrite_index)
-
-        rewrite_call = run.call_args_list[rewrite_index]
-        self.assertEqual(rewrite_call.args[0], rewrite_cmd)
-        self.assertEqual(rewrite_call.kwargs['cwd'], site_htdocs)
-        self.assertIs(rewrite_call.kwargs['check'], True)
-
-    def test_install_wordpress_reraises_rewrite_failure(self):
+    def test_set_permalink_structure_reraises_wp_cli_failure(self):
         site_htdocs = '/var/www/example.com/htdocs'
-        rewrite_cmd = ['wp', 'rewrite', 'structure', '/%postname%/', '--allow-root']
+        rewrite_cmd = [
+            'wp', 'rewrite', 'structure', '/%postname%/',
+            '--path=' + site_htdocs,
+            '--allow-root',
+        ]
         rewrite_error = mtf.subprocess.CalledProcessError(
             1, rewrite_cmd, stderr='rewrite failed'
         )
 
         with mock.patch(
                 'wo.cli.plugins.multitenancy_functions.subprocess.run',
-                side_effect=[self._wp_result(), rewrite_error],
+                side_effect=rewrite_error,
         ) as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
+            with self.assertRaises(mtf.subprocess.CalledProcessError) as raised:
+                MTFunctions.set_permalink_structure(
+                    mock.Mock(),
+                    'example.com',
+                    site_htdocs,
+                )
+
+        self.assertIs(raised.exception, rewrite_error)
+        run.assert_called_once()
+
+    def test_install_wordpress_runs_early_permalink_phase_after_core_install(self):
+        site_htdocs = '/var/www/example.com/htdocs'
+        app = mock.Mock()
+        manager = mock.Mock()
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch.object(MTFunctions, 'set_permalink_structure') as set_permalink, \
                 mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod'), \
                 mock.patch('builtins.open', mock.mock_open()), \
                 mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'), \
                 mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
-            with self.assertRaises(mtf.subprocess.CalledProcessError) as raised:
-                MTFunctions.install_wordpress(
-                    mock.Mock(),
-                    'example.com',
-                    site_htdocs,
-                    'admin',
-                    'admin@example.com',
-                )
+            manager.attach_mock(run, 'run')
+            manager.attach_mock(set_permalink, 'set_permalink_structure')
 
-        self.assertIs(raised.exception, rewrite_error)
-        self.assertEqual(run.call_args_list[1].args[0], rewrite_cmd)
-        self.assertEqual(run.call_args_list[1].kwargs['cwd'], site_htdocs)
-        self.assertIs(run.call_args_list[1].kwargs['check'], True)
+            MTFunctions.install_wordpress(
+                app,
+                'example.com',
+                site_htdocs,
+                'admin',
+                'admin@example.com',
+            )
+
+        self.assertTrue(any(
+            call.args[0][:3] == ['wp', 'core', 'install']
+            for call in run.call_args_list
+        ))
+        core_index = next(
+            index for index, call in enumerate(manager.mock_calls)
+            if call[0] == 'run'
+            and call.args[0][:3] == ['wp', 'core', 'install']
+        )
+        permalink_index = next(
+            index for index, call in enumerate(manager.mock_calls)
+            if call[0] == 'set_permalink_structure'
+        )
+        self.assertLess(core_index, permalink_index)
+        set_permalink.assert_called_once_with(app, 'example.com', site_htdocs)
 
 class BaselineApplicatorTests(unittest.TestCase):
 

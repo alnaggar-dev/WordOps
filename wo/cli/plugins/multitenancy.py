@@ -371,6 +371,14 @@ class WOMultitenancyController(CementBaseController):
             else:
                 Log.warn(self, "baseline.json missing; skipping baseline activation")
             
+            # Re-assert the permalink after baseline (install_wordpress already
+            # wrote it to the DB): baseline enables Object Cache Pro with
+            # --skip-flush, so writing the option now routes through the active
+            # object cache and overwrites any stale permalink_structure cached
+            # under this tenant's Redis prefix. Unconditional, so sites created
+            # without a baseline refresh correctly too.
+            MTFunctions.set_permalink_structure(self, wo_domain, site_htdocs)
+
             # Set permissions
             Log.info(self, "Setting permissions...")
             setwebrootpermissions(self, site_htdocs)
