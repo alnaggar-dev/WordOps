@@ -484,6 +484,86 @@ url-only = https://example.com/url-only.zip
 
 
 
+
+class InstallWordpressPermalinkTests(unittest.TestCase):
+
+    def _wp_result(self, returncode=0, stdout='', stderr=''):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_install_wordpress_sets_postname_permalink_after_core_install(self):
+        site_htdocs = '/var/www/example.com/htdocs'
+        rewrite_cmd = ['wp', 'rewrite', 'structure', '/%postname%/', '--allow-root']
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                return_value=self._wp_result(),
+        ) as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod'), \
+                mock.patch('builtins.open', mock.mock_open()), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
+            MTFunctions.install_wordpress(
+                mock.Mock(),
+                'example.com',
+                site_htdocs,
+                'admin',
+                'admin@example.com',
+            )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        core_index = next(
+            (
+                index for index, argv in enumerate(commands)
+                if argv[:3] == ['wp', 'core', 'install']
+            ),
+            None,
+        )
+        rewrite_index = next(
+            (
+                index for index, argv in enumerate(commands)
+                if argv[:4] == ['wp', 'rewrite', 'structure', '/%postname%/']
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(core_index)
+        self.assertIsNotNone(rewrite_index)
+        self.assertLess(core_index, rewrite_index)
+
+        rewrite_call = run.call_args_list[rewrite_index]
+        self.assertEqual(rewrite_call.args[0], rewrite_cmd)
+        self.assertEqual(rewrite_call.kwargs['cwd'], site_htdocs)
+        self.assertIs(rewrite_call.kwargs['check'], True)
+
+    def test_install_wordpress_reraises_rewrite_failure(self):
+        site_htdocs = '/var/www/example.com/htdocs'
+        rewrite_cmd = ['wp', 'rewrite', 'structure', '/%postname%/', '--allow-root']
+        rewrite_error = mtf.subprocess.CalledProcessError(
+            1, rewrite_cmd, stderr='rewrite failed'
+        )
+
+        with mock.patch(
+                'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                side_effect=[self._wp_result(), rewrite_error],
+        ) as run, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod'), \
+                mock.patch('builtins.open', mock.mock_open()), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
+            with self.assertRaises(mtf.subprocess.CalledProcessError) as raised:
+                MTFunctions.install_wordpress(
+                    mock.Mock(),
+                    'example.com',
+                    site_htdocs,
+                    'admin',
+                    'admin@example.com',
+                )
+
+        self.assertIs(raised.exception, rewrite_error)
+        self.assertEqual(run.call_args_list[1].args[0], rewrite_cmd)
+        self.assertEqual(run.call_args_list[1].kwargs['cwd'], site_htdocs)
+        self.assertIs(run.call_args_list[1].kwargs['check'], True)
+
 class BaselineApplicatorTests(unittest.TestCase):
 
     def setUp(self):

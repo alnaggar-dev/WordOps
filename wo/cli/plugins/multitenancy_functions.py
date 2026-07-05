@@ -758,6 +758,19 @@ server {{
         except subprocess.CalledProcessError as e:
             Log.error(app, f"Failed to install WordPress: {e.stderr}")
             raise
+
+        # Set permalink structure to Post name (matches wo site create default)
+        try:
+            rewrite_cmd = [
+                'wp', 'rewrite', 'structure', '/%postname%/',
+                '--allow-root'
+            ]
+            subprocess.run(rewrite_cmd, cwd=site_htdocs,
+                           capture_output=True, text=True, check=True)
+            Log.debug(app, f"Permalink structure set to Post name for {domain}")
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"Failed to set permalink structure: {e.stderr}")
+            raise
     
     @staticmethod
     def get_admin_password(app, domain):
