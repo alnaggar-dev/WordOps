@@ -758,6 +758,99 @@ class BaselineApplicatorTests(unittest.TestCase):
             if call.args[0][:3] == ['wp', 'cap', 'add']
         ]
 
+    def _make_plugin_site(self):
+        site_path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, site_path, ignore_errors=True)
+        plugins_root = os.path.join(site_path, 'wp-content', 'plugins')
+        os.makedirs(plugins_root)
+        return site_path, plugins_root
+
+    def test_find_plugin_main_file_falls_back_to_header_scan(self):
+        """A non-conventional PHP file with a plugin header is selected."""
+        site_path, plugins_root = self._make_plugin_site()
+        plugin_dir = os.path.join(plugins_root, 'moyasar')
+        os.makedirs(plugin_dir)
+        with open(os.path.join(plugin_dir, 'moyasar-payments.php'), 'w') as fh:
+            fh.write("<?php\n/*\nPlugin Name: Moyasar\n*/\n")
+
+        self.assertEqual(
+            BaselineApplicator.find_plugin_main_file(site_path, 'moyasar'),
+            'moyasar/moyasar-payments.php',
+        )
+
+    def test_find_plugin_main_file_prefers_conventional_slug_file(self):
+        """The conventional <slug>/<slug>.php path wins over fallback scan."""
+        site_path, plugins_root = self._make_plugin_site()
+        plugin_dir = os.path.join(plugins_root, 'sample-plugin')
+        os.makedirs(plugin_dir)
+        with open(os.path.join(plugin_dir, 'a-header.php'), 'w') as fh:
+            fh.write("<?php\n/*\nPlugin Name: Header Candidate\n*/\n")
+        with open(os.path.join(plugin_dir, 'sample-plugin.php'), 'w') as fh:
+            fh.write("<?php\n/*\nPlugin Name: Sample Plugin\n*/\n")
+
+        self.assertEqual(
+            BaselineApplicator.find_plugin_main_file(site_path, 'sample-plugin'),
+            'sample-plugin/sample-plugin.php',
+        )
+
+    def test_find_plugin_main_file_returns_root_single_file_plugin(self):
+        """A single-file plugin directly under plugins/ resolves to <slug>.php."""
+        site_path, plugins_root = self._make_plugin_site()
+        with open(os.path.join(plugins_root, 'root-plugin.php'), 'w') as fh:
+            fh.write("<?php\n/*\nPlugin Name: Root Plugin\n*/\n")
+
+        self.assertEqual(
+            BaselineApplicator.find_plugin_main_file(site_path, 'root-plugin'),
+            'root-plugin.php',
+        )
+
+    def test_find_plugin_main_file_ignores_headerless_index_stub(self):
+        """Headerless index.php stubs are ignored during fallback scan."""
+        site_path, plugins_root = self._make_plugin_site()
+        plugin_dir = os.path.join(plugins_root, 'madfu-payment-gateway')
+        os.makedirs(plugin_dir)
+        with open(os.path.join(plugin_dir, 'index.php'), 'w'):
+            pass
+        with open(os.path.join(plugin_dir, 'madfu-pay.php'), 'w') as fh:
+            fh.write("<?php\n/*\nPlugin Name: Madfu Payment Gateway\n*/\n")
+
+        self.assertEqual(
+            BaselineApplicator.find_plugin_main_file(
+                site_path, 'madfu-payment-gateway'
+            ),
+            'madfu-payment-gateway/madfu-pay.php',
+        )
+
+        index_only_dir = os.path.join(plugins_root, 'index-only-plugin')
+        os.makedirs(index_only_dir)
+        with open(os.path.join(index_only_dir, 'index.php'), 'w'):
+            pass
+
+        self.assertIsNone(
+            BaselineApplicator.find_plugin_main_file(site_path, 'index-only-plugin')
+        )
+
+    def test_find_plugin_main_file_returns_none_for_absent_plugin_dir(self):
+        """Missing plugin directories are reported as absent."""
+        site_path, _plugins_root = self._make_plugin_site()
+
+        self.assertIsNone(
+            BaselineApplicator.find_plugin_main_file(site_path, 'missing-plugin')
+        )
+
+    def test_find_plugin_main_file_returns_none_without_plugin_header(self):
+        """Fallback scan ignores PHP files that do not declare Plugin Name."""
+        site_path, plugins_root = self._make_plugin_site()
+        plugin_dir = os.path.join(plugins_root, 'headerless-plugin')
+        os.makedirs(plugin_dir)
+        with open(os.path.join(plugin_dir, 'custom.php'), 'w') as fh:
+            fh.write("<?php\n// not a WordPress plugin header\n")
+
+        self.assertIsNone(
+            BaselineApplicator.find_plugin_main_file(site_path, 'headerless-plugin')
+        )
+
+
     def test_ensure_nginx_helper_caps_grants_required_administrator_caps(self):
         """Nginx Helper caps are granted through exact WP-CLI cap-add calls."""
         expected_commands = [
@@ -790,13 +883,13 @@ class BaselineApplicatorTests(unittest.TestCase):
                     expected_commands[0],
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=BaselineApplicator.WP_CLI_TIMEOUT,
                 ),
                 mock.call(
                     expected_commands[1],
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=BaselineApplicator.WP_CLI_TIMEOUT,
                 ),
             ],
         )
@@ -974,7 +1067,10 @@ class BaselineApplicatorTests(unittest.TestCase):
                 cache_type='wpfc',
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         nginx_helper_commands = self._nginx_helper_update_commands(run)
         self.assertEqual(len(nginx_helper_commands), 1)
         payload = json.loads(nginx_helper_commands[0][4])
@@ -1031,7 +1127,10 @@ class BaselineApplicatorTests(unittest.TestCase):
                         cache_type=cache_type,
                     )
 
-                self.assertEqual(result, {'success': True, 'error': None})
+                self.assertEqual(
+                    result,
+                    {'success': True, 'error': None, 'skipped_plugins': []},
+                )
                 self.assertEqual(self._nginx_helper_update_commands(run), [])
                 if name == 'plugin_absent':
                     self.assertEqual(self._nginx_helper_cap_commands(run), [])
@@ -1082,7 +1181,10 @@ class BaselineApplicatorTests(unittest.TestCase):
                 cache_type='wpfc',
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         self.assertTrue(log_warn.called)
 
     def test_apply_baseline_to_site_updates_options_and_continues_after_option_failure(self):
@@ -1114,15 +1216,16 @@ class BaselineApplicatorTests(unittest.TestCase):
 
         with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
                                return_value='kept-plugin/kept-plugin.php'), \
-                mock.patch.object(BaselineApplicator, 'restore_plugins_from_json') as restore_plugins, \
                 mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
                 mock.patch('wo.core.logging.Log.warn') as log_warn:
             result = BaselineApplicator.apply_baseline_to_site(
                 self.app, 'example.com', self.site_path, baseline
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
-        restore_plugins.assert_not_called()
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         self.assertTrue(log_warn.called)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn([
@@ -1157,6 +1260,353 @@ class BaselineApplicatorTests(unittest.TestCase):
             ],
         ])
 
+    def test_apply_baseline_to_site_skips_missing_plugin_and_continues(self):
+        """A missing plugin is reported but does not abort later baseline work."""
+        baseline = {
+            'plugins': ['good-plugin', 'missing-plugin', 'after-plugin'],
+            'theme': 'baseline-theme',
+            'options': {'blogname': 'Tenant Site'},
+        }
+        plugin_files = {
+            'good-plugin': 'good-plugin/good-plugin.php',
+            'missing-plugin': None,
+            'after-plugin': 'after-plugin/after-plugin.php',
+        }
+
+        def find_plugin(site_path, slug):
+            return plugin_files[slug]
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'option', 'update']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               side_effect=find_plugin), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'example.com', self.site_path, baseline
+            )
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['skipped_plugins'], ['missing-plugin'])
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn([
+            'wp', 'plugin', 'activate', 'good-plugin/good-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ], commands)
+        self.assertIn([
+            'wp', 'plugin', 'activate', 'after-plugin/after-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ], commands)
+        self.assertIn([
+            'wp', 'theme', 'activate', 'baseline-theme',
+            '--path=' + self.site_path, '--allow-root',
+        ], commands)
+        self.assertTrue(log_warn.called)
+
+    def test_apply_baseline_to_site_skips_failed_plugin_activation_and_continues(self):
+        """A plugin activation failure skips that slug and activates later plugins."""
+        baseline = {
+            'plugins': ['bad-plugin', 'after-plugin'],
+            'theme': '',
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                if cmd[3] == 'bad-plugin/bad-plugin.php':
+                    return self._wp_result(returncode=1, stderr='activation failed')
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(
+                BaselineApplicator,
+                'find_plugin_main_file',
+                side_effect=lambda site_path, slug: f'{slug}/{slug}.php',
+        ), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'example.com', self.site_path, baseline
+            )
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['skipped_plugins'], ['bad-plugin'])
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn([
+            'wp', 'plugin', 'activate', 'after-plugin/after-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ], commands)
+        self.assertTrue(log_warn.called)
+
+    def test_apply_baseline_to_site_skips_plugin_on_activation_timeout(self):
+        """A timed-out plugin activation skips that plugin and continues."""
+        baseline = {
+            'plugins': ['slow-plugin', 'after-plugin'],
+            'theme': 'baseline-theme',
+            'options': {'blogname': 'Tenant Site'},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                if cmd[3] == 'slow-plugin/slow-plugin.php':
+                    raise mtf.subprocess.TimeoutExpired(
+                        cmd,
+                        BaselineApplicator.WP_CLI_TIMEOUT,
+                    )
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'option', 'update']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(
+                BaselineApplicator,
+                'find_plugin_main_file',
+                side_effect=lambda site_path, slug: f'{slug}/{slug}.php',
+        ), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'example.com', self.site_path, baseline
+            )
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['skipped_plugins'], ['slow-plugin'])
+        commands = [call.args[0] for call in run.call_args_list]
+        slow_plugin_cmd = [
+            'wp', 'plugin', 'activate', 'slow-plugin/slow-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ]
+        after_plugin_cmd = [
+            'wp', 'plugin', 'activate', 'after-plugin/after-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ]
+        self.assertIn(slow_plugin_cmd, commands)
+        self.assertIn(after_plugin_cmd, commands)
+        self.assertLess(
+            commands.index(slow_plugin_cmd),
+            commands.index(after_plugin_cmd),
+        )
+        self.assertTrue(log_warn.called)
+
+    def test_apply_baseline_to_site_theme_failure_is_fatal_after_options(self):
+        """Theme activation fails last, after plugins and options were applied."""
+        baseline = {
+            'plugins': ['good-plugin'],
+            'theme': 'missing-theme',
+            'options': {'blog_public': 0},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'option', 'update']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result(returncode=1, stderr='theme missing')
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               return_value='good-plugin/good-plugin.php'), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn:
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'example.com', self.site_path, baseline
+            )
+
+        self.assertFalse(result['success'])
+        self.assertIn('Failed to activate baseline theme', result['error'])
+        self.assertIn('missing-theme', result['error'])
+        self.assertEqual(result['skipped_plugins'], [])
+        commands = [call.args[0] for call in run.call_args_list]
+        plugin_cmd = [
+            'wp', 'plugin', 'activate', 'good-plugin/good-plugin.php',
+            '--path=' + self.site_path, '--allow-root',
+        ]
+        option_cmd = [
+            'wp', 'option', 'update', 'blog_public', '0',
+            '--path=' + self.site_path, '--allow-root',
+        ]
+        theme_cmd = [
+            'wp', 'theme', 'activate', 'missing-theme',
+            '--path=' + self.site_path, '--allow-root',
+        ]
+        self.assertIn(plugin_cmd, commands)
+        self.assertIn(option_cmd, commands)
+        self.assertLess(commands.index(option_cmd), commands.index(theme_cmd))
+        self.assertTrue(log_warn.called)
+
+    def test_apply_baseline_to_site_theme_activated_last(self):
+        """Baseline theme activation is ordered after options and cache config."""
+        baseline = {
+            'plugins': ['good-plugin', 'nginx-helper'],
+            'theme': 'baseline-theme',
+            'options': {'blog_public': 1},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'option', 'update']:
+                return self._wp_result()
+            if cmd[:4] == ['wp', 'cap', 'add', 'administrator']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(
+                BaselineApplicator,
+                'find_plugin_main_file',
+                side_effect=lambda site_path, slug: f'{slug}/{slug}.php',
+        ), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp) as run, \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app,
+                'example.com',
+                self.site_path,
+                baseline,
+                cache_type='wpfc',
+            )
+
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
+        commands = [call.args[0] for call in run.call_args_list]
+        theme_index = next(
+            index for index, cmd in enumerate(commands)
+            if cmd[:3] == ['wp', 'theme', 'activate']
+        )
+        option_indices = [
+            index for index, cmd in enumerate(commands)
+            if cmd[:4] == ['wp', 'option', 'update', 'blog_public']
+        ]
+        nginx_helper_index = next(
+            index for index, cmd in enumerate(commands)
+            if cmd[:4] == [
+                'wp', 'option', 'update', 'rt_wp_nginx_helper_options',
+            ]
+        )
+
+        self.assertEqual(len(option_indices), 1)
+        self.assertLess(option_indices[0], theme_index)
+        self.assertLess(nginx_helper_index, theme_index)
+
+    def test_apply_baseline_to_site_theme_success_marks_fully_applied(self):
+        """All plugins found plus theme success returns the fully-applied result."""
+        baseline = {
+            'plugins': ['good-plugin'],
+            'theme': 'baseline-theme',
+            'options': {},
+        }
+
+        def run_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'plugin', 'activate']:
+                return self._wp_result()
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result()
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               return_value='good-plugin/good-plugin.php'), \
+                mock.patch.object(mtf.subprocess, 'run', side_effect=run_wp):
+            result = BaselineApplicator.apply_baseline_to_site(
+                self.app, 'example.com', self.site_path, baseline
+            )
+
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
+
+    def test_apply_baseline_to_site_result_flags_preserve_full_apply_rule(self):
+        """Callers can reject fatal themes and skipped plugins as incomplete."""
+        theme_failure_baseline = {
+            'plugins': [],
+            'theme': 'missing-theme',
+            'options': {},
+        }
+
+        def run_theme_failure_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            if cmd[:3] == ['wp', 'theme', 'activate']:
+                return self._wp_result(returncode=1, stderr='theme missing')
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(mtf.subprocess, 'run',
+                               side_effect=run_theme_failure_wp), \
+                mock.patch('wo.core.logging.Log.warn'):
+            theme_result = BaselineApplicator.apply_baseline_to_site(
+                self.app,
+                'example.com',
+                self.site_path,
+                theme_failure_baseline,
+            )
+
+        skipped_plugin_baseline = {
+            'plugins': ['missing-plugin'],
+            'theme': '',
+            'options': {},
+        }
+
+        def run_skipped_plugin_wp(cmd, **kwargs):
+            if cmd[:4] == ['wp', 'option', 'get', 'active_plugins']:
+                return self._wp_result(stdout='[]')
+            self.fail(f'unexpected wp command: {cmd!r}')
+
+        with mock.patch.object(BaselineApplicator, 'find_plugin_main_file',
+                               return_value=None), \
+                mock.patch.object(mtf.subprocess, 'run',
+                                  side_effect=run_skipped_plugin_wp), \
+                mock.patch('wo.core.logging.Log.warn'):
+            skipped_plugin_result = BaselineApplicator.apply_baseline_to_site(
+                self.app,
+                'example.com',
+                self.site_path,
+                skipped_plugin_baseline,
+            )
+
+        self.assertFalse(theme_result['success'])
+        self.assertFalse(
+            theme_result['success'] and not theme_result['skipped_plugins']
+        )
+        self.assertTrue(skipped_plugin_result['success'])
+        self.assertEqual(
+            skipped_plugin_result['skipped_plugins'],
+            ['missing-plugin'],
+        )
+        self.assertFalse(
+            skipped_plugin_result['success']
+            and not skipped_plugin_result['skipped_plugins']
+        )
+
     def test_apply_baseline_to_site_prune_deactivates_exact_active_unlisted_set(self):
         """prune removes only plugins active on the site and absent from baseline plugins."""
         baseline = {
@@ -1184,7 +1634,10 @@ class BaselineApplicatorTests(unittest.TestCase):
                 self.app, 'example.com', self.site_path, baseline, prune=True
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         deactivate_commands = [
             call.args[0] for call in run.call_args_list
             if call.args[0][:3] == ['wp', 'plugin', 'deactivate']
@@ -1222,7 +1675,10 @@ class BaselineApplicatorTests(unittest.TestCase):
                 self.app, 'example.com', self.site_path, baseline, prune=False
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
 
 
 
@@ -1286,7 +1742,8 @@ class ObjectCacheDropinTests(unittest.TestCase):
             )
 
         run.assert_called_once_with(
-            self._enable_cmd(), capture_output=True, text=True, timeout=30
+            self._enable_cmd(), capture_output=True, text=True,
+            timeout=BaselineApplicator.WP_CLI_TIMEOUT,
         )
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ['wp', 'redis', 'enable'])
@@ -1421,7 +1878,10 @@ class ObjectCacheDropinTests(unittest.TestCase):
                 self.app, 'x.com', self.site_path, baseline, prune=False
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(self._enable_cmd(), commands)
 
@@ -1463,7 +1923,10 @@ class ObjectCacheDropinTests(unittest.TestCase):
                 self.app, 'x.com', self.site_path, baseline, prune=False
             )
 
-        self.assertEqual(result, {'success': True, 'error': None})
+        self.assertEqual(
+            result,
+            {'success': True, 'error': None, 'skipped_plugins': []},
+        )
         chown.assert_not_called()
 class BaselineApplicatorSitesTests(unittest.TestCase):
 

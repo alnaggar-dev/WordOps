@@ -3,6 +3,7 @@ Core functions for managing shared WordPress infrastructure.
 """
 
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -2379,52 +2380,80 @@ class ReleaseManager:
 
 class BaselineApplicator:
     """Helper class for applying baseline configuration to sites"""
+
+    # WP-CLI baseline commands (plugin/theme/option/cache) use this timeout,
+    # in seconds. Cold-start plugin activation during initial site creation
+    # bootstraps every already-active plugin on each call (WooCommerce
+    # first-run migrations, Object Cache Pro cold cache), which can transiently
+    # exceed a tight limit even though steady-state calls take a few seconds.
+    WP_CLI_TIMEOUT = 120
     
     @staticmethod
     def find_plugin_main_file(site_path, plugin_slug):
-        """Find the main PHP file for a plugin"""
-        plugin_dir = f"{site_path}/wp-content/plugins/{plugin_slug}"
-        
-        if not os.path.exists(plugin_dir):
+        """Find a plugin's main PHP file relative to the plugins directory.
+
+        Returns the path relative to wp-content/plugins (for example
+        "moyasar/moyasar-payments.php"), or None when the plugin is not
+        present on disk.
+        """
+        plugins_root = f"{site_path}/wp-content/plugins"
+
+        # A plugin's main file is the top-level PHP file that carries the
+        # WordPress "Plugin Name:" header, exactly the way WordPress itself
+        # discovers it. Requiring the header is essential: many plugins ship
+        # an empty "silence is golden" index.php in their root that is NOT the
+        # main file (for example madfu-payment-gateway keeps its header in
+        # madfu-pay.php), and some ship their main file under a name that does
+        # not match the folder (moyasar ships moyasar-payments.php).
+
+        # Single-file plugin living directly under plugins/.
+        single = f"{plugins_root}/{plugin_slug}.php"
+        if os.path.isfile(single) and \
+                BaselineApplicator._has_plugin_header(single):
+            return f"{plugin_slug}.php"
+
+        plugin_dir = f"{plugins_root}/{plugin_slug}"
+        if not os.path.isdir(plugin_dir):
             return None
-        
-        # Common patterns
-        candidates = [
-            f"{plugin_slug}/{plugin_slug}.php",
-            f"{plugin_slug}/index.php",
-            f"{plugin_slug}/plugin.php",
-            f"{plugin_slug}.php"  # Single-file plugin
-        ]
-        
-        for candidate in candidates:
-            full_path = f"{site_path}/wp-content/plugins/{candidate}"
-            if os.path.exists(full_path):
-                return candidate
-        
-        return None
-    
-    @staticmethod
-    def restore_plugins_from_json(app, site_path, plugins_json):
-        """Restore active_plugins option from JSON string"""
+
+        # Prefer the conventional <slug>/<slug>.php when it carries the header.
+        conventional = f"{plugin_dir}/{plugin_slug}.php"
+        if os.path.isfile(conventional) and \
+                BaselineApplicator._has_plugin_header(conventional):
+            return f"{plugin_slug}/{plugin_slug}.php"
+
+        # Otherwise take the first (alphabetical) top-level PHP file that has
+        # the header. Header-less stubs such as an empty index.php are ignored.
         try:
-            restore_cmd = [
-                'wp', 'option', 'update', 'active_plugins', plugins_json,
-                '--format=json',
-                '--path=' + site_path,
-                '--allow-root'
-            ]
-            
-            subprocess.run(
-                restore_cmd,
-                capture_output=True,
-                timeout=30,
-                check=True
-            )
-            
-            Log.debug(app, f"Restored plugins for {site_path}")
-            
-        except Exception as e:
-            Log.debug(app, f"Failed to restore plugins: {e}")
+            entries = sorted(os.listdir(plugin_dir))
+        except OSError:
+            return None
+        for entry in entries:
+            if not entry.endswith('.php'):
+                continue
+            candidate = f"{plugin_dir}/{entry}"
+            if os.path.isfile(candidate) and \
+                    BaselineApplicator._has_plugin_header(candidate):
+                return f"{plugin_slug}/{entry}"
+
+        return None
+
+    @staticmethod
+    def _has_plugin_header(file_path):
+        """Return True if a PHP file declares a 'Plugin Name:' header.
+
+        Mirrors WordPress core plugin detection: the metadata block lives in
+        the first 8 KB of the file and the label may be preceded by comment
+        characters.
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8',
+                      errors='ignore') as handle:
+                head = handle.read(8192)
+        except OSError:
+            return False
+        return re.search(r'^[ \t/*#@]*Plugin Name:', head,
+                         re.IGNORECASE | re.MULTILINE) is not None
     
     @staticmethod
     def _get_active_plugin_slugs(app, site_path):
@@ -2441,7 +2470,7 @@ class BaselineApplicator:
             active_cmd,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=BaselineApplicator.WP_CLI_TIMEOUT
         )
 
         if active_result.returncode != 0:
@@ -2468,7 +2497,7 @@ class BaselineApplicator:
                                cache_type=None):
         """Apply baseline configuration to a single site via WP-CLI"""
         
-        result = {'success': False, 'error': None}
+        result = {'success': False, 'error': None, 'skipped_plugins': []}
         
         try:
             # Get current active plugins (for rollback)
@@ -2483,72 +2512,62 @@ class BaselineApplicator:
                 get_plugins_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=BaselineApplicator.WP_CLI_TIMEOUT
             )
             
             if plugins_result.returncode != 0:
                 result['error'] = "Could not read current plugins: " + plugins_result.stderr.strip()
                 return result
             
-            current_plugins = plugins_result.stdout.strip()
-            
-            # Activate each baseline plugin
+            # Activate each baseline plugin. A plugin that is missing on disk
+            # or fails to activate is skipped with a warning so that one bad
+            # plugin never blocks the rest of the baseline (theme, options and
+            # cache configuration) from being applied.
             for plugin_slug in baseline.get('plugins', []):
-                # Find plugin main file
                 plugin_file = BaselineApplicator.find_plugin_main_file(
-                    site_path, 
+                    site_path,
                     plugin_slug
                 )
-                
-                if not plugin_file:
-                    result['error'] = f"Plugin {plugin_slug} not found on disk"
-                    return result
-                
-                # Activate plugin
-                activate_cmd = [
-                    'wp', 'plugin', 'activate', plugin_file,
-                    '--path=' + site_path,
-                    '--allow-root'
-                ]
-                
-                activate_result = subprocess.run(
-                    activate_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if activate_result.returncode != 0:
-                    result['error'] = f"Failed to activate {plugin_slug}: " + \
-                                    activate_result.stderr
-                    # Rollback - restore original plugins
-                    BaselineApplicator.restore_plugins_from_json(
-                        app, 
-                        site_path, 
-                        current_plugins
-                    )
-                    return result
-            
-            # Switch theme if needed
-            theme_slug = baseline.get('theme')
-            if theme_slug:
-                theme_cmd = [
-                    'wp', 'theme', 'activate', theme_slug,
-                    '--path=' + site_path,
-                    '--allow-root'
-                ]
-                
-                theme_result = subprocess.run(
-                    theme_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if theme_result.returncode != 0:
-                    result['error'] = f"Failed to activate theme {theme_slug}"
-                    return result
 
+                if not plugin_file:
+                    Log.warn(
+                        app,
+                        f"Baseline plugin {plugin_slug} not found on disk "
+                        f"for {domain}; skipping"
+                    )
+                    result['skipped_plugins'].append(plugin_slug)
+                    continue
+
+                try:
+                    activate_result = subprocess.run(
+                        [
+                            'wp', 'plugin', 'activate', plugin_file,
+                            '--path=' + site_path,
+                            '--allow-root'
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=BaselineApplicator.WP_CLI_TIMEOUT
+                    )
+                except subprocess.TimeoutExpired:
+                    Log.warn(
+                        app,
+                        f"Timed out activating baseline plugin {plugin_slug} "
+                        f"for {domain}; skipping"
+                    )
+                    result['skipped_plugins'].append(plugin_slug)
+                    continue
+
+                if activate_result.returncode != 0:
+                    Log.warn(
+                        app,
+                        f"Failed to activate baseline plugin {plugin_slug} "
+                        f"for {domain}; skipping: "
+                        f"{activate_result.stderr.strip()}"
+                    )
+                    result['skipped_plugins'].append(plugin_slug)
+                    continue
+            
             for option_name, option_value in baseline.get('options', {}).items():
                 wp_value, use_json_format = BaselineApplicator._option_value_for_wp_cli(
                     option_value
@@ -2565,7 +2584,7 @@ class BaselineApplicator:
                     option_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=30
+                    timeout=BaselineApplicator.WP_CLI_TIMEOUT
                 )
 
                 if option_result.returncode != 0:
@@ -2592,7 +2611,7 @@ class BaselineApplicator:
                         deactivate_cmd,
                         capture_output=True,
                         text=True,
-                        timeout=30
+                        timeout=BaselineApplicator.WP_CLI_TIMEOUT
                     )
                     if deactivate_result.returncode != 0:
                         result['error'] = "Failed to prune plugins: " + \
@@ -2613,6 +2632,31 @@ class BaselineApplicator:
                     BaselineApplicator.configure_nginx_helper(
                         app, domain, site_path, cache_type
                     )
+
+            # Switch the baseline theme last, so a theme failure never blocks
+            # the plugin, option, drop-in and cache configuration above from
+            # being applied. A specified-but-failed baseline theme is still
+            # fatal to the apply (success stays False) so the site is not
+            # recorded as fully at baseline.
+            theme_slug = baseline.get('theme')
+            if theme_slug:
+                theme_result = subprocess.run(
+                    [
+                        'wp', 'theme', 'activate', theme_slug,
+                        '--path=' + site_path,
+                        '--allow-root'
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=BaselineApplicator.WP_CLI_TIMEOUT
+                )
+                if theme_result.returncode != 0:
+                    result['error'] = (
+                        f"Failed to activate baseline theme {theme_slug}: "
+                        f"{theme_result.stderr.strip()}"
+                    )
+                    Log.warn(app, f"{result['error']} for {domain}")
+                    return result
 
             result['success'] = True
             return result
@@ -2679,7 +2723,7 @@ class BaselineApplicator:
                 option_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=BaselineApplicator.WP_CLI_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             Log.warn(
@@ -2720,7 +2764,7 @@ class BaselineApplicator:
                     cap_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=BaselineApplicator.WP_CLI_TIMEOUT,
                 )
             except (subprocess.TimeoutExpired, OSError) as e:
                 Log.warn(
@@ -2769,7 +2813,7 @@ class BaselineApplicator:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=BaselineApplicator.WP_CLI_TIMEOUT
             )
         except Exception as e:
             Log.warn(
@@ -2909,9 +2953,15 @@ class BaselineApplicator:
             dur = int((_time.monotonic() - start) * 1000)
 
             if result['success']:
+                skipped = result.get('skipped_plugins') or []
                 site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
                 if site_obj:
-                    site_obj.baseline_version = baseline_version
+                    # Only advance the recorded baseline version when every
+                    # plugin applied. A site with skipped plugins is not fully
+                    # at this baseline, so leave its version untouched so
+                    # `validate` flags it and a later `apply` re-attempts.
+                    if not skipped:
+                        site_obj.baseline_version = baseline_version
                     site_obj.updated_at = datetime.now()
                     session.commit()
                 success_count += 1
@@ -2919,8 +2969,17 @@ class BaselineApplicator:
                     Log.info(app, f"  ✅ {domain} ({dur} ms)")
                 else:
                     Log.debug(app, f"Applied to {domain}")
+                if skipped:
+                    Log.warn(
+                        app,
+                        f"  ⚠️  {domain}: skipped plugins (version not "
+                        f"advanced): {', '.join(skipped)}"
+                    )
                 per_site.append({
-                    'domain': domain, 'status': 'success', 'duration_ms': dur,
+                    'domain': domain,
+                    'status': 'partial' if skipped else 'success',
+                    'duration_ms': dur,
+                    'skipped_plugins': skipped,
                 })
             else:
                 failed_count += 1

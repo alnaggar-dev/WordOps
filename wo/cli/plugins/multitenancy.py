@@ -346,6 +346,7 @@ class WOMultitenancyController(CementBaseController):
             baseline_path = f"{shared_root}/config/baseline.json"
             baseline = None
             current_version = MTDatabase.get_baseline_version(self)
+            baseline_complete = True
             if os.path.exists(baseline_path):
                 try:
                     with open(baseline_path, 'r') as baseline_file:
@@ -367,15 +368,27 @@ class WOMultitenancyController(CementBaseController):
                             f"Baseline configuration failed for {wo_domain}: "
                             f"{baseline_result.get('error')}"
                         )
-                    current_version = baseline.get('version', current_version)
+                        baseline_complete = False
+                    elif baseline_result.get('skipped_plugins'):
+                        Log.warn(
+                            self,
+                            f"Baseline applied for {wo_domain} but skipped "
+                            f"plugins: "
+                            f"{', '.join(baseline_result['skipped_plugins'])}"
+                        )
+                        baseline_complete = False
+                    else:
+                        current_version = baseline.get('version', current_version)
                 except Exception as e:
                     baseline = None
+                    baseline_complete = False
                     Log.warn(
                         self,
                         f"Could not read baseline.json; skipping baseline activation: {e}"
                     )
             else:
                 Log.warn(self, "baseline.json missing; skipping baseline activation")
+                baseline_complete = False
             
             # Re-assert the permalink after baseline (install_wordpress already
             # wrote it to the DB): baseline enables Object Cache Pro with
@@ -471,8 +484,12 @@ class WOMultitenancyController(CementBaseController):
                         Log.debug(self, "Nginx reloaded successfully after SSL deployment")
             
 
-            # Record current baseline version so validate doesn't flag the new site
-            MTDatabase.update_site_baseline(self, wo_domain, current_version)
+            # Record the baseline version so validate does not flag a fully
+            # applied site; a partial or failed baseline records 0 so validate
+            # flags it and `wo multitenancy apply` re-attempts later.
+            MTDatabase.update_site_baseline(
+                self, wo_domain, current_version if baseline_complete else 0
+            )
 
             # Git commit
             WOGit.add(self, ["/etc/nginx"], 
@@ -482,10 +499,23 @@ class WOMultitenancyController(CementBaseController):
             admin_pass = MTFunctions.get_admin_password(self, wo_domain)
             site_url = f"https://{wo_domain}" if pargs.letsencrypt else f"http://{wo_domain}"
 
-            Log.info(self, f"site_created target={wo_domain} result=success")
+            banner_status = "success" if baseline_complete else "partial"
+            Log.info(self, f"site_created target={wo_domain} result={banner_status}")
 
             Log.info(self, "")
-            Log.info(self, "🎉 WordPress site created successfully!")
+            if baseline_complete:
+                Log.info(self, "🎉 WordPress site created successfully!")
+            else:
+                Log.info(
+                    self,
+                    "⚠️  WordPress site created, but baseline configuration "
+                    "did not fully apply."
+                )
+                Log.info(
+                    self,
+                    "   Review the warnings above, then run "
+                    "'wo multitenancy apply' to retry."
+                )
             Log.info(self, f"   URL: {site_url}")
             Log.info(self, f"   Admin URL: {site_url}/wp-admin")
             Log.info(self, f"   Admin user: {pargs.admin_user}")
