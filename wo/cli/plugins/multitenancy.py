@@ -87,7 +87,7 @@ class WOMultitenancyController(CementBaseController):
             (['--admin-email'],
                 dict(help='WordPress admin email', default='')),
             (['--admin-user'],
-                dict(help='WordPress admin username', default='admin')),
+                dict(help='WordPress admin username', default='SuperDuper')),
             (['plugin_slug'], dict(help='Plugin or theme slug', nargs='?')),
             (['theme_slug'], dict(help='Theme slug', nargs='?')),
             (['--apply-now'], dict(help='Apply changes immediately', action='store_true')),

@@ -273,7 +273,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `--letsencrypt` | Enable Let's Encrypt SSL. |
 | `--hsts` | Enable HSTS. |
 | `--dns[=dns_cf]` | Use wildcard/DNS mode. |
-| `--admin-user` | WordPress admin username. Default: `admin`. |
+| `--admin-user` | WordPress admin username. Default: `SuperDuper`. |
 | `--admin-email` | WordPress admin email. Falls back to `admin_email` in config. |
 
 If no PHP flag is passed, the default comes from `php_version` in config, which defaults to 8.4. If no cache flag is passed, the site is created with basic/no cache. SSL is `-le` or `--letsencrypt`; a copied `—le` with an em dash causes `unrecognized arguments`.
