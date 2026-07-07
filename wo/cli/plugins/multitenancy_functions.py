@@ -848,7 +848,7 @@ server {{
 
     # Multitenant-specific: Handle /wp symlink directory
     # This location block is the ONLY difference from standard WordOps sites
-    location /wp {{
+    location /wp/ {{
         try_files $uri $uri/ /wp/index.php?$args;
     }}
 
