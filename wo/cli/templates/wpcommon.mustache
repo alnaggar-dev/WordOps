@@ -59,6 +59,7 @@ location ~ ^/wp-json/ {
     more_set_headers "Cache-Control: no-cache, no-store, must-revalidate, max-age=0, private";
     more_set_headers "Pragma: no-cache";
     more_set_headers "Expires: 0";
+    try_files $uri $uri/ /index.php$is_args$args;
 }
 # webp rewrite rules for jpg and png images
 # try to load alternative image.png.webp before image.png
