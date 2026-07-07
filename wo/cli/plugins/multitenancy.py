@@ -926,7 +926,10 @@ class WOMultitenancyController(CementBaseController):
     @expose(help="Rename a multitenancy site's primary domain")
     def rename(self):
         """Rename a shared-core tenant domain in place."""
-        return self._rename_impl()
+        result = self._rename_impl()
+        if not result:
+            self.app.close(1)
+        return result
 
     def _delete_impl(self):
         pargs = self.app.pargs
@@ -1158,9 +1161,14 @@ class WOMultitenancyController(CementBaseController):
                 os.remove(old_enabled_path)
             if os.path.exists(old_force_ssl_path):
                 os.remove(old_force_ssl_path)
+            if os.path.lexists(old_available_path) or os.path.exists(old_available_path):
+                os.remove(old_available_path)
 
             os.rename(old_root, new_root)
             rollback['root_moved'] = True
+
+            if not MTFunctions.relink_core_files_for_rename(self, new_htdocs):
+                raise Exception("Core file symlink relink failed")
 
             for stale_include_path in (
                     f'{new_root}/conf/nginx/ssl.conf',

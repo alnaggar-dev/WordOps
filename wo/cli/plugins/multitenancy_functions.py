@@ -503,6 +503,37 @@ require __DIR__ . '/wp/wp-blog-header.php';
             with open(index_dest, 'w') as f:
                 f.write(index_content)
             Log.debug(app, f"Created index.php for {site_htdocs}")
+
+    @staticmethod
+    def relink_core_files_for_rename(app, site_htdocs):
+        """Recreate per-site WordPress core-file symlinks after a root move.
+
+        create_shared_symlinks() writes these as absolute links rooted at the
+        site's own htdocs, so os.rename() to a new domain root leaves them
+        dangling and WP-CLI can no longer bootstrap the install. Recreate them
+        with relative targets so they resolve regardless of the parent
+        directory name, keeping both the rename and its rollback valid.
+        Recoverable: returns False on failure instead of exiting.
+        """
+        core_files = (
+            'wp-login.php', 'wp-admin', 'wp-includes', 'wp-cron.php',
+            'xmlrpc.php', 'wp-comments-post.php', 'wp-settings.php',
+        )
+        try:
+            for name in core_files:
+                link = f"{site_htdocs}/{name}"
+                if os.path.lexists(link) and not os.path.islink(link):
+                    Log.error(app, f"Refusing to replace non-symlink core path: {link}", exit=False)
+                    return False
+                tmp_link = f"{link}.rename-tmp"
+                if os.path.lexists(tmp_link):
+                    os.remove(tmp_link)
+                os.symlink(f"wp/{name}", tmp_link)
+                os.replace(tmp_link, link)
+            return True
+        except Exception as e:
+            Log.error(app, f"Failed to relink core files for rename: {e}", exit=False)
+            return False
     
     @staticmethod
     def generate_wp_config(app, site_root, domain, db_name, db_user, db_pass, db_host, redis_prefix=None):

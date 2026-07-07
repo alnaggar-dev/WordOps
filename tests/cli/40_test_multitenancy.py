@@ -833,6 +833,7 @@ class MultitenancyRenameTests(unittest.TestCase):
         calls['os_rename'].assert_not_called()
         calls['rewrite_wp_config_for_rename'].assert_not_called()
         calls['update_wordpress_domain'].assert_not_called()
+        calls['relink_core_files_for_rename'].assert_not_called()
         calls['rename_shared_site_domain'].assert_not_called()
 
     def _run_rename(
@@ -943,6 +944,9 @@ class MultitenancyRenameTests(unittest.TestCase):
             prepare_ssl = stack.enter_context(mock.patch.object(
                 mt.MTFunctions, 'prepare_ssl_certificate_for_rename', return_value=prepare_ssl_return,
             ))
+            relink_core_files = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'relink_core_files_for_rename', return_value=True,
+            ))
             rewrite_wp_config = stack.enter_context(mock.patch.object(
                 mt.MTFunctions, 'rewrite_wp_config_for_rename', return_value=rewrite_return,
             ))
@@ -985,6 +989,7 @@ class MultitenancyRenameTests(unittest.TestCase):
             if manager is not None:
                 manager.attach_mock(prepare_ssl, 'prepare_ssl')
                 manager.attach_mock(os_rename, 'rename')
+                manager.attach_mock(relink_core_files, 'relink_core_files')
                 manager.attach_mock(rewrite_wp_config, 'rewrite_wp_config')
                 manager.attach_mock(write_nginx, 'write_nginx')
                 manager.attach_mock(enable_nginx, 'enable_nginx')
@@ -1015,6 +1020,7 @@ class MultitenancyRenameTests(unittest.TestCase):
             'generate_redis_prefix': generate_redis_prefix,
             'prepare_ssl_certificate_for_rename': prepare_ssl,
             'rewrite_wp_config_for_rename': rewrite_wp_config,
+            'relink_core_files_for_rename': relink_core_files,
             'write_nginx_config_for_rename': write_nginx,
             'enable_nginx_site_for_rename': enable_nginx,
             'validate_nginx_config_recoverable': validate_nginx,
@@ -1036,6 +1042,30 @@ class MultitenancyRenameTests(unittest.TestCase):
             'rmtree': rmtree,
             'subprocess_run': subprocess_run,
         }
+
+    def test_rename_closes_app_with_failure_status_when_impl_fails(self):
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        ctrl.app = mock.Mock()
+        ctrl._rename_impl = mock.Mock(return_value=False)
+
+        self.assertFalse(ctrl.rename())
+        ctrl._rename_impl.assert_called_once_with()
+        ctrl.app.close.assert_called_once_with(1)
+
+    def test_rename_returns_success_without_closing_app_when_impl_succeeds(self):
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        ctrl.app = mock.Mock()
+        ctrl._rename_impl = mock.Mock(return_value=True)
+
+        self.assertTrue(ctrl.rename())
+        ctrl._rename_impl.assert_called_once_with()
+        ctrl.app.close.assert_not_called()
 
     def test_rename_requires_two_domains(self):
         calls = self._run_rename(pargs_overrides={'newsite_name': None})
@@ -1080,11 +1110,15 @@ class MultitenancyRenameTests(unittest.TestCase):
 
     def test_rename_moves_root_rewrites_wp_updates_databases_and_purges_caches(self):
         manager = mock.Mock()
-        calls = self._run_rename(manager=manager)
+        calls = self._run_rename(old_available=True, manager=manager)
         ctrl = calls['ctrl']
 
         self.assertTrue(calls['result'])
         calls['os_rename'].assert_any_call('/var/www/old.example.com', '/var/www/new.example.com')
+        calls['os_remove'].assert_any_call('/etc/nginx/sites-available/old.example.com')
+        calls['relink_core_files_for_rename'].assert_called_once_with(
+            ctrl, '/var/www/new.example.com/htdocs',
+        )
         calls['rewrite_wp_config_for_rename'].assert_called_once_with(
             ctrl,
             '/var/www/new.example.com',
@@ -1120,7 +1154,8 @@ class MultitenancyRenameTests(unittest.TestCase):
             mock.call(ctrl, 'new.example.com', 'new_example_com_'),
         ])
 
-        self.assertLess(self._first_call_index(manager, 'rename'), self._first_call_index(manager, 'rewrite_wp_config'))
+        self.assertLess(self._first_call_index(manager, 'rename'), self._first_call_index(manager, 'relink_core_files'))
+        self.assertLess(self._first_call_index(manager, 'relink_core_files'), self._first_call_index(manager, 'rewrite_wp_config'))
         self.assertLess(self._first_call_index(manager, 'rewrite_wp_config'), self._first_call_index(manager, 'write_nginx'))
         self.assertLess(self._first_call_index(manager, 'write_nginx'), self._first_call_index(manager, 'enable_nginx'))
         self.assertLess(self._first_call_index(manager, 'enable_nginx'), self._first_call_index(manager, 'validate_nginx'))
@@ -1200,7 +1235,11 @@ class MultitenancyRenameTests(unittest.TestCase):
         )
 
     def test_rename_rolls_back_db_and_wp_when_reload_fails(self):
-        calls = self._run_rename(reload_return=False)
+        calls = self._run_rename(
+            old_available=True,
+            reload_return=False,
+            timestamp='20260707-010203',
+        )
         ctrl = calls['ctrl']
 
         self.assertFalse(calls['result'])
@@ -1227,6 +1266,10 @@ class MultitenancyRenameTests(unittest.TestCase):
             'http',
         )
         calls['os_rename'].assert_any_call('/var/www/new.example.com', '/var/www/old.example.com')
+        calls['copy2'].assert_any_call(
+            '/var/www/.wo-rename-old.example.com-to-new.example.com-20260707-010203/nginx-site-available-old.example.com',
+            '/etc/nginx/sites-available/old.example.com',
+        )
 
     def test_rename_stale_ssl_includes_are_moved_and_restored_on_failure(self):
         timestamp = '20260707-123456'
@@ -1306,6 +1349,56 @@ class MultitenancyRenameHelperTests(unittest.TestCase):
         query.filter_by.side_effect = filter_by
         session.query.return_value = query
         return session
+
+    def test_relink_core_files_for_rename_replaces_absolute_core_links_with_relative_links(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        htdocs = os.path.join(tmp, 'htdocs')
+        shared = os.path.join(tmp, 'shared')
+        os.makedirs(htdocs)
+        os.makedirs(shared)
+        os.symlink(shared, os.path.join(htdocs, 'wp'))
+        core_files = (
+            'wp-login.php', 'wp-admin', 'wp-includes', 'wp-cron.php',
+            'xmlrpc.php', 'wp-comments-post.php', 'wp-settings.php',
+        )
+        for name in core_files:
+            target = os.path.join(shared, name)
+            if name in ('wp-admin', 'wp-includes'):
+                os.makedirs(target)
+            else:
+                with open(target, 'w') as fh:
+                    fh.write(f'{name}\n')
+            os.symlink(os.path.join(htdocs, 'wp', name), os.path.join(htdocs, name))
+
+        self.assertTrue(MTFunctions.relink_core_files_for_rename(mock.Mock(), htdocs))
+
+        for name in core_files:
+            link = os.path.join(htdocs, name)
+            self.assertTrue(os.path.islink(link), name)
+            self.assertEqual(os.readlink(link), f'wp/{name}')
+            self.assertTrue(os.path.exists(link), name)
+
+    def test_relink_core_files_for_rename_refuses_to_replace_real_core_path(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        htdocs = os.path.join(tmp, 'htdocs')
+        shared = os.path.join(tmp, 'shared')
+        os.makedirs(htdocs)
+        os.makedirs(shared)
+        os.symlink(shared, os.path.join(htdocs, 'wp'))
+        protected_path = os.path.join(htdocs, 'wp-login.php')
+        with open(protected_path, 'wb') as fh:
+            fh.write(b'custom login entrypoint')
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.error') as log_error:
+            self.assertFalse(MTFunctions.relink_core_files_for_rename(mock.Mock(), htdocs))
+
+        self.assertTrue(os.path.exists(protected_path))
+        self.assertFalse(os.path.islink(protected_path))
+        with open(protected_path, 'rb') as fh:
+            self.assertEqual(fh.read(), b'custom login entrypoint')
+        log_error.assert_called_once()
 
     def test_rewrite_wp_config_for_rename_preserves_db_credentials_and_salts(self):
         tmp = tempfile.mkdtemp()
