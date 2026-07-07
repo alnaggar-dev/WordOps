@@ -2232,5 +2232,546 @@ class ReloadServicesAfterConfigChangeTests(unittest.TestCase):
         self.assertTrue(log_warn.called)
         log_error.assert_not_called()
 
+
+
+class PluginThemeUpdateTests(unittest.TestCase):
+    """Focused tests for shared plugin/theme source updates."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _infra(self, root=None):
+        return SharedInfrastructure(mock.Mock(), root or self.tmp)
+
+    def _write_baseline(self, baseline, root=None):
+        root = root or self.tmp
+        config_dir = os.path.join(root, 'config')
+        os.makedirs(config_dir, exist_ok=True)
+        baseline_file = os.path.join(config_dir, 'baseline.json')
+        with open(baseline_file, 'w') as fh:
+            json.dump(baseline, fh)
+        return baseline_file
+
+    def _read_baseline(self, root=None):
+        with open(os.path.join(root or self.tmp, 'config', 'baseline.json')) as fh:
+            return json.load(fh)
+
+    def _patch_logs(self, stack):
+        for method in ('info', 'warn', 'error', 'debug'):
+            stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+
+    def test_load_config_keeps_bare_github_repo_values(self):
+        conf = """
+[multitenancy]
+shared_root = /tmp/shared
+
+[github_plugins]
+bare = owner/repo
+
+[github_themes]
+bare-theme = owner/theme
+"""
+
+        def read_config(parser, filenames, encoding=None):
+            parser.read_file(io.StringIO(conf))
+            return [filenames]
+
+        with mock.patch.object(mtf.os.path, 'exists', return_value=True), \
+                mock.patch.object(mtf.configparser.ConfigParser, 'read', read_config):
+            config = MTFunctions.load_config(mock.Mock())
+
+        self.assertEqual(config['github_plugins'], {'bare': 'owner/repo'})
+        self.assertEqual(config['github_themes'], {'bare-theme': 'owner/theme'})
+
+    def test_create_baseline_config_writes_sources_from_config_sections(self):
+        infra = self._infra()
+        os.makedirs(infra.config_dir, exist_ok=True)
+        config = {
+            'wordpress_plugins': {'wp-plugin': '5.3'},
+            'github_plugins': {'github-plugin': 'owner/repo,branch,main'},
+            'url_plugins': {'url-plugin': 'https://example.com/plugin.zip'},
+            'wordpress_themes': {'wp-theme': 'latest'},
+            'github_themes': {'github-theme': 'owner/theme,tag,1.2.3'},
+            'url_themes': {'url-theme': 'https://example.com/theme.zip'},
+        }
+
+        with mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            self.assertTrue(infra.create_baseline_config(config))
+
+        baseline = self._read_baseline()
+        self.assertEqual(baseline['sources']['plugins'], {
+            'wp-plugin': {'type': 'wordpress', 'version': '5.3'},
+            'github-plugin': {
+                'type': 'github',
+                'repo': 'owner/repo',
+                'ref_type': 'branch',
+                'ref': 'main',
+            },
+            'url-plugin': {'type': 'url', 'url': 'https://example.com/plugin.zip'},
+        })
+        self.assertEqual(baseline['sources']['themes'], {
+            'wp-theme': {'type': 'wordpress', 'version': 'latest'},
+            'github-theme': {
+                'type': 'github',
+                'repo': 'owner/theme',
+                'ref_type': 'tag',
+                'ref': '1.2.3',
+            },
+            'url-theme': {'type': 'url', 'url': 'https://example.com/theme.zip'},
+        })
+
+    def test_update_plugin_uses_baseline_github_source(self):
+        infra = self._infra()
+        self._write_baseline({
+            'plugins': ['custom'],
+            'sources': {
+                'plugins': {
+                    'custom': {
+                        'type': 'github',
+                        'repo': 'owner/repo',
+                        'ref_type': 'branch',
+                        'ref': 'main',
+                    },
+                },
+            },
+        })
+
+        with mock.patch.object(SharedInfrastructure, 'download_plugin_from_github', return_value=True) as download, \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            self.assertTrue(infra.update_plugin('custom', config={}))
+
+        download.assert_called_once_with(
+            'owner/repo',
+            'custom',
+            branch='main',
+            force=True,
+            backup_records=mock.ANY,
+        )
+
+    def test_update_plugin_falls_back_to_config_url_source(self):
+        infra = self._infra()
+        self._write_baseline({'plugins': ['custom']})
+
+        with mock.patch.object(SharedInfrastructure, 'download_plugin_from_url', return_value=True) as download, \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            self.assertTrue(infra.update_plugin(
+                'custom',
+                config={'url_plugins': {'custom': 'https://example.com/custom.zip'}},
+            ))
+
+        download.assert_called_once_with(
+            'https://example.com/custom.zip',
+            'custom',
+            force=True,
+            backup_records=mock.ANY,
+        )
+
+    def test_update_plugin_unknown_source_fails_without_guessing_wordpress_org(self):
+        infra = self._infra()
+        self._write_baseline({'plugins': ['premium']})
+
+        with mock.patch.object(SharedInfrastructure, 'download_plugin') as wp, \
+                mock.patch.object(SharedInfrastructure, 'download_plugin_from_github') as github, \
+                mock.patch.object(SharedInfrastructure, 'download_plugin_from_url') as url, \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            self.assertFalse(infra.update_plugin('premium', config={}))
+
+        wp.assert_not_called()
+        github.assert_not_called()
+        url.assert_not_called()
+
+    def test_update_theme_uses_baseline_theme_when_slug_missing(self):
+        infra = self._infra()
+        self._write_baseline({
+            'theme': 'woodmart-child',
+            'sources': {
+                'themes': {
+                    'woodmart-child': {
+                        'type': 'github',
+                        'repo': 'owner/theme',
+                        'ref_type': 'branch',
+                        'ref': 'main',
+                    },
+                },
+            },
+        })
+
+        with mock.patch.object(SharedInfrastructure, 'download_theme_from_github', return_value=True) as download, \
+                mock.patch('wo.core.logging.Log.info'), \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            self.assertTrue(infra.update_theme(config={}))
+
+        download.assert_called_once_with(
+            'owner/theme',
+            'woodmart-child',
+            branch='main',
+            force=True,
+            backup_records=mock.ANY,
+        )
+
+    def test_update_plugins_and_themes_dispatches_all_source_types(self):
+        infra = self._infra()
+        config = {
+            'wordpress_plugins': {'wp-source': '5.3'},
+            'github_plugins': {'github-source': 'owner/repo,branch,main'},
+            'url_plugins': {'url-source': 'https://example.com/url-source.zip'},
+            'wordpress_themes': {'wp-theme': '6.0'},
+            'github_themes': {'github-theme': 'owner/theme,tag,1.2.3'},
+            'url_themes': {'url-theme': 'https://example.com/url-theme.zip'},
+        }
+
+        with mock.patch.object(SharedInfrastructure, 'download_plugin', return_value=True) as download_plugin, \
+                mock.patch.object(SharedInfrastructure, 'download_plugin_from_github', return_value=True) as download_github, \
+                mock.patch.object(SharedInfrastructure, 'download_plugin_from_url', return_value=True) as download_url, \
+                mock.patch.object(SharedInfrastructure, 'download_theme', return_value=True) as download_theme, \
+                mock.patch.object(SharedInfrastructure, 'download_theme_from_github', return_value=True) as download_theme_github, \
+                mock.patch.object(SharedInfrastructure, 'download_theme_from_url', return_value=True) as download_theme_url, \
+                mock.patch('wo.core.logging.Log.warn'), \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            ok, backup_records = infra.update_plugins_and_themes(config)
+
+        self.assertTrue(ok)
+        self.assertIsInstance(backup_records, list)
+        download_plugin.assert_called_once_with(
+            'wp-source',
+            version='5.3',
+            force=True,
+            backup_records=mock.ANY,
+        )
+        download_github.assert_called_once_with(
+            'owner/repo',
+            'github-source',
+            branch='main',
+            force=True,
+            backup_records=mock.ANY,
+        )
+        download_url.assert_called_once_with(
+            'https://example.com/url-source.zip',
+            'url-source',
+            force=True,
+            backup_records=mock.ANY,
+        )
+        download_theme.assert_called_once_with(
+            'wp-theme',
+            version='6.0',
+            force=True,
+            backup_records=mock.ANY,
+        )
+        download_theme_github.assert_called_once_with(
+            'owner/theme',
+            'github-theme',
+            tag='1.2.3',
+            force=True,
+            backup_records=mock.ANY,
+        )
+        download_theme_url.assert_called_once_with(
+            'https://example.com/url-theme.zip',
+            'url-theme',
+            force=True,
+            backup_records=mock.ANY,
+        )
+
+    def test_update_plugins_and_themes_warns_and_skips_unknown_baseline_slug(self):
+        infra = self._infra()
+        self._write_baseline({
+            'plugins': ['known', 'unknown'],
+            'sources': {
+                'plugins': {
+                    'known': {'type': 'wordpress', 'version': 'latest'},
+                },
+            },
+        })
+
+        with mock.patch.object(infra, '_dispatch_download', return_value=True) as dispatch, \
+                mock.patch('wo.core.logging.Log.warn') as log_warn, \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            ok, backup_records = infra.update_plugins_and_themes({})
+
+        self.assertTrue(ok)
+        self.assertIsInstance(backup_records, list)
+        dispatch.assert_called_once_with(
+            'plugin',
+            'known',
+            {'type': 'wordpress', 'version': 'latest'},
+            force=True,
+            backup_records=mock.ANY,
+        )
+        log_warn.assert_called_once_with(
+            infra.app,
+            'No download source configured for plugin unknown; skipping',
+        )
+
+    def test_update_plugins_and_themes_restores_successes_when_later_item_fails(self):
+        infra = self._infra()
+        self._write_baseline({
+            'plugins': ['first', 'second'],
+            'sources': {
+                'plugins': {
+                    'first': {'type': 'wordpress', 'version': 'latest'},
+                    'second': {'type': 'wordpress', 'version': 'latest'},
+                },
+            },
+        })
+        record = {
+            'kind': 'plugin',
+            'slug': 'first',
+            'target': os.path.join(self.tmp, 'wp-content', 'plugins', 'first'),
+            'backup': os.path.join(self.tmp, 'backups', 'first'),
+        }
+
+        def dispatch(kind, slug, source, force=False, backup_records=None):
+            if slug == 'first':
+                backup_records.append(record)
+                return True
+            return False
+
+        with mock.patch.object(infra, '_dispatch_download', side_effect=dispatch) as dispatch_mock, \
+                mock.patch.object(infra, 'restore_asset_backups', return_value=True) as restore, \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.warn'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            result = infra.update_plugins_and_themes({})
+
+        self.assertEqual(result, (False, []))
+        self.assertEqual(dispatch_mock.call_count, 2)
+        restore.assert_called_once_with([record])
+
+    def test_promote_asset_force_restores_existing_on_failed_rename(self):
+        infra = self._infra()
+        target = os.path.join(self.tmp, 'wp-content', 'plugins', 'demo')
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, 'old.txt'), 'w') as fh:
+            fh.write('old')
+        staged_parent = os.path.join(self.tmp, 'tmp', 'assets')
+        staged_dir = os.path.join(staged_parent, 'wo_plugin_demo_test')
+        os.makedirs(staged_dir, exist_ok=True)
+        with open(os.path.join(staged_dir, 'new.txt'), 'w') as fh:
+            fh.write('new')
+        real_rename = os.rename
+
+        def fail_staged_to_target(src, dst):
+            if src == staged_dir:
+                raise OSError('promote failed')
+            return real_rename(src, dst)
+
+        backup_records = []
+        with mock.patch.object(mtf.os, 'rename', side_effect=fail_staged_to_target), \
+                mock.patch('wo.core.logging.Log.warn'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            ok = infra._promote_asset('plugin', 'demo', staged_dir, force=True, backup_records=backup_records)
+
+        self.assertFalse(ok)
+        self.assertEqual(backup_records, [])
+        self.assertTrue(os.path.exists(os.path.join(target, 'old.txt')))
+
+    def test_restore_asset_backups_reverts_successful_promotions(self):
+        infra = self._infra()
+        plugin_target = os.path.join(self.tmp, 'wp-content', 'plugins', 'demo')
+        theme_target = os.path.join(self.tmp, 'wp-content', 'themes', 'child')
+        os.makedirs(plugin_target, exist_ok=True)
+        os.makedirs(theme_target, exist_ok=True)
+        with open(os.path.join(plugin_target, 'old-plugin.txt'), 'w') as fh:
+            fh.write('old plugin')
+        with open(os.path.join(theme_target, 'old-theme.txt'), 'w') as fh:
+            fh.write('old theme')
+        staged_parent = os.path.join(self.tmp, 'tmp', 'assets')
+        plugin_staged = os.path.join(staged_parent, 'plugin-staged')
+        theme_staged = os.path.join(staged_parent, 'theme-staged')
+        os.makedirs(plugin_staged, exist_ok=True)
+        os.makedirs(theme_staged, exist_ok=True)
+        with open(os.path.join(plugin_staged, 'new-plugin.txt'), 'w') as fh:
+            fh.write('new plugin')
+        with open(os.path.join(theme_staged, 'new-theme.txt'), 'w') as fh:
+            fh.write('new theme')
+        records = []
+
+        with mock.patch('wo.core.logging.Log.warn'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            self.assertTrue(infra._promote_asset('plugin', 'demo', plugin_staged, force=True, backup_records=records))
+            self.assertTrue(infra._promote_asset('theme', 'child', theme_staged, force=True, backup_records=records))
+            self.assertTrue(infra.restore_asset_backups(records))
+
+        self.assertTrue(os.path.exists(os.path.join(plugin_target, 'old-plugin.txt')))
+        self.assertFalse(os.path.exists(os.path.join(plugin_target, 'new-plugin.txt')))
+        self.assertTrue(os.path.exists(os.path.join(theme_target, 'old-theme.txt')))
+        self.assertFalse(os.path.exists(os.path.join(theme_target, 'new-theme.txt')))
+
+    def test_wordpress_download_uses_version_pin_and_latest_stable_urls(self):
+        urls = []
+
+        def run_download(root, method_name, slug, version):
+            infra = self._infra(root)
+            os.makedirs(os.path.join(root, 'wp-content', 'plugins'), exist_ok=True)
+            os.makedirs(os.path.join(root, 'wp-content', 'themes'), exist_ok=True)
+            def fake_run(argv, **kwargs):
+                if argv[0] == 'curl':
+                    urls.append(argv[-1])
+                    with open(argv[3], 'wb') as fh:
+                        fh.write(b'PK\x03\x04')
+                    return mock.Mock(returncode=0, stdout='', stderr='')
+                if argv[0] == 'unzip':
+                    extract_dir = argv[-1]
+                    os.makedirs(os.path.join(extract_dir, slug), exist_ok=True)
+                    return mock.Mock(returncode=0, stdout='', stderr='')
+                raise AssertionError(f'unexpected command: {argv}')
+
+            with mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=fake_run), \
+                    mock.patch('wo.core.logging.Log.debug'), \
+                    mock.patch('wo.core.logging.Log.warn'):
+                return getattr(infra, method_name)(slug, version=version)
+
+        self.assertTrue(run_download(os.path.join(self.tmp, 'pinned-plugin'), 'download_plugin', 'akismet', '5.3'))
+        self.assertTrue(run_download(os.path.join(self.tmp, 'latest-plugin'), 'download_plugin', 'akismet', 'latest'))
+        self.assertTrue(run_download(os.path.join(self.tmp, 'pinned-theme'), 'download_theme', 'twentytwentyfour', '6.0'))
+
+        self.assertIn('https://downloads.wordpress.org/plugin/akismet.5.3.zip', urls)
+        self.assertIn('https://downloads.wordpress.org/plugin/akismet.latest-stable.zip', urls)
+        self.assertIn('https://downloads.wordpress.org/theme/twentytwentyfour.6.0.zip', urls)
+
+    def test_wordpress_download_unzip_failure_preserves_existing_target(self):
+        infra = self._infra()
+        target = os.path.join(self.tmp, 'wp-content', 'plugins', 'akismet')
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, 'old.txt'), 'w') as fh:
+            fh.write('old')
+        backup_records = []
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == 'curl':
+                with open(argv[3], 'wb') as fh:
+                    fh.write(b'PK\x03\x04')
+                return mock.Mock(returncode=0, stdout='', stderr='')
+            if argv[0] == 'unzip':
+                return mock.Mock(returncode=2, stdout='', stderr='bad zip')
+            raise AssertionError(f'unexpected command: {argv}')
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=fake_run), \
+                mock.patch('wo.core.logging.Log.debug'), \
+                mock.patch('wo.core.logging.Log.warn'):
+            ok = infra.download_plugin('akismet', version='latest', force=True, backup_records=backup_records)
+
+        self.assertFalse(ok)
+        self.assertTrue(os.path.exists(os.path.join(target, 'old.txt')))
+        self.assertEqual(backup_records, [])
+
+    def test_controller_bulk_update_restores_assets_on_canary_failure(self):
+        if mt is None:
+            self.skipTest(f'multitenancy controller import unavailable: {_mt_import_error}')
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        pargs = mock.Mock()
+        pargs.force = False
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+        asset_records = [{
+            'kind': 'plugin',
+            'slug': 'x',
+            'target': '/tmp/x',
+            'backup': '/tmp/b',
+        }]
+
+        with contextlib.ExitStack() as stack:
+            self._patch_logs(stack)
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_shared_sites', return_value=[{'domain': 'example.com'}]))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'load_config', return_value={'shared_root': self.tmp}))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'test_site', return_value=False))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'download_wordpress_core', return_value='wp-test'))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'update_plugins_and_themes', return_value=(True, asset_records)))
+            restore = stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'restore_asset_backups', return_value=True))
+            switch_release = stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'switch_release'))
+            stack.enter_context(mock.patch.object(mt.ReleaseManager, 'backup_current'))
+            ctrl.update()
+
+        restore.assert_called_once_with(asset_records)
+        switch_release.assert_not_called()
+
+    def test_add_plugin_github_records_source_in_baseline(self):
+        if mt is None:
+            self.skipTest(f'multitenancy controller import unavailable: {_mt_import_error}')
+        self._write_baseline({'version': 2, 'plugins': [], 'theme': 'active', 'sources': {}})
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        pargs = mock.Mock()
+        pargs.plugin_slug = 'custom'
+        pargs.site_name = None
+        pargs.apply_now = False
+        pargs.github = 'owner/repo'
+        pargs.branch = 'main'
+        pargs.tag = None
+        pargs.url = None
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+
+        def download(github_repo, plugin_slug, branch=None, tag=None):
+            plugin_dir = os.path.join(self.tmp, 'wp-content', 'plugins', plugin_slug)
+            os.makedirs(plugin_dir, exist_ok=True)
+            return True
+
+        with contextlib.ExitStack() as stack:
+            self._patch_logs(stack)
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'load_config', return_value={'shared_root': self.tmp}))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'download_plugin_from_github', side_effect=download))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'git_commit_baseline', return_value=True))
+            ctrl.add_plugin()
+
+        baseline = self._read_baseline()
+        self.assertEqual(baseline['version'], 3)
+        self.assertIn('custom', baseline['plugins'])
+        self.assertEqual(baseline['sources']['plugins']['custom'], {
+            'type': 'github',
+            'repo': 'owner/repo',
+            'ref_type': 'branch',
+            'ref': 'main',
+        })
+
+    def test_add_theme_url_records_source_in_baseline(self):
+        if mt is None:
+            self.skipTest(f'multitenancy controller import unavailable: {_mt_import_error}')
+        self._write_baseline({'version': 2, 'plugins': [], 'theme': 'active', 'sources': {}})
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        pargs = mock.Mock()
+        pargs.theme_slug = 'custom-theme'
+        pargs.site_name = None
+        pargs.set_default = False
+        pargs.apply_now = False
+        pargs.github = None
+        pargs.branch = None
+        pargs.tag = None
+        pargs.url = 'https://example.com/custom-theme.zip'
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+
+        def download(url, theme_slug):
+            theme_dir = os.path.join(self.tmp, 'wp-content', 'themes', theme_slug)
+            os.makedirs(theme_dir, exist_ok=True)
+            return True
+
+        with contextlib.ExitStack() as stack:
+            self._patch_logs(stack)
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'load_config', return_value={'shared_root': self.tmp}))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'download_theme_from_url', side_effect=download))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'git_commit_baseline', return_value=True))
+            ctrl.add_theme()
+
+        baseline = self._read_baseline()
+        self.assertEqual(baseline['version'], 3)
+        self.assertEqual(baseline['theme'], 'active')
+        self.assertEqual(baseline['sources']['themes']['custom-theme'], {
+            'type': 'url',
+            'url': 'https://example.com/custom-theme.zip',
+        })
 if __name__ == '__main__':
     unittest.main()

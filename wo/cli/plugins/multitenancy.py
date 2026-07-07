@@ -562,41 +562,49 @@ class WOMultitenancyController(CementBaseController):
         infra = SharedInfrastructure(self, shared_root)
         release_manager = ReleaseManager(self, shared_root)
 
+        asset_backups = []
+        core_switched = False
+
         try:
             # Create new release
             Log.info(self, "Creating new WordPress release...")
             new_release = infra.download_wordpress_core(config.get('wp_version'))
-            
-            # Update plugins and themes
+
+            # Update plugins and themes (staged; auto-restores on failure)
             Log.info(self, "Updating plugins and themes...")
-            infra.update_plugins_and_themes(config)
-            
+            assets_ok, asset_backups = infra.update_plugins_and_themes(config)
+            if not assets_ok:
+                Log.error(self, "Plugin/theme update failed; shared assets were restored")
+                return
+
             # Test with canary site if available
             if shared_sites and not pargs.force:
                 canary = shared_sites[0]
                 Log.info(self, f"Testing with canary site: {canary['domain']}")
                 if not MTFunctions.test_site(self, canary['domain']):
-                    Log.warn(self, "Canary test failed. Use --force to proceed anyway.")
+                    infra.restore_asset_backups(asset_backups)
+                    Log.warn(self, "Canary test failed; shared assets restored. Use --force to proceed anyway.")
                     return
-            
+
             # Backup current state
             Log.info(self, "Backing up current release...")
             release_manager.backup_current()
-            
+
             # Switch to new release
             Log.info(self, "Switching to new release...")
             infra.switch_release(new_release)
-            
+            core_switched = True
+
             # Clear all caches globally (fast - ~2 seconds for any number of sites)
             MTFunctions.clear_all_caches(self)
-            
+
             # Update database
             MTDatabase.update_release(self, new_release)
-            
+
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
             release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
-            
+
 
             Log.info(self, "✅ Update completed successfully!")
             Log.info(self, f"   New release: {new_release}")
@@ -605,6 +613,8 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"update_completed target=baseline result=success release={new_release}")
 
         except Exception as e:
+            if asset_backups and not core_switched:
+                infra.restore_asset_backups(asset_backups)
             Log.info(self, f"update_failed target=baseline result=failure")
             Log.error(self, f"Update failed: {str(e)}")
             Log.info(self, "Run 'wo multitenancy rollback' to revert")
@@ -1033,6 +1043,9 @@ class WOMultitenancyController(CementBaseController):
         if source_count > 1:
             Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
         
+        if branch and tag:
+            Log.error(self, "Specify only one GitHub ref: --branch OR --tag")
+        
         # Validate: branch/tag only valid with GitHub
         if (branch or tag) and not github_repo:
             Log.error(self, "--branch and --tag can only be used with --github")
@@ -1104,6 +1117,40 @@ class WOMultitenancyController(CementBaseController):
         baseline['generated'] = datetime.now().isoformat()
         baseline['plugins'].append(plugin_slug)
         
+        plugin_sources = baseline.setdefault('sources', {}).setdefault('plugins', {})
+        if github_repo:
+            if branch:
+                plugin_sources[plugin_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'branch',
+                    'ref': branch,
+                }
+            elif tag:
+                plugin_sources[plugin_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'tag',
+                    'ref': tag,
+                }
+            else:
+                plugin_sources[plugin_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'default',
+                    'ref': None,
+                }
+        elif url:
+            plugin_sources[plugin_slug] = {
+                'type': 'url',
+                'url': url,
+            }
+        else:
+            plugin_sources[plugin_slug] = {
+                'type': 'wordpress',
+                'version': 'latest',
+            }
+        
         # Write updated baseline
         with open(baseline_file, 'w') as f:
             json.dump(baseline, f, indent=2)
@@ -1163,6 +1210,9 @@ class WOMultitenancyController(CementBaseController):
         source_count = sum([bool(github_repo), bool(url)])
         if source_count > 1:
             Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
+        
+        if branch and tag:
+            Log.error(self, "Specify only one GitHub ref: --branch OR --tag")
         
         # Validate: branch/tag only valid with GitHub
         if (branch or tag) and not github_repo:
@@ -1229,6 +1279,40 @@ class WOMultitenancyController(CementBaseController):
         baseline['version'] = new_version
         baseline['generated'] = datetime.now().isoformat()
         
+        theme_sources = baseline.setdefault('sources', {}).setdefault('themes', {})
+        if github_repo:
+            if branch:
+                theme_sources[theme_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'branch',
+                    'ref': branch,
+                }
+            elif tag:
+                theme_sources[theme_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'tag',
+                    'ref': tag,
+                }
+            else:
+                theme_sources[theme_slug] = {
+                    'type': 'github',
+                    'repo': github_repo,
+                    'ref_type': 'default',
+                    'ref': None,
+                }
+        elif url:
+            theme_sources[theme_slug] = {
+                'type': 'url',
+                'url': url,
+            }
+        else:
+            theme_sources[theme_slug] = {
+                'type': 'wordpress',
+                'version': 'latest',
+            }
+        
         if set_default:
             old_theme = baseline.get('theme', 'none')
             baseline['theme'] = theme_slug
@@ -1291,6 +1375,8 @@ class WOMultitenancyController(CementBaseController):
         baseline['version'] = new_version
         baseline['generated'] = datetime.now().isoformat()
         baseline['plugins'].remove(plugin_slug)
+        plugin_sources = (baseline.get('sources') or {}).get('plugins') or {}
+        plugin_sources.pop(plugin_slug, None)
         
         # Write updated baseline
         with open(baseline_file, 'w') as f:
@@ -1317,8 +1403,8 @@ class WOMultitenancyController(CementBaseController):
         """
         Update a plugin from its original source (WordPress.org, GitHub, or URL)
         
-        This command re-downloads a plugin from the source specified in baseline.json,
-        allowing you to get the latest version while maintaining source information.
+        This command re-downloads a plugin from baseline ``sources`` metadata first,
+        then from /etc/wo/plugins.d/multitenancy.conf fallback.
         
         Usage:
             wo multitenancy update-plugin <slug>
@@ -1339,14 +1425,13 @@ class WOMultitenancyController(CementBaseController):
         
         # Update plugin using SharedInfrastructure method
         infra = SharedInfrastructure(self, shared_root)
-        success = infra.update_plugin(plugin_slug)
+        success = infra.update_plugin(plugin_slug, config=config)
         
         if success:
             Log.info(self, "")
             Log.info(self, f"✅ Plugin {plugin_slug} updated successfully")
             Log.info(self, "")
-            Log.info(self, "Next steps:")
-            Log.info(self, "  • Apply to all sites: wo multitenancy apply")
+            Log.info(self, "Shared plugin files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
         else:
             Log.error(self, f"Failed to update plugin {plugin_slug}")
             Log.error(self, "Check the error messages above for details")
@@ -1356,7 +1441,7 @@ class WOMultitenancyController(CementBaseController):
         """
         Update the theme from its original source (WordPress.org, GitHub, or URL)
         
-        This command re-downloads the theme from the source specified in baseline.json.
+        This command re-downloads the theme from baseline ``sources`` metadata first, then from /etc/wo/plugins.d/multitenancy.conf fallback.
         
         Usage:
             wo multitenancy update-theme
@@ -1384,14 +1469,13 @@ class WOMultitenancyController(CementBaseController):
         
         # Update theme using SharedInfrastructure method
         infra = SharedInfrastructure(self, shared_root)
-        success = infra.update_theme()
+        success = infra.update_theme(theme_name, config=config)
         
         if success:
             Log.info(self, "")
             Log.info(self, f"✅ Theme {theme_name} updated successfully")
             Log.info(self, "")
-            Log.info(self, "Next steps:")
-            Log.info(self, "  • Apply to all sites: wo multitenancy apply")
+            Log.info(self, "Shared theme files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
         else:
             Log.error(self, f"Failed to update theme {theme_name}")
             Log.error(self, "Check the error messages above for details")
@@ -1511,7 +1595,6 @@ class WOMultitenancyController(CementBaseController):
         
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
-        
         # Validate theme exists on disk
         theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
         if not os.path.exists(theme_dir):
@@ -1533,6 +1616,14 @@ class WOMultitenancyController(CementBaseController):
         baseline['version'] = new_version
         baseline['theme'] = theme_slug
         baseline['generated'] = datetime.now().isoformat()
+        infra = SharedInfrastructure(self, shared_root)
+        theme_sources = baseline.setdefault('sources', {}).setdefault('themes', {})
+        if theme_slug not in theme_sources:
+            source = infra._resolve_source('theme', theme_slug, config=config, baseline=baseline)
+            if source:
+                theme_sources[theme_slug] = source.copy()
+            else:
+                Log.warn(self, f"No download source configured for theme {theme_slug}; future update-theme will fail until a source is added")
         
         # Write updated baseline
         with open(baseline_file, 'w') as f:
@@ -1542,7 +1633,6 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, f"   Theme: {old_theme} → {theme_slug}")
         
         # Git commit
-        infra = SharedInfrastructure(self, shared_root)
         commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
         if infra.git_commit_baseline(commit_msg):
             Log.info(self, f"✅ Git: {commit_msg}")

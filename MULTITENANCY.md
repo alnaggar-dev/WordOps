@@ -158,7 +158,7 @@ Older templates may contain extra keys such as `baseline_plugins`, `baseline_the
 
 ## Baseline configuration
 
-`/var/www/shared/config/baseline.json` is the git-tracked source of truth for tenant activation and fleet-wide WordPress options:
+`/var/www/shared/config/baseline.json` is the git-tracked source of truth for tenant activation, fleet-wide WordPress options, and durable CLI-added plugin/theme source metadata:
 
 ```json
 {
@@ -166,9 +166,22 @@ Older templates may contain extra keys such as `baseline_plugins`, `baseline_the
   "generated": "2026-07-04T12:00:00Z",
   "plugins": [
     "redis-cache",
-    "nginx-helper"
+    "nginx-helper",
+    "custom-github",
+    "premium-url"
   ],
   "theme": "twentytwentyfour",
+  "sources": {
+    "plugins": {
+      "redis-cache": { "type": "wordpress", "version": "latest" },
+      "custom-github": { "type": "github", "repo": "owner/repo", "ref_type": "branch", "ref": "main" },
+      "premium-url": { "type": "url", "url": "https://example.com/plugin.zip" }
+    },
+    "themes": {
+      "twentytwentyfour": { "type": "wordpress", "version": "latest" },
+      "custom-theme": { "type": "github", "repo": "owner/theme", "ref_type": "default", "ref": null }
+    }
+  },
   "options": {
     "blog_public": false,
     "timezone_string": "UTC",
@@ -182,6 +195,8 @@ Older templates may contain extra keys such as `baseline_plugins`, `baseline_the
 ```
 
 `plugins` is the additive activation list unless `apply --prune` is used. `theme` is the active theme slug. `options` is applied with `wp option update` during site creation and `wo multitenancy apply`: scalar values become strings (`true`/`false` become `1`/`0`), while arrays and objects are written as JSON.
+
+`sources` is optional and records where shared plugins and themes are downloaded from. Source entries use one of these shapes: WordPress.org `{ "type": "wordpress", "version": "latest" }` or a pinned version, GitHub `{ "type": "github", "repo": "owner/repo", "ref_type": "branch" | "tag" | "default", "ref": "main" | "v1.2.3" | null }`, or URL `{ "type": "url", "url": "https://example.com/plugin.zip" }`. `baseline.json` is now the durable source metadata for CLI-added plugins/themes, while `/etc/wo/plugins.d/multitenancy.conf` remains the packaged/operator source catalog and fallback for older baselines.
 
 `wo multitenancy init` creates `baseline.json` only when the file is missing. It never overwrites an existing baseline, even with `--force`. The first file is a starting template: legacy `baseline_plugins` or `baseline_theme` keys take precedence when present; otherwise plugins are seeded from the keys in `[wordpress_plugins]`, `[github_plugins]`, and `[url_plugins]`, and the theme is seeded from the first `[wordpress_themes]` entry, the `-child` entry in `[github_themes]`, or the first available theme source. After that first write, the file is operator-owned and init does not rewrite it.
 
@@ -197,8 +212,8 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | --- | --- |
 | `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe but never overwrites an existing baseline. |
 | `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. For `--wpfc`/`--wpredis` sites that include `nginx-helper` in the baseline, it also enables Nginx Helper cache purging automatically. See [create options](#create-options). |
-| `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, update shared plugins/themes, canary-test, back up and switch release, and clear caches. `--force` skips the canary abort. This command does not bump the baseline version. |
-| `wo multitenancy rollback [--force]` | Switch `current` back to the previous release. `--force` skips confirmation. |
+| `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, refresh all shared plugin/theme sources from baseline metadata or config fallback, restore shared assets if a download/promote fails or the canary aborts, then back up and switch the core release and clear caches. `--force` skips the canary abort. This command does not bump the baseline version. |
+| `wo multitenancy rollback [--force]` | Switch `current` back to the previous WordPress core release only. It does not roll back plugin/theme updates after a successful update command. Failed bulk updates restore shared asset backups automatically before returning. `--force` skips confirmation. |
 | `wo multitenancy delete <domain> [--force]` | Delete a tenant with `wo site delete ... --no-prompt`, then remove its multi-tenancy tracking row. |
 | `wo multitenancy remove [--force]` | Tear down the entire shared infrastructure. It refuses while sites remain unless `--force` is used. |
 
@@ -219,12 +234,12 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 | `wo multitenancy add-plugin <slug> [--github=user/repo] [--branch=<b> \| --tag=<t>] [--url=<zip>] [--apply-now]` | Add a plugin to `baseline.json` and commit it. Default source is WordPress.org; GitHub and URL zip sources are supported. `--apply-now` rolls out immediately. |
 | `wo multitenancy add-theme <slug> [--github=user/repo] [--branch=<b> \| --tag=<t>] [--url=<zip>] [--set-default] [--apply-now]` | Add a theme from WordPress.org, GitHub, or URL zip and commit it. `--set-default` makes it the baseline active theme. `--apply-now` rolls out when the theme is also default. |
 | `wo multitenancy remove-plugin <slug> [--apply-now]` | Remove a plugin from the baseline and commit it. This is baseline-only; it does not live-deactivate the plugin on sites. |
-| `wo multitenancy update-plugin <slug>` | Re-fetch a plugin from its original source. |
-| `wo multitenancy update-theme` | Re-fetch the configured baseline theme from its original source. Takes no slug. |
+| `wo multitenancy update-plugin <slug>` | Re-fetch a plugin from baseline `sources` metadata first, then `/etc/wo/plugins.d/multitenancy.conf` fallback. Shared plugin files become live for all sites immediately. |
+| `wo multitenancy update-theme` | Re-fetch the configured baseline theme from baseline `sources` metadata first, then `/etc/wo/plugins.d/multitenancy.conf` fallback. Shared theme files become live for all sites immediately. Takes no slug. |
 | `wo multitenancy set-theme <slug> [--apply-now]` | Set an already-present shared theme as the baseline default, commit it, and optionally apply. |
 | `wo multitenancy apply [--dry-run] [--prune] [--verbose]` | Apply the current baseline to every enabled site by activating plugins, activating the theme, and updating `options` through wp-cli. Default behavior is additive: plugins already active but absent from the baseline stay active. `--prune` is destructive and deactivates active plugins not listed in `baseline.json`; run `--dry-run --prune` first to see the exact would-be-deactivated set. For `--wpfc`/`--wpredis` sites with `nginx-helper` in the baseline, it also (re)enables Nginx Helper cache purging. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. |
 | `wo multitenancy history` | Show the last 20 git commits of `config/baseline.json`. |
-| `wo multitenancy baseline-rollback --to-version=N [--apply-now] [--force]` | Find the git commit for baseline version `N`, check out `baseline.json` from it, commit the rollback, and optionally apply to sites. |
+| `wo multitenancy baseline-rollback --to-version=N [--apply-now] [--force]` | Find the git commit for baseline version `N`, check out `baseline.json` from it, commit the rollback, and optionally apply to sites. This can restore an older baseline without `sources`; afterward updates fall back to `/etc/wo/plugins.d/multitenancy.conf`, and per-item updates fail for slugs still lacking a source. |
 
 ### Shared config & maintenance
 

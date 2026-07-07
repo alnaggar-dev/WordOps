@@ -7,6 +7,7 @@ import re
 import json
 import shutil
 import subprocess
+import tempfile
 import time as _time
 import random
 import string
@@ -83,7 +84,7 @@ class MTFunctions:
             github_plugins = {}
             for key, value in config.items('github_plugins'):
                 # Skip items that don't look like GitHub repo definitions
-                if ',' in value and '/' in value:
+                if '/' in value:
                     github_plugins[key] = value
             if github_plugins:
                 result['github_plugins'] = github_plugins
@@ -93,7 +94,7 @@ class MTFunctions:
             github_themes = {}
             for key, value in config.items('github_themes'):
                 # Skip items that don't look like GitHub repo definitions
-                if ',' in value and '/' in value:
+                if '/' in value:
                     github_themes[key] = value
             if github_themes:
                 result['github_themes'] = github_themes
@@ -1221,6 +1222,95 @@ class SharedInfrastructure:
         self.wp_content_dir = f"{shared_root}/wp-content"
         self.config_dir = f"{shared_root}/config"
     
+    def _parse_github_source(self, repo_info):
+        """Return durable GitHub source metadata for a repo definition."""
+        if not isinstance(repo_info, str):
+            return None
+
+        parts = [part.strip() for part in repo_info.split(',')]
+        repo = parts[0] if parts else ''
+        if '/' not in repo:
+            return None
+
+        ref_type = 'default'
+        ref = None
+        if len(parts) >= 3 and parts[1] in ('branch', 'tag') and parts[2]:
+            ref_type = parts[1]
+            ref = parts[2]
+
+        return {
+            'type': 'github',
+            'repo': repo,
+            'ref_type': ref_type,
+            'ref': ref
+        }
+
+    def _wordpress_source(self, version='latest'):
+        """Return durable WordPress.org source metadata."""
+        return {
+            'type': 'wordpress',
+            'version': version or 'latest'
+        }
+
+    def _load_baseline(self):
+        """Read baseline metadata, returning an empty dict when unavailable."""
+        baseline_file = f"{self.config_dir}/baseline.json"
+        if not os.path.exists(baseline_file):
+            Log.debug(self.app, f"Baseline file not found: {baseline_file}")
+            return {}
+
+        try:
+            with open(baseline_file, 'r') as f:
+                return json.load(f)
+        except ValueError as e:
+            Log.warn(self.app, f"Invalid baseline JSON in {baseline_file}: {e}")
+            return {}
+        except OSError as e:
+            Log.warn(self.app, f"Unable to read baseline file {baseline_file}: {e}")
+            return {}
+
+    def _resolve_source(self, kind, slug, config=None, baseline=None):
+        """Resolve a source dict for a plugin or theme slug."""
+        suffix = 'plugins' if kind == 'plugin' else 'themes'
+        if baseline is None:
+            baseline = self._load_baseline()
+        if config is None:
+            config = MTFunctions.load_config(self.app)
+
+        source = (baseline.get('sources') or {}).get(suffix, {}).get(slug)
+        if source:
+            return source
+
+        github_sources = config.get('github_' + suffix, {})
+        if slug in github_sources:
+            parsed = self._parse_github_source(github_sources[slug])
+            if parsed:
+                return parsed
+
+        url_sources = config.get('url_' + suffix, {})
+        if slug in url_sources:
+            return {
+                'type': 'url',
+                'url': url_sources[slug]
+            }
+
+        wordpress_sources = config.get('wordpress_' + suffix, {})
+        if slug in wordpress_sources:
+            return self._wordpress_source(wordpress_sources[slug])
+
+        if kind == 'plugin':
+            legacy = config.get('baseline_plugins', [])
+            if isinstance(legacy, str):
+                legacy = [item.strip() for item in legacy.split(',')]
+            else:
+                legacy = [item.strip() for item in legacy if item]
+            if slug in legacy:
+                return self._wordpress_source('latest')
+        elif config.get('baseline_theme') == slug:
+            return self._wordpress_source('latest')
+
+        return None
+    
     def create_directory_structure(self):
         """Create shared directory structure"""
         directories = [
@@ -1381,21 +1471,22 @@ die($error_msg);
         if github_plugins:
             for plugin_slug, repo_info in github_plugins.items():
                 if isinstance(repo_info, str):
-                    # Parse format: "user/repo,branch,name" or "user/repo,tag,name"
-                    parts = [p.strip() for p in repo_info.split(',')]
-                    if len(parts) >= 2:
-                        github_repo = parts[0]
-                        ref_type = parts[1]  # 'branch' or 'tag'
-                        ref_name = parts[2] if len(parts) > 2 else None
+                    parsed = self._parse_github_source(repo_info)
+                    if not parsed:
+                        continue
 
-                        if ref_type == 'branch' and ref_name:
-                            ok = self.download_plugin_from_github(github_repo, plugin_slug, branch=ref_name)
-                        elif ref_type == 'tag' and ref_name:
-                            ok = self.download_plugin_from_github(github_repo, plugin_slug, tag=ref_name)
-                        else:
-                            ok = self.download_plugin_from_github(github_repo, plugin_slug)
-                        if not ok:
-                            failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
+                    github_repo = parsed['repo']
+                    branch = parsed['ref'] if parsed['ref_type'] == 'branch' else None
+                    tag = parsed['ref'] if parsed['ref_type'] == 'tag' else None
+
+                    if branch:
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug, branch=branch)
+                    elif tag:
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug, tag=tag)
+                    else:
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug)
+                    if not ok:
+                        failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
 
         # Download WordPress.org theme sources. New configs use
         # [wordpress_themes]; legacy configs fall back to baseline_theme.
@@ -1416,21 +1507,22 @@ die($error_msg);
         if github_themes:
             for theme_slug, repo_info in github_themes.items():
                 if isinstance(repo_info, str):
-                    # Parse format: "user/repo,branch,name" or "user/repo,tag,name"
-                    parts = [p.strip() for p in repo_info.split(',')]
-                    if len(parts) >= 2:
-                        github_repo = parts[0]
-                        ref_type = parts[1]  # 'branch' or 'tag'
-                        ref_name = parts[2] if len(parts) > 2 else None
+                    parsed = self._parse_github_source(repo_info)
+                    if not parsed:
+                        continue
 
-                        if ref_type == 'branch' and ref_name:
-                            ok = self.download_theme_from_github(github_repo, theme_slug, branch=ref_name)
-                        elif ref_type == 'tag' and ref_name:
-                            ok = self.download_theme_from_github(github_repo, theme_slug, tag=ref_name)
-                        else:
-                            ok = self.download_theme_from_github(github_repo, theme_slug)
-                        if not ok:
-                            failures.append(f"theme '{theme_slug}' (GitHub {github_repo})")
+                    github_repo = parsed['repo']
+                    branch = parsed['ref'] if parsed['ref_type'] == 'branch' else None
+                    tag = parsed['ref'] if parsed['ref_type'] == 'tag' else None
+
+                    if branch:
+                        ok = self.download_theme_from_github(github_repo, theme_slug, branch=branch)
+                    elif tag:
+                        ok = self.download_theme_from_github(github_repo, theme_slug, tag=tag)
+                    else:
+                        ok = self.download_theme_from_github(github_repo, theme_slug)
+                    if not ok:
+                        failures.append(f"theme '{theme_slug}' (GitHub {github_repo})")
 
         # Download URL plugins
         if url_plugins:
@@ -1448,7 +1540,116 @@ die($error_msg);
 
         return failures
     
-    def download_plugin(self, plugin_slug):
+    def _asset_parent(self, kind):
+        """Return the live shared parent dir for plugins or themes."""
+        sub = 'plugins' if kind == 'plugin' else 'themes'
+        return f"{self.wp_content_dir}/{sub}"
+
+    def _promote_asset(self, kind, slug, staged_dir, force=False, backup_records=None):
+        """Move staged_dir into the live shared asset path, backing up an
+        existing target when force=True. A promotion record is appended only
+        after the staged dir is successfully renamed into the target."""
+        target = f"{self._asset_parent(kind)}/{slug}"
+
+        if os.path.exists(target) and not force:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            Log.debug(self.app, f"{kind} {slug} already exists, skipping replace")
+            return True
+
+        backup = None
+        if os.path.exists(target):
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            backup = f"{self.shared_root}/backups/assets/{stamp}/{kind}s/{slug}"
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            try:
+                os.rename(target, backup)
+            except OSError as e:
+                Log.warn(self.app, f"Could not back up existing {kind} {slug}: {e}")
+                shutil.rmtree(staged_dir, ignore_errors=True)
+                return False
+
+        try:
+            os.rename(staged_dir, target)
+        except OSError as e:
+            Log.warn(self.app, f"Could not promote {kind} {slug}: {e}")
+            if os.path.exists(target):
+                shutil.rmtree(target, ignore_errors=True)
+            if backup is not None:
+                try:
+                    os.rename(backup, target)
+                except OSError as e2:
+                    Log.warn(self.app, f"Could not restore backup for {kind} {slug}: {e2}")
+            return False
+
+        if backup_records is not None:
+            backup_records.append({'kind': kind, 'slug': slug, 'target': target, 'backup': backup})
+        return True
+
+    def restore_asset_backups(self, backup_records):
+        """Reverse successful _promote_asset() records in reverse order.
+        Return True only if every restore succeeded."""
+        all_ok = True
+        for record in reversed(backup_records or []):
+            target = record.get('target')
+            backup = record.get('backup')
+            try:
+                if os.path.islink(target) or os.path.isfile(target):
+                    os.unlink(target)
+                elif os.path.isdir(target):
+                    shutil.rmtree(target)
+            except OSError as e:
+                Log.warn(self.app, f"Could not remove {target} during restore: {e}")
+                all_ok = False
+                continue
+            if backup is not None:
+                if os.path.exists(backup):
+                    try:
+                        os.rename(backup, target)
+                    except OSError as e:
+                        Log.warn(self.app, f"Could not restore backup {backup}: {e}")
+                        all_ok = False
+                else:
+                    Log.warn(self.app, f"Backup missing for {target}: {backup}")
+                    all_ok = False
+        return all_ok
+
+    def _dispatch_download(self, kind, slug, source, force=False, backup_records=None):
+        """Call the correct download_* helper for a resolved source dict."""
+        stype = (source or {}).get('type')
+        if kind == 'plugin':
+            if stype == 'wordpress':
+                return self.download_plugin(slug, version=source.get('version', 'latest'),
+                                            force=force, backup_records=backup_records)
+            if stype == 'github':
+                kwargs = {}
+                if source.get('ref_type') == 'branch' and source.get('ref'):
+                    kwargs['branch'] = source['ref']
+                elif source.get('ref_type') == 'tag' and source.get('ref'):
+                    kwargs['tag'] = source['ref']
+                return self.download_plugin_from_github(source['repo'], slug, force=force,
+                                                        backup_records=backup_records, **kwargs)
+            if stype == 'url':
+                return self.download_plugin_from_url(source['url'], slug,
+                                                     force=force, backup_records=backup_records)
+        else:
+            if stype == 'wordpress':
+                return self.download_theme(slug, version=source.get('version', 'latest'),
+                                           force=force, backup_records=backup_records)
+            if stype == 'github':
+                kwargs = {}
+                if source.get('ref_type') == 'branch' and source.get('ref'):
+                    kwargs['branch'] = source['ref']
+                elif source.get('ref_type') == 'tag' and source.get('ref'):
+                    kwargs['tag'] = source['ref']
+                return self.download_theme_from_github(source['repo'], slug, force=force,
+                                                       backup_records=backup_records, **kwargs)
+            if stype == 'url':
+                return self.download_theme_from_url(source['url'], slug,
+                                                    force=force, backup_records=backup_records)
+        Log.error(self.app, f"Unknown source type for {kind} {slug}: {stype}", exit=False)
+        return False
+
+    def download_plugin(self, plugin_slug, version='latest', force=False, backup_records=None):
         """Download a plugin from WordPress.org.
 
         Returns True on success or if the plugin is already present, False if
@@ -1456,49 +1657,45 @@ die($error_msg);
         """
         plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
 
-        if os.path.exists(plugin_dir):
+        if os.path.exists(plugin_dir) and not force:
             return True
 
-        success = False
+        os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"wo_plugin_{plugin_slug}_", dir=f"{self.shared_root}/tmp/assets")
         try:
-            # Create temp directory for plugin download
-            temp_dir = f"/tmp/wo_plugin_{plugin_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
-
-            # Download plugin zip from wordpress.org
-            plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.latest-stable.zip"
+            if not version or version == 'latest':
+                plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.latest-stable.zip"
+            else:
+                plugin_url = f"https://downloads.wordpress.org/plugin/{plugin_slug}.{version}.zip"
             zip_file = f"{temp_dir}/{plugin_slug}.zip"
 
-            # Download using curl
             download_cmd = ['curl', '-L', '-o', zip_file, plugin_url]
             result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
 
-            if result.returncode == 0 and os.path.exists(zip_file):
-                # Extract the plugin
-                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-                subprocess.run(unzip_cmd, capture_output=True, check=False)
-
-                # Move to shared plugins directory
-                extracted_plugin = f"{temp_dir}/{plugin_slug}"
-                if os.path.exists(extracted_plugin):
-                    shutil.move(extracted_plugin, plugin_dir)
-                    Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
-                    success = True
-                else:
-                    Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
-            else:
+            if result.returncode != 0 or not os.path.exists(zip_file):
                 Log.debug(self.app, f"Plugin download failed for: {plugin_slug}")
+                return False
 
-            # Cleanup temp directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            res = subprocess.run(unzip_cmd, capture_output=True, check=False)
+            if res.returncode != 0:
+                Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
+                return False
 
+            extracted_plugin = f"{temp_dir}/{plugin_slug}"
+            if not os.path.exists(extracted_plugin):
+                Log.debug(self.app, f"Plugin extraction failed for: {plugin_slug}")
+                return False
+
+            Log.debug(self.app, f"Downloaded plugin: {plugin_slug}")
+            return self._promote_asset('plugin', plugin_slug, extracted_plugin, force=force, backup_records=backup_records)
         except Exception as e:
             Log.debug(self.app, f"Could not download plugin {plugin_slug}: {e}")
+            return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-        return success
-    
-    def download_theme(self, theme_slug):
+    def download_theme(self, theme_slug, version='latest', force=False, backup_records=None):
         """Download a theme from WordPress.org.
 
         Returns True on success or if the theme is already present, False if the
@@ -1506,49 +1703,45 @@ die($error_msg);
         """
         theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
 
-        if os.path.exists(theme_dir):
+        if os.path.exists(theme_dir) and not force:
             return True
 
-        success = False
+        os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"wo_theme_{theme_slug}_", dir=f"{self.shared_root}/tmp/assets")
         try:
             Log.debug(self.app, f"Downloading theme: {theme_slug}")
 
-            # Create temp directory for theme download
-            temp_dir = f"/tmp/wo_theme_{theme_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
-
-            # Download theme zip from wordpress.org
-            theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
+            if not version or version == 'latest':
+                theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.latest-stable.zip"
+            else:
+                theme_url = f"https://downloads.wordpress.org/theme/{theme_slug}.{version}.zip"
             zip_file = f"{temp_dir}/{theme_slug}.zip"
 
-            # Download using curl
             download_cmd = ['curl', '-L', '-o', zip_file, theme_url]
             result = subprocess.run(download_cmd, capture_output=True, text=True, check=False)
 
-            if result.returncode == 0 and os.path.exists(zip_file):
-                # Extract the theme
-                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-                subprocess.run(unzip_cmd, capture_output=True, check=False)
-
-                # Move to shared themes directory
-                extracted_theme = f"{temp_dir}/{theme_slug}"
-                if os.path.exists(extracted_theme):
-                    shutil.move(extracted_theme, theme_dir)
-                    Log.debug(self.app, f"Downloaded theme: {theme_slug}")
-                    success = True
-                else:
-                    Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
-            else:
+            if result.returncode != 0 or not os.path.exists(zip_file):
                 Log.debug(self.app, f"Theme download failed for: {theme_slug}")
+                return False
 
-            # Cleanup temp directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+            res = subprocess.run(unzip_cmd, capture_output=True, check=False)
+            if res.returncode != 0:
+                Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
+                return False
 
+            extracted_theme = f"{temp_dir}/{theme_slug}"
+            if not os.path.exists(extracted_theme):
+                Log.debug(self.app, f"Theme extraction failed for: {theme_slug}")
+                return False
+
+            Log.debug(self.app, f"Downloaded theme: {theme_slug}")
+            return self._promote_asset('theme', theme_slug, extracted_theme, force=force, backup_records=backup_records)
         except Exception as e:
             Log.debug(self.app, f"Could not download theme {theme_slug}: {e}")
-
-        return success
+            return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
     # ==========================================
@@ -1596,7 +1789,7 @@ die($error_msg);
         return subprocess.run(
             cmd, capture_output=True, text=True, input=curl_input)
 
-    def download_plugin_from_github(self, github_repo, plugin_slug, branch=None, tag=None):
+    def download_plugin_from_github(self, github_repo, plugin_slug, branch=None, tag=None, force=False, backup_records=None):
         """
         Download a plugin from a GitHub repository
         
@@ -1616,14 +1809,13 @@ die($error_msg);
         Example:
             infra.download_plugin_from_github('user/my-plugin', 'my-plugin', tag='v1.5.0')
         """
+        plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
+        
+        if os.path.exists(plugin_dir) and not force:
+            Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
+            return True
+        
         try:
-            plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
-            
-            # Check if plugin already exists on disk
-            if os.path.exists(plugin_dir):
-                Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
-                return True
-            
             # Construct the appropriate GitHub archive URL
             # GitHub archive URLs follow this pattern:
             # - For tags: https://github.com/user/repo/archive/refs/tags/TAG.zip
@@ -1642,72 +1834,57 @@ die($error_msg);
                 Log.debug(self.app, f"Downloading from GitHub (trying 'main' branch)")
             
             # Create temporary directory for download and extraction
-            temp_dir = f"/tmp/wo_github_{plugin_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
-            zip_file = f"{temp_dir}/{plugin_slug}.zip"
-            
-            # Download the zip (authenticated when a GitHub token is available)
-            result = self._github_curl(url, zip_file)
-            
-            # If download failed and we were trying 'main', fallback to 'master'
-            if result.returncode != 0 and not branch and not tag:
-                Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
-                url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+            os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix=f"wo_plugin_{plugin_slug}_", dir=f"{self.shared_root}/tmp/assets")
+            try:
+                zip_file = f"{temp_dir}/{plugin_slug}.zip"
+                
+                # Download the zip (authenticated when a GitHub token is available)
                 result = self._github_curl(url, zip_file)
-            
-            # Verify download was successful
-            if result.returncode != 0 or not os.path.exists(zip_file):
-                Log.debug(self.app, f"Failed to download from GitHub: {github_repo}")
-                # Cleanup temp directory
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Extract the downloaded zip file
-            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-            result = subprocess.run(unzip_cmd, capture_output=True)
-            
-            if result.returncode != 0:
-                Log.debug(self.app, "Failed to extract GitHub archive")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Find the extracted directory
-            # GitHub creates a directory named like: repo-branch or repo-tag
-            # We need to find it and rename it to the plugin_slug
-            extracted = None
-            for item in os.listdir(temp_dir):
-                item_path = f"{temp_dir}/{item}"
-                # Skip __MACOSX and the zip file itself
-                if os.path.isdir(item_path) and item not in ['__MACOSX', plugin_slug]:
-                    extracted = item_path
-                    break
-            
-            if not extracted:
-                Log.debug(self.app, "No directory found in GitHub archive")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Move the extracted directory to the plugins directory with correct name
-            shutil.move(extracted, plugin_dir)
-            
-            # Cleanup temporary directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
-            Log.debug(self.app, f"Successfully downloaded plugin from GitHub: {github_repo}")
-            return True
-            
+                
+                # If download failed and we were trying 'main', fallback to 'master'
+                if result.returncode != 0 and not branch and not tag:
+                    Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
+                    url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                    result = self._github_curl(url, zip_file)
+                
+                # Verify download was successful
+                if result.returncode != 0 or not os.path.exists(zip_file):
+                    Log.debug(self.app, f"Failed to download from GitHub: {github_repo}")
+                    return False
+                
+                # Extract the downloaded zip file
+                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                result = subprocess.run(unzip_cmd, capture_output=True)
+                
+                if result.returncode != 0:
+                    Log.debug(self.app, "Failed to extract GitHub archive")
+                    return False
+                
+                # Find the extracted directory
+                # GitHub creates a directory named like: repo-branch or repo-tag
+                # We need to find it and rename it to the plugin_slug
+                extracted = None
+                for item in os.listdir(temp_dir):
+                    item_path = f"{temp_dir}/{item}"
+                    # Skip __MACOSX and the zip file itself
+                    if os.path.isdir(item_path) and item not in ['__MACOSX', plugin_slug]:
+                        extracted = item_path
+                        break
+                
+                if not extracted:
+                    Log.debug(self.app, "No directory found in GitHub archive")
+                    return False
+                
+                Log.debug(self.app, f"Successfully downloaded plugin from GitHub: {github_repo}")
+                return self._promote_asset('plugin', plugin_slug, extracted, force=force, backup_records=backup_records)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             Log.debug(self.app, f"GitHub plugin download failed: {e}")
-            # Ensure cleanup on error
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
             return False
     
-    def download_plugin_from_url(self, url, plugin_slug):
+    def download_plugin_from_url(self, url, plugin_slug, force=False, backup_records=None):
         """
         Download a plugin from a direct URL
         
@@ -1724,17 +1901,15 @@ die($error_msg);
         Example:
             infra.download_plugin_from_url('https://example.com/my-plugin.zip', 'my-plugin')
         """
+        plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
+        
+        if os.path.exists(plugin_dir) and not force:
+            Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
+            return True
+        
+        os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"wo_plugin_{plugin_slug}_", dir=f"{self.shared_root}/tmp/assets")
         try:
-            plugin_dir = f"{self.wp_content_dir}/plugins/{plugin_slug}"
-            
-            # Check if plugin already exists
-            if os.path.exists(plugin_dir):
-                Log.debug(self.app, f"Plugin {plugin_slug} already exists, skipping download")
-                return True
-            
-            # Create temporary directory for download
-            temp_dir = f"/tmp/wo_url_{plugin_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
             zip_file = f"{temp_dir}/{plugin_slug}.zip"
             
             Log.debug(self.app, f"Downloading plugin from URL: {url}")
@@ -1746,8 +1921,6 @@ die($error_msg);
             # Verify download was successful
             if result.returncode != 0 or not os.path.exists(zip_file):
                 Log.debug(self.app, f"Failed to download from URL: {url}")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
                 return False
             
             # Verify it's actually a zip file (check magic bytes)
@@ -1756,8 +1929,6 @@ die($error_msg);
                 # ZIP files start with 'PK\x03\x04' or 'PK\x05\x06' (empty archive)
                 if not (magic[:2] == b'PK'):
                     Log.debug(self.app, "Downloaded file is not a valid ZIP archive")
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir)
                     return False
             
             # Extract the zip file
@@ -1766,8 +1937,6 @@ die($error_msg);
             
             if result.returncode != 0:
                 Log.debug(self.app, "Failed to extract plugin zip")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
                 return False
             
             # Find the extracted directory
@@ -1782,45 +1951,32 @@ die($error_msg);
             
             if not extracted:
                 # Maybe it's a single-file plugin or flat structure
-                # In this case, create a directory and move all PHP files there
+                # In this case, create a staged directory and move all top-level files there
                 Log.debug(self.app, "No plugin directory found, checking for flat structure")
                 php_files = [f for f in os.listdir(temp_dir) if f.endswith('.php')]
                 if php_files:
-                    # Create plugin directory and move contents
-                    os.makedirs(plugin_dir, exist_ok=True)
+                    staged = tempfile.mkdtemp(prefix=f"staged_{plugin_slug}_", dir=temp_dir)
                     for item in os.listdir(temp_dir):
-                        if item != plugin_slug + '.zip':
-                            src = f"{temp_dir}/{item}"
-                            dst = f"{plugin_dir}/{item}"
-                            if os.path.isfile(src):
-                                shutil.move(src, dst)
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir)
+                        if item == plugin_slug + '.zip':
+                            continue
+                        src = f"{temp_dir}/{item}"
+                        dst = f"{staged}/{item}"
+                        if os.path.isfile(src):
+                            shutil.move(src, dst)
                     Log.debug(self.app, f"Downloaded plugin from URL (flat structure)")
-                    return True
-                else:
-                    Log.debug(self.app, "No valid plugin structure found in archive")
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir)
-                    return False
-            
-            # Move extracted directory to plugins directory
-            shutil.move(extracted, plugin_dir)
-            
-            # Cleanup temporary directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+                    return self._promote_asset('plugin', plugin_slug, staged, force=force, backup_records=backup_records)
+                Log.debug(self.app, "No valid plugin structure found in archive")
+                return False
             
             Log.debug(self.app, f"Successfully downloaded plugin from URL")
-            return True
-            
+            return self._promote_asset('plugin', plugin_slug, extracted, force=force, backup_records=backup_records)
         except Exception as e:
             Log.debug(self.app, f"URL plugin download failed: {e}")
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
             return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
-    def download_theme_from_github(self, github_repo, theme_slug, branch=None, tag=None):
+    def download_theme_from_github(self, github_repo, theme_slug, branch=None, tag=None, force=False, backup_records=None):
         """
         Download a theme from a GitHub repository
         
@@ -1836,14 +1992,13 @@ die($error_msg);
         Returns:
             bool: True if download and extraction successful, False otherwise
         """
+        theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
+        
+        if os.path.exists(theme_dir) and not force:
+            Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
+            return True
+        
         try:
-            theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
-            
-            # Check if theme already exists
-            if os.path.exists(theme_dir):
-                Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
-                return True
-            
             # Construct GitHub URL (same logic as plugins)
             if tag:
                 url = f"https://github.com/{github_repo}/archive/refs/tags/{tag}.zip"
@@ -1856,67 +2011,54 @@ die($error_msg);
                 Log.debug(self.app, f"Downloading theme from GitHub (trying 'main' branch)")
             
             # Create temporary directory
-            temp_dir = f"/tmp/wo_github_theme_{theme_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
-            zip_file = f"{temp_dir}/{theme_slug}.zip"
-            
-            # Download
-            result = self._github_curl(url, zip_file)
-            
-            # Fallback to master if main failed
-            if result.returncode != 0 and not branch and not tag:
-                Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
-                url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+            os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix=f"wo_theme_{theme_slug}_", dir=f"{self.shared_root}/tmp/assets")
+            try:
+                zip_file = f"{temp_dir}/{theme_slug}.zip"
+                
+                # Download
                 result = self._github_curl(url, zip_file)
-            
-            # Verify download
-            if result.returncode != 0 or not os.path.exists(zip_file):
-                Log.debug(self.app, f"Failed to download theme from GitHub: {github_repo}")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Extract
-            unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
-            result = subprocess.run(unzip_cmd, capture_output=True)
-            
-            if result.returncode != 0:
-                Log.debug(self.app, "Failed to extract GitHub theme archive")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Find extracted directory
-            extracted = None
-            for item in os.listdir(temp_dir):
-                item_path = f"{temp_dir}/{item}"
-                if os.path.isdir(item_path) and item not in ['__MACOSX', theme_slug]:
-                    extracted = item_path
-                    break
-            
-            if not extracted:
-                Log.debug(self.app, "No directory found in GitHub theme archive")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                return False
-            
-            # Move to themes directory
-            shutil.move(extracted, theme_dir)
-            
-            # Cleanup
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
-            Log.debug(self.app, f"Successfully downloaded theme from GitHub: {github_repo}")
-            return True
-            
+                
+                # Fallback to master if main failed
+                if result.returncode != 0 and not branch and not tag:
+                    Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
+                    url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                    result = self._github_curl(url, zip_file)
+                
+                # Verify download
+                if result.returncode != 0 or not os.path.exists(zip_file):
+                    Log.debug(self.app, f"Failed to download theme from GitHub: {github_repo}")
+                    return False
+                
+                # Extract
+                unzip_cmd = ['unzip', '-q', zip_file, '-d', temp_dir]
+                result = subprocess.run(unzip_cmd, capture_output=True)
+                
+                if result.returncode != 0:
+                    Log.debug(self.app, "Failed to extract GitHub theme archive")
+                    return False
+                
+                # Find extracted directory
+                extracted = None
+                for item in os.listdir(temp_dir):
+                    item_path = f"{temp_dir}/{item}"
+                    if os.path.isdir(item_path) and item not in ['__MACOSX', theme_slug]:
+                        extracted = item_path
+                        break
+                
+                if not extracted:
+                    Log.debug(self.app, "No directory found in GitHub theme archive")
+                    return False
+                
+                Log.debug(self.app, f"Successfully downloaded theme from GitHub: {github_repo}")
+                return self._promote_asset('theme', theme_slug, extracted, force=force, backup_records=backup_records)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             Log.debug(self.app, f"GitHub theme download failed: {e}")
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
             return False
     
-    def download_theme_from_url(self, url, theme_slug):
+    def download_theme_from_url(self, url, theme_slug, force=False, backup_records=None):
         """
         Download a theme from a direct URL
         
@@ -1929,17 +2071,15 @@ die($error_msg);
         Returns:
             bool: True if download and extraction successful, False otherwise
         """
+        theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
+        
+        if os.path.exists(theme_dir) and not force:
+            Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
+            return True
+        
+        os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"wo_theme_{theme_slug}_", dir=f"{self.shared_root}/tmp/assets")
         try:
-            theme_dir = f"{self.wp_content_dir}/themes/{theme_slug}"
-            
-            # Check if theme already exists
-            if os.path.exists(theme_dir):
-                Log.debug(self.app, f"Theme {theme_slug} already exists, skipping download")
-                return True
-            
-            # Create temporary directory
-            temp_dir = f"/tmp/wo_url_theme_{theme_slug}"
-            os.makedirs(temp_dir, exist_ok=True)
             zip_file = f"{temp_dir}/{theme_slug}.zip"
             
             Log.debug(self.app, f"Downloading theme from URL: {url}")
@@ -1951,8 +2091,6 @@ die($error_msg);
             # Verify download
             if result.returncode != 0 or not os.path.exists(zip_file):
                 Log.debug(self.app, f"Failed to download theme from URL: {url}")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
                 return False
             
             # Verify it's a zip file
@@ -1960,8 +2098,6 @@ die($error_msg);
                 magic = f.read(4)
                 if not (magic[:2] == b'PK'):
                     Log.debug(self.app, "Downloaded file is not a valid ZIP archive")
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir)
                     return False
             
             # Extract
@@ -1970,8 +2106,6 @@ die($error_msg);
             
             if result.returncode != 0:
                 Log.debug(self.app, "Failed to extract theme zip")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
                 return False
             
             # Find extracted directory
@@ -1983,26 +2117,30 @@ die($error_msg);
                     break
             
             if not extracted:
-                Log.debug(self.app, "No theme directory found in archive")
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
+                Log.debug(self.app, "No theme directory found in archive, checking for flat structure")
+                staged = tempfile.mkdtemp(prefix=f"staged_{theme_slug}_", dir=temp_dir)
+                moved = False
+                for item in os.listdir(temp_dir):
+                    if item == theme_slug + '.zip':
+                        continue
+                    src = f"{temp_dir}/{item}"
+                    dst = f"{staged}/{item}"
+                    if os.path.isfile(src):
+                        shutil.move(src, dst)
+                        moved = True
+                if moved:
+                    Log.debug(self.app, f"Downloaded theme from URL (flat structure)")
+                    return self._promote_asset('theme', theme_slug, staged, force=force, backup_records=backup_records)
+                Log.debug(self.app, "No valid theme structure found in archive")
                 return False
             
-            # Move to themes directory
-            shutil.move(extracted, theme_dir)
-            
-            # Cleanup
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
             Log.debug(self.app, f"Successfully downloaded theme from URL")
-            return True
-            
+            return self._promote_asset('theme', theme_slug, extracted, force=force, backup_records=backup_records)
         except Exception as e:
             Log.debug(self.app, f"URL theme download failed: {e}")
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
             return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
     # ==========================================
     # PHASE 3: Helper Methods
@@ -2114,11 +2252,55 @@ die($error_msg);
                 "or hand-edit baseline.json"
             )
 
+        baseline_sources = {
+            'plugins': {},
+            'themes': {}
+        }
+
+        legacy_plugins = config.get('baseline_plugins', [])
+        if isinstance(legacy_plugins, str):
+            legacy_plugins = [p.strip() for p in legacy_plugins.split(',')]
+        for plugin_slug in [p for p in legacy_plugins if p]:
+            baseline_sources['plugins'][plugin_slug] = self._wordpress_source('latest')
+
+        legacy_theme = config.get('baseline_theme', '')
+        if legacy_theme:
+            baseline_sources['themes'][legacy_theme] = self._wordpress_source('latest')
+
+        for plugin_slug, version in config.get('wordpress_plugins', {}).items():
+            baseline_sources['plugins'][plugin_slug] = self._wordpress_source(version)
+
+        for theme_slug, version in config.get('wordpress_themes', {}).items():
+            baseline_sources['themes'][theme_slug] = self._wordpress_source(version)
+
+        for plugin_slug, url in config.get('url_plugins', {}).items():
+            baseline_sources['plugins'][plugin_slug] = {
+                'type': 'url',
+                'url': url
+            }
+
+        for theme_slug, url in config.get('url_themes', {}).items():
+            baseline_sources['themes'][theme_slug] = {
+                'type': 'url',
+                'url': url
+            }
+
+        for plugin_slug, repo_info in config.get('github_plugins', {}).items():
+            source = self._parse_github_source(repo_info)
+            if source is not None:
+                baseline_sources['plugins'][plugin_slug] = source
+
+        for theme_slug, repo_info in config.get('github_themes', {}).items():
+            source = self._parse_github_source(repo_info)
+            if source is not None:
+                baseline_sources['themes'][theme_slug] = source
+
         baseline = {
             'version': 1,
             'generated': datetime.now().isoformat(),
             'plugins': all_plugins,
             'theme': theme,
+            'sources': baseline_sources,
             'options': {
                 'blog_public': 1,
                 'default_comment_status': 'closed',
@@ -2155,36 +2337,110 @@ die($error_msg);
         os.symlink(release_path, current_link)
         Log.debug(self.app, f"Switched to release: {release_name}")
     
+    def update_plugin(self, plugin_slug, config=None):
+        """Refresh one shared plugin from its recorded source. Return True on success."""
+        if not plugin_slug:
+            Log.error(self.app, "Plugin slug is required", exit=False)
+            return False
+        if config is None:
+            config = MTFunctions.load_config(self.app)
+        baseline = self._load_baseline()
+        source = self._resolve_source('plugin', plugin_slug, config=config, baseline=baseline)
+        if not source:
+            Log.error(self.app, f"No download source configured for plugin {plugin_slug}", exit=False)
+            return False
+        backup_records = []
+        if not self._dispatch_download('plugin', plugin_slug, source, force=True, backup_records=backup_records):
+            self.restore_asset_backups(backup_records)
+            return False
+        for record in backup_records:
+            if record.get('backup'):
+                Log.info(self.app, f"Previous plugin backup: {record['backup']}")
+        return True
+
+    def update_theme(self, theme_slug=None, config=None):
+        """Refresh one shared theme from its recorded source. Uses baseline['theme'] when slug omitted."""
+        if config is None:
+            config = MTFunctions.load_config(self.app)
+        baseline = self._load_baseline()
+        if not theme_slug:
+            theme_slug = baseline.get('theme')
+        if not theme_slug:
+            Log.error(self.app, "No theme configured in baseline", exit=False)
+            return False
+        source = self._resolve_source('theme', theme_slug, config=config, baseline=baseline)
+        if not source:
+            Log.error(self.app, f"No download source configured for theme {theme_slug}", exit=False)
+            return False
+        backup_records = []
+        if not self._dispatch_download('theme', theme_slug, source, force=True, backup_records=backup_records):
+            self.restore_asset_backups(backup_records)
+            return False
+        for record in backup_records:
+            if record.get('backup'):
+                Log.info(self.app, f"Previous theme backup: {record['backup']}")
+        return True
+
     def update_plugins_and_themes(self, config):
-        """Update all plugins and themes"""
-        
-        # Update plugins
-        plugins_dir = f"{self.wp_content_dir}/plugins"
-        for plugin in os.listdir(plugins_dir):
-            plugin_path = f"{plugins_dir}/{plugin}"
-            if os.path.isdir(plugin_path):
-                try:
-                    # Try to update using WP-CLI (needs a working WordPress)
-                    # In production, this would be more sophisticated
-                    Log.debug(self.app, f"Would update plugin: {plugin}")
-                except:
-                    pass
-        
-        # Re-download WordPress.org plugin sources to ensure latest versions.
-        # New configs use [wordpress_plugins]; legacy configs fall back to
-        # baseline_plugins.
-        if 'wordpress_plugins' in config:
-            wordpress_plugins = list(config.get('wordpress_plugins', {}).keys())
-        else:
-            wordpress_plugins = config.get('baseline_plugins', [])
-            if isinstance(wordpress_plugins, str):
-                wordpress_plugins = [p.strip() for p in wordpress_plugins.split(',')]
-        github_plugins = config.get('github_plugins', {})
-        url_plugins = config.get('url_plugins', {})
-        for plugin in [p for p in wordpress_plugins if p]:
-            if plugin in github_plugins or plugin in url_plugins:
-                continue
-            self.download_plugin(plugin)
+        """Refresh all shared plugin/theme sources.
+
+        Returns a tuple (success, backup_records). On any download/promote
+        failure every promoted asset is restored and (False, []) is returned.
+        Slugs without a resolvable source are warned and skipped, not failed.
+        """
+        baseline = self._load_baseline()
+        backup_records = []
+
+        def ordered_unique(items):
+            seen = set()
+            result = []
+            for item in items:
+                if item and item not in seen:
+                    seen.add(item)
+                    result.append(item)
+            return result
+
+        plugin_slugs = []
+        plugin_slugs.extend(baseline.get('plugins', []) or [])
+        plugin_slugs.extend((baseline.get('sources') or {}).get('plugins', {}).keys())
+        plugin_slugs.extend(config.get('wordpress_plugins', {}).keys())
+        plugin_slugs.extend(config.get('github_plugins', {}).keys())
+        plugin_slugs.extend(config.get('url_plugins', {}).keys())
+        legacy_plugins = config.get('baseline_plugins')
+        if legacy_plugins:
+            if isinstance(legacy_plugins, str):
+                legacy_plugins = [p.strip() for p in legacy_plugins.split(',')]
+            plugin_slugs.extend(legacy_plugins)
+        plugin_slugs = ordered_unique(plugin_slugs)
+
+        theme_slugs = []
+        if baseline.get('theme'):
+            theme_slugs.append(baseline['theme'])
+        theme_slugs.extend((baseline.get('sources') or {}).get('themes', {}).keys())
+        theme_slugs.extend(config.get('wordpress_themes', {}).keys())
+        theme_slugs.extend(config.get('github_themes', {}).keys())
+        theme_slugs.extend(config.get('url_themes', {}).keys())
+        if config.get('baseline_theme'):
+            theme_slugs.append(config['baseline_theme'])
+        theme_slugs = ordered_unique(theme_slugs)
+
+        failures = []
+        for kind, slugs in (('plugin', plugin_slugs), ('theme', theme_slugs)):
+            for slug in slugs:
+                source = self._resolve_source(kind, slug, config=config, baseline=baseline)
+                if not source:
+                    Log.warn(self.app, f"No download source configured for {kind} {slug}; skipping")
+                    continue
+                if not self._dispatch_download(kind, slug, source, force=True, backup_records=backup_records):
+                    failures.append(f"{kind} {slug}")
+
+        if failures:
+            self.restore_asset_backups(backup_records)
+            for item in failures:
+                Log.error(self.app, f"Failed to update {item}", exit=False)
+            return (False, [])
+
+        return (True, backup_records)
     
     def set_permissions(self):
         """Set proper permissions on shared infrastructure"""
