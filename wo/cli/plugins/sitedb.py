@@ -94,6 +94,34 @@ def updateSiteInfo(self, site, stype='', cache='', webroot='',
         Log.error(self, "Unable to update site info in application database.")
 
 
+def renameSiteInfo(self, old_site, new_site, site_path=None, ssl=None):
+    """Rename a site record in the WordOps application database."""
+    try:
+        old = SiteDB.query.filter(SiteDB.sitename == old_site).first()
+        existing = SiteDB.query.filter(SiteDB.sitename == new_site).first()
+
+        if old is None:
+            Log.error(self, f"{old_site} does not exist in database", exit=False)
+            return False
+
+        if existing is not None:
+            Log.error(self, f"{new_site} already exists in database", exit=False)
+            return False
+
+        old.sitename = new_site
+        if site_path is not None:
+            old.site_path = site_path
+        if ssl is not None:
+            old.is_ssl = ssl
+        db_session.commit()
+        return True
+    except Exception as e:
+        db_session.rollback()
+        Log.debug(self, "{0}".format(e))
+        Log.error(self, "Unable to rename site in application database.", exit=False)
+        return False
+
+
 def deleteSiteInfo(self, site):
     """Delete site record in database"""
     try:

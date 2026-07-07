@@ -372,6 +372,39 @@ class MTDatabase:
             return False
     
     @staticmethod
+    def rename_shared_site_domain(app, old_domain, new_domain, site_path=None, redis_prefix=None, is_ssl=None):
+        """Rename a shared-site tracking row without changing its identity."""
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(domain=old_domain).first()
+            existing = session.query(MultitenancySite).filter_by(domain=new_domain).first()
+            
+            if not site:
+                Log.error(app, f"Site not found in database: {old_domain}", exit=False)
+                return False
+            
+            if existing is not None and existing is not site:
+                Log.error(app, f"Domain already tracked: {new_domain}", exit=False)
+                return False
+            
+            site.domain = new_domain
+            site.site_path = site_path or f'/var/www/{new_domain}'
+            if redis_prefix is not None:
+                site.redis_prefix = redis_prefix
+            if is_ssl is not None:
+                site.is_ssl = is_ssl
+            site.updated_at = datetime.now()
+            
+            session.commit()
+            Log.debug(app, f"Renamed shared site: {old_domain} -> {new_domain}")
+            return True
+                
+        except Exception as e:
+            session.rollback()
+            Log.error(app, f"Failed to rename shared site {old_domain}: {e}", exit=False)
+            return False
+    
+    @staticmethod
     def cleanup(app):
         """Clean up multi-tenancy database entries"""
         try:

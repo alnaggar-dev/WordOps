@@ -203,6 +203,97 @@ class MTFunctions:
             return False
 
     @staticmethod
+    def validate_nginx_config_recoverable(app, log_errors=True):
+        """Run nginx -t without exiting the process."""
+        try:
+            result = subprocess.run(['nginx', '-t'], capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                return True
+
+            if log_errors:
+                Log.warn(app, "Nginx configuration test failed")
+                Log.warn(app, f"Error: {result.stderr.strip()}")
+                Log.warn(app, f"Output: {result.stdout.strip()}")
+            return False
+
+        except subprocess.TimeoutExpired:
+            if log_errors:
+                Log.warn(app, "Nginx configuration test timed out")
+            return False
+        except Exception as e:
+            if log_errors:
+                Log.error(app, f"Nginx configuration test error: {e}", exit=False)
+            return False
+
+    @staticmethod
+    def write_nginx_config_for_rename(app, domain, php_version, cache_type, site_root):
+        """Write a multitenancy nginx vhost for a renamed tenant without exiting."""
+        try:
+            content = MTFunctions.generate_modular_nginx_config(domain, site_root, php_version, cache_type)
+            MTFunctions.ensure_nginx_directories(app, domain, site_root)
+
+            nginx_conf = f"/etc/nginx/sites-available/{domain}"
+            with open(nginx_conf, 'w') as f:
+                f.write(content)
+            os.chmod(nginx_conf, 0o644)
+
+            if MTFunctions.validate_nginx_config_recoverable(app):
+                return nginx_conf
+            return None
+
+        except Exception as e:
+            Log.error(app, f"Failed to write nginx config for renamed domain {domain}: {e}", exit=False)
+            return None
+
+    @staticmethod
+    def enable_nginx_site_for_rename(app, domain):
+        """Enable a renamed nginx site without using default-exiting WOFileUtils."""
+        try:
+            src = f'/etc/nginx/sites-available/{domain}'
+            dst = f'/etc/nginx/sites-enabled/{domain}'
+
+            if os.path.lexists(dst) or os.path.exists(dst):
+                Log.error(app, f"Nginx enabled site already exists: {dst}", exit=False)
+                return False
+
+            os.symlink(src, dst)
+            return True
+
+        except Exception as e:
+            Log.error(app, f"Failed to enable nginx site for renamed domain {domain}: {e}", exit=False)
+            return False
+
+    @staticmethod
+    def reload_nginx_recoverable(app, domain):
+        """Reload nginx without exiting the process."""
+        if not MTFunctions.validate_nginx_config_recoverable(app):
+            return False
+
+        try:
+            subprocess.run(['systemctl', 'reload', 'nginx'], capture_output=True, text=True, timeout=30, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            Log.warn(app, f"systemctl reload nginx failed for {domain}: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            Log.warn(app, f"systemctl reload nginx timed out for {domain}")
+        except Exception as e:
+            Log.warn(app, f"systemctl reload nginx error for {domain}: {e}")
+
+        try:
+            subprocess.run(['nginx', '-s', 'reload'], capture_output=True, text=True, timeout=30, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"nginx -s reload failed for {domain}: {e.stderr}", exit=False)
+            return False
+        except subprocess.TimeoutExpired:
+            Log.error(app, f"nginx -s reload timed out for {domain}", exit=False)
+            return False
+        except Exception as e:
+            Log.error(app, f"nginx -s reload error for {domain}: {e}", exit=False)
+            return False
+
+    @staticmethod
     def get_php_fpm_socket(php_version):
         """Get correct PHP-FPM socket path for given PHP version"""
         # WordOps uses socket naming convention without dots: php83-fpm, not php8.3-fpm
@@ -580,6 +671,44 @@ if (!defined('WP_CLI')) {{
         os.chmod(wp_config_path, 0o640)
         Log.debug(app, f"Generated wp-config.php with shared config include at {wp_config_path}")
         Log.debug(app, f"Redis prefix for {domain}: {redis_prefix}")
+
+    @staticmethod
+    def rewrite_wp_config_for_rename(app, site_root, old_domain, new_domain, new_redis_prefix, tracked_old_redis_prefix=None):
+        """Rewrite only domain-derived wp-config.php values for a tenant rename.
+
+        Returns the old Redis prefix found in wp-config.php, or None on failure.
+        """
+        wp_config_path = f"{site_root}/htdocs/wp-config.php"
+        if not os.path.exists(wp_config_path):
+            Log.error(app, f"wp-config.php not found: {wp_config_path}", exit=False)
+            return None
+
+        try:
+            with open(wp_config_path, 'r') as f:
+                content = f.read()
+
+            match = re.search(r"'prefix'\s*=>\s*'([^']+)'", content)
+            if not match:
+                Log.error(app, "wp-config.php does not contain a Redis prefix; refusing unsafe rename", exit=False)
+                return None
+
+            resolved_old_prefix = match.group(1)
+            if tracked_old_redis_prefix and tracked_old_redis_prefix != resolved_old_prefix:
+                Log.warn(app, f"Tracked Redis prefix {tracked_old_redis_prefix} differs from wp-config.php prefix {resolved_old_prefix}; using wp-config.php value")
+
+            content = re.sub(r"('prefix'\s*=>\s*)'[^']+'", "\\1'{}'".format(new_redis_prefix), content, count=1)
+            content = content.replace(f"://{old_domain}/wp-content", f"://{new_domain}/wp-content")
+            content = content.replace(f"WordPress Configuration for {old_domain}", f"WordPress Configuration for {new_domain}")
+
+            with open(wp_config_path, 'w') as f:
+                f.write(content)
+            os.chmod(wp_config_path, 0o640)
+            Log.debug(app, f"Updated wp-config.php for rename from {old_domain} to {new_domain}")
+            return resolved_old_prefix
+
+        except Exception as e:
+            Log.error(app, f"Failed to update wp-config.php for rename: {e}", exit=False)
+            return None
     
     def generate_salts():
         """Generate WordPress salts"""
@@ -798,6 +927,36 @@ server {{
         except subprocess.CalledProcessError as e:
             Log.error(app, f"Failed to set permalink structure: {e.stderr}")
             raise
+
+    @staticmethod
+    def update_wordpress_domain(app, site_htdocs, old_domain, new_domain, scheme):
+        """Update WordPress URLs and serialized domain references after tenant rename."""
+        new_url = f'{scheme}://{new_domain}'
+        try:
+            subprocess.run(
+                ['wp', 'option', 'update', 'home', new_url, '--path=' + site_htdocs, '--allow-root'],
+                capture_output=True, text=True, check=True
+            )
+            subprocess.run(
+                ['wp', 'option', 'update', 'siteurl', new_url, '--path=' + site_htdocs, '--allow-root'],
+                capture_output=True, text=True, check=True
+            )
+            subprocess.run(
+                [
+                    'wp', 'search-replace', old_domain, new_domain,
+                    '--all-tables-with-prefix',
+                    '--skip-columns=guid',
+                    '--precise',
+                    '--recurse-objects',
+                    '--path=' + site_htdocs,
+                    '--allow-root',
+                ],
+                capture_output=True, text=True, check=True
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"Failed to update WordPress domain: {e.stderr}", exit=False)
+            return False
 
     @staticmethod
     def purge_site_cache(app, domain, redis_prefix=None):
@@ -1024,6 +1183,120 @@ server {{
         except Exception as e:
             Log.debug(app, f"SSL setup error: {e}")
             Log.warn(app, f"Could not configure SSL for {domain}: {str(e)}")
+            return False
+
+    @staticmethod
+    def prepare_ssl_certificate_for_rename(app, domain, pargs):
+        """Ensure a certificate for the new domain exists before mutating the tenant."""
+        from wo.core.acme import WOAcme
+        from wo.core.domainvalidate import WODomain
+        from wo.core.variables import WOVar
+
+        if (os.path.exists(f"{WOVar.wo_ssl_live}/{domain}/fullchain.pem") and
+                os.path.exists(f"{WOVar.wo_ssl_live}/{domain}/key.pem")):
+            return True
+        if os.path.exists(f"/etc/letsencrypt/renewal/{domain}_ecc/fullchain.cer"):
+            return True
+        if not os.path.exists('/etc/letsencrypt/acme.sh'):
+            Log.error(app, "acme.sh is not installed; cannot prepare SSL for rename", exit=False)
+            return False
+
+        try:
+            (domain_type, root_domain) = WODomain.getlevel(app, domain)
+            if domain_type == 'subdomain':
+                acme_domains = [domain]
+            else:
+                acme_domains = [domain, f'www.{domain}']
+
+            acmedata = {
+                'dns': False,
+                'acme_dns': 'dns_cf',
+                'dnsalias': False,
+                'acme_alias': '',
+                'keylength': 'ec-384'
+            }
+
+            if getattr(pargs, 'dns', None):
+                acmedata['dns'] = True
+                if pargs.dns != 'dns_cf':
+                    acmedata['acme_dns'] = pargs.dns
+
+            if not acmedata['dns'] and not getattr(pargs, 'force', False):
+                if not WOAcme.check_dns(app, acme_domains):
+                    return False
+
+            if not acmedata['dns']:
+                os.makedirs('/var/www/html/.well-known/acme-challenge', exist_ok=True)
+                try:
+                    shutil.chown('/var/www/html/.well-known', 'www-data', 'www-data')
+                    os.chmod('/var/www/html/.well-known', 0o750)
+                except Exception as e:
+                    Log.warn(app, f"Could not set permissions on ACME webroot: {e}")
+
+            cmd = ['/etc/letsencrypt/acme.sh', '--config-home', '/etc/letsencrypt/config', '--issue']
+            for item in acme_domains:
+                cmd.extend(['-d', item])
+            if acmedata['dns']:
+                cmd.extend(['--dns', acmedata['acme_dns']])
+                if acmedata['dnsalias']:
+                    cmd.extend(['--challenge-alias', acmedata['acme_alias']])
+            else:
+                cmd.extend(['-w', '/var/www/html'])
+            cmd.extend(['-k', acmedata['keylength'], '-f'])
+
+            subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            Log.error(app, f"Failed to prepare SSL certificate for renamed domain {domain}: {e.stderr}", exit=False)
+            return False
+        except subprocess.TimeoutExpired as e:
+            Log.error(app, f"Timed out preparing SSL certificate for renamed domain {domain}: {e}", exit=False)
+            return False
+        except Exception as e:
+            Log.error(app, f"Failed to prepare SSL certificate for renamed domain {domain}: {e}", exit=False)
+            return False
+
+    @staticmethod
+    def install_ssl_config_for_rename(app, domain, site_root, pargs):
+        """Deploy prepared certificate files and write nginx SSL includes for a renamed tenant."""
+        from wo.core.domainvalidate import WODomain
+        from wo.core.variables import WOVar
+
+        try:
+            os.makedirs(f'/etc/letsencrypt/live/{domain}', exist_ok=True)
+
+            cmd = [
+                '/etc/letsencrypt/acme.sh', '--config-home', '/etc/letsencrypt/config',
+                '--install-cert', '-d', domain, '--ecc',
+                '--cert-file', f'{WOVar.wo_ssl_live}/{domain}/cert.pem',
+                '--key-file', f'{WOVar.wo_ssl_live}/{domain}/key.pem',
+                '--fullchain-file', f'{WOVar.wo_ssl_live}/{domain}/fullchain.pem',
+                '--ca-file', f'{WOVar.wo_ssl_live}/{domain}/ca.pem',
+                '--reloadcmd', 'nginx -t && service nginx restart',
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+
+            data = {'ssl_live_path': WOVar.wo_ssl_live, 'domain': domain, 'quic': True}
+            with open(f'{site_root}/conf/nginx/ssl.conf', 'w') as fh:
+                app.app.render((data), 'ssl.mustache', out=fh)
+
+            (domain_type, root_domain) = WODomain.getlevel(app, domain)
+            if domain_type == 'subdomain':
+                acme_domains = [domain]
+            else:
+                acme_domains = [domain, f'www.{domain}']
+
+            with open(f'/etc/nginx/conf.d/force-ssl-{domain}.conf', 'w') as fh:
+                app.app.render(({'domains': ' '.join(acme_domains)}), 'force-ssl.mustache', out=fh)
+
+            if getattr(pargs, 'hsts', False):
+                with open(f'{site_root}/conf/nginx/hsts.conf', 'w') as fh:
+                    fh.write('more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";')
+
+            return MTFunctions.validate_nginx_config_recoverable(app, log_errors=True)
+
+        except Exception as e:
+            Log.error(app, f"Failed to install SSL config for renamed domain {domain}: {e}", exit=False)
             return False
 
     @staticmethod

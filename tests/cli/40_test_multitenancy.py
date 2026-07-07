@@ -26,6 +26,19 @@ _distro.id = lambda: 'debian'
 _distro.version = lambda: '12'
 _distro.codename = lambda: 'bookworm'
 _mt_import_error = None
+
+# Non-Debian dev hosts (e.g. macOS) lack the ``apt`` / ``sh.apt_get`` layer that
+# ``wo.core.aptget`` imports at module load. Without it the controller import
+# fails and every controller test is skipped. Install a guarded dummy so the
+# real module is still used on Linux/CI (where it imports cleanly).
+import sys as _sys
+import types as _types
+try:
+    from wo.core.aptget import WOAptGet  # noqa: F401
+except Exception:
+    _aptget_stub = _types.ModuleType('wo.core.aptget')
+    _aptget_stub.WOAptGet = type('WOAptGet', (), {})
+    _sys.modules['wo.core.aptget'] = _aptget_stub
 try:
     from wo.cli.plugins.multitenancy_functions import MTFunctions, SharedInfrastructure, BaselineApplicator
     from wo.cli.plugins import multitenancy_functions as mtf
@@ -757,6 +770,830 @@ class MultitenancyDeleteCacheTests(unittest.TestCase):
     def test_delete_skips_purge_when_site_delete_fails(self):
         purge, ctrl = self._run_delete(returncode=1)
         purge.assert_not_called()
+
+
+class MultitenancyRenameTests(unittest.TestCase):
+    """`wo multitenancy rename` preserves tenant isolation while renaming domains."""
+
+    def _path_state(self, initial_existing):
+        existing = set(initial_existing)
+
+        def exists(path):
+            return path in existing
+
+        def rename(src, dst):
+            existing.discard(src)
+            existing.add(dst)
+
+        def remove(path):
+            existing.discard(path)
+
+        def symlink(src, dst):
+            existing.add(dst)
+
+        def copy2(src, dst):
+            existing.add(dst)
+
+        def makedirs(path, *args, **kwargs):
+            existing.add(path)
+
+        def rmtree(path, *args, **kwargs):
+            existing.discard(path)
+
+        return existing, exists, rename, remove, symlink, copy2, makedirs, rmtree
+
+    def _subprocess_guard(self, argv, *args, **kwargs):
+        self.assertFalse(
+            any('--alias' in str(part) for part in argv),
+            f"rename must not call wp-cli with --alias: {argv}",
+        )
+        self.assertFalse(
+            argv[:3] == ['wo', 'site', 'update'],
+            f"rename must not shell out to wo site update: {argv}",
+        )
+        self.assertFalse(
+            argv[:3] == ['wp', 'cache', 'flush'],
+            f"rename must not flush a shared WordPress cache: {argv}",
+        )
+        self.assertFalse(
+            argv[:2] in (['redis-cli', 'flushdb'], ['redis-cli', 'flushall']),
+            f"rename must not flush the shared Redis database: {argv}",
+        )
+        return mock.Mock(returncode=0, stdout='', stderr='')
+
+    def _first_call_index(self, manager, name):
+        for index, call in enumerate(manager.mock_calls):
+            if call[0] == name:
+                return index
+        self.fail(f"{name} was not called; calls were {manager.mock_calls!r}")
+
+    def _assert_no_rename_mutations(self, calls):
+        calls['makedirs'].assert_not_called()
+        calls['copy2'].assert_not_called()
+        calls['os_rename'].assert_not_called()
+        calls['rewrite_wp_config_for_rename'].assert_not_called()
+        calls['update_wordpress_domain'].assert_not_called()
+        calls['rename_shared_site_domain'].assert_not_called()
+
+    def _run_rename(
+            self,
+            *,
+            old_ssl=False,
+            pargs_overrides=None,
+            check_domain_exists=False,
+            mt_site_present=True,
+            extra_existing=None,
+            old_enabled=False,
+            old_available=False,
+            old_force_ssl=False,
+            rewrite_return='old_example_com_',
+            prepare_ssl_return=True,
+            install_ssl_return=True,
+            reload_return=True,
+            validate_return=True,
+            write_nginx_return='/etc/nginx/sites-available/new.example.com',
+            enable_nginx_return=True,
+            update_wp_return=True,
+            rename_site_info_return=True,
+            rename_shared_return=True,
+            manager=None,
+            timestamp=None):
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        pargs = mock.Mock()
+        pargs.site_name = 'old.example.com'
+        pargs.newsite_name = 'new.example.com'
+        pargs.force = True
+        pargs.letsencrypt = False
+        pargs.dns = None
+        pargs.hsts = False
+        if pargs_overrides:
+            for name, value in pargs_overrides.items():
+                setattr(pargs, name, value)
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = pargs
+
+        site_info = mock.Mock()
+        site_info.site_path = '/var/www/old.example.com'
+        site_info.cache_type = 'wpfc'
+        site_info.php_version = '8.4'
+        site_info.is_ssl = old_ssl
+
+        mt_site = None
+        if mt_site_present:
+            mt_site = mock.Mock()
+            mt_site.domain = 'old.example.com'
+            mt_site.site_path = '/var/www/old.example.com'
+            mt_site.cache_type = 'wpfc'
+            mt_site.php_version = '8.4'
+            mt_site.is_ssl = old_ssl
+            mt_site.redis_prefix = 'old_example_com_'
+
+        session = mock.Mock()
+        session.query.return_value.filter_by.return_value.first.return_value = mt_site
+
+        initial_existing = {
+            '/var/www/old.example.com',
+            '/var/www/old.example.com/htdocs/wp-config.php',
+        }
+        if old_enabled:
+            initial_existing.add('/etc/nginx/sites-enabled/old.example.com')
+        if old_available:
+            initial_existing.add('/etc/nginx/sites-available/old.example.com')
+        if old_force_ssl:
+            initial_existing.add('/etc/nginx/conf.d/force-ssl-old.example.com.conf')
+        if extra_existing:
+            initial_existing.update(extra_existing)
+
+        existing, exists, rename_side_effect, remove_side_effect, symlink_side_effect, \
+            copy2_side_effect, makedirs_side_effect, rmtree_side_effect = self._path_state(initial_existing)
+
+        with contextlib.ExitStack() as stack:
+            log_mocks = {}
+            for method in ('info', 'warn', 'error', 'debug'):
+                log_mocks[method] = stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+
+            if timestamp is not None:
+                datetime_mock = mock.Mock()
+                datetime_mock.now.return_value.strftime.return_value = timestamp
+                stack.enter_context(mock.patch.object(mt, 'datetime', datetime_mock))
+
+            stack.enter_context(mock.patch.object(mt.WODomain, 'validate', side_effect=[
+                'old.example.com', 'new.example.com',
+            ]))
+            get_site_info = stack.enter_context(mock.patch.object(mt, 'getSiteInfo', return_value=site_info))
+            check_exists = stack.enter_context(mock.patch.object(
+                mt, 'check_domain_exists', return_value=check_domain_exists,
+            ))
+            stack.enter_context(mock.patch('wo.core.database.db_session', session))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_shared_site', return_value=False))
+            generate_redis_prefix = stack.enter_context(mock.patch.object(
+                mt.MTDatabase, 'generate_redis_prefix', return_value='new_example_com_',
+            ))
+            rename_shared_site_domain = stack.enter_context(mock.patch.object(
+                mt.MTDatabase, 'rename_shared_site_domain', return_value=rename_shared_return,
+            ))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'load_config', return_value={
+                'shared_root': '/var/www/shared',
+            }))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
+            prepare_ssl = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'prepare_ssl_certificate_for_rename', return_value=prepare_ssl_return,
+            ))
+            rewrite_wp_config = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'rewrite_wp_config_for_rename', return_value=rewrite_return,
+            ))
+            write_nginx = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'write_nginx_config_for_rename', return_value=write_nginx_return,
+            ))
+            enable_nginx = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'enable_nginx_site_for_rename', return_value=enable_nginx_return,
+            ))
+            validate_nginx = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'validate_nginx_config_recoverable', return_value=validate_return,
+            ))
+            update_wp = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'update_wordpress_domain', return_value=update_wp_return,
+            ))
+            install_ssl = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'install_ssl_config_for_rename', return_value=install_ssl_return,
+            ))
+            purge_cache = stack.enter_context(mock.patch.object(mt.MTFunctions, 'purge_site_cache'))
+            reload_nginx = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'reload_nginx_recoverable', return_value=reload_return,
+            ))
+            rename_site_info = stack.enter_context(mock.patch.object(
+                mt, 'renameSiteInfo', return_value=rename_site_info_return,
+            ))
+            wogit_add = stack.enter_context(mock.patch.object(mt.WOGit, 'add'))
+            os_rename = stack.enter_context(mock.patch.object(mt.os, 'rename', side_effect=rename_side_effect))
+            os_remove = stack.enter_context(mock.patch.object(mt.os, 'remove', side_effect=remove_side_effect))
+            os_symlink = stack.enter_context(mock.patch.object(mt.os, 'symlink', side_effect=symlink_side_effect))
+            os_makedirs = stack.enter_context(mock.patch.object(mt.os, 'makedirs', side_effect=makedirs_side_effect))
+            os_chmod = stack.enter_context(mock.patch.object(mt.os, 'chmod'))
+            path_exists = stack.enter_context(mock.patch.object(mt.os.path, 'exists', side_effect=exists))
+            path_lexists = stack.enter_context(mock.patch.object(mt.os.path, 'lexists', side_effect=exists))
+            copy2 = stack.enter_context(mock.patch.object(mt.shutil, 'copy2', side_effect=copy2_side_effect))
+            rmtree = stack.enter_context(mock.patch.object(mt.shutil, 'rmtree', side_effect=rmtree_side_effect))
+            subprocess_run = stack.enter_context(mock.patch.object(
+                mt.subprocess, 'run', side_effect=self._subprocess_guard,
+            ))
+
+            if manager is not None:
+                manager.attach_mock(prepare_ssl, 'prepare_ssl')
+                manager.attach_mock(os_rename, 'rename')
+                manager.attach_mock(rewrite_wp_config, 'rewrite_wp_config')
+                manager.attach_mock(write_nginx, 'write_nginx')
+                manager.attach_mock(enable_nginx, 'enable_nginx')
+                manager.attach_mock(validate_nginx, 'validate_nginx')
+                manager.attach_mock(update_wp, 'update_wp')
+                manager.attach_mock(install_ssl, 'install_ssl')
+                manager.attach_mock(rename_site_info, 'rename_site_info')
+                manager.attach_mock(rename_shared_site_domain, 'rename_shared_site_domain')
+                manager.attach_mock(purge_cache, 'purge_cache')
+                manager.attach_mock(reload_nginx, 'reload_nginx')
+
+            result = ctrl._rename_impl()
+
+        return {
+            'result': result,
+            'ctrl': ctrl,
+            'pargs': pargs,
+            'session': session,
+            'mt_site': mt_site,
+            'site_info': site_info,
+            'existing': existing,
+            'log_info': log_mocks['info'],
+            'log_warn': log_mocks['warn'],
+            'log_error': log_mocks['error'],
+            'log_debug': log_mocks['debug'],
+            'getSiteInfo': get_site_info,
+            'check_domain_exists': check_exists,
+            'generate_redis_prefix': generate_redis_prefix,
+            'prepare_ssl_certificate_for_rename': prepare_ssl,
+            'rewrite_wp_config_for_rename': rewrite_wp_config,
+            'write_nginx_config_for_rename': write_nginx,
+            'enable_nginx_site_for_rename': enable_nginx,
+            'validate_nginx_config_recoverable': validate_nginx,
+            'update_wordpress_domain': update_wp,
+            'install_ssl_config_for_rename': install_ssl,
+            'purge_site_cache': purge_cache,
+            'reload_nginx_recoverable': reload_nginx,
+            'renameSiteInfo': rename_site_info,
+            'rename_shared_site_domain': rename_shared_site_domain,
+            'WOGit.add': wogit_add,
+            'os_rename': os_rename,
+            'os_remove': os_remove,
+            'os_symlink': os_symlink,
+            'makedirs': os_makedirs,
+            'chmod': os_chmod,
+            'path_exists': path_exists,
+            'path_lexists': path_lexists,
+            'copy2': copy2,
+            'rmtree': rmtree,
+            'subprocess_run': subprocess_run,
+        }
+
+    def test_rename_requires_two_domains(self):
+        calls = self._run_rename(pargs_overrides={'newsite_name': None})
+
+        self.assertFalse(calls['result'])
+        calls['log_error'].assert_any_call(
+            calls['ctrl'],
+            "Usage: wo multitenancy rename <old-domain> <new-domain>",
+            exit=False,
+        )
+        self._assert_no_rename_mutations(calls)
+
+    def test_rename_rejects_existing_target(self):
+        calls = self._run_rename(check_domain_exists=True)
+
+        self.assertFalse(calls['result'])
+        calls['log_error'].assert_any_call(
+            calls['ctrl'], "Site new.example.com already exists", exit=False,
+        )
+        self._assert_no_rename_mutations(calls)
+
+    def test_rename_rejects_untracked_old_site(self):
+        calls = self._run_rename(mt_site_present=False)
+
+        self.assertFalse(calls['result'])
+        calls['log_error'].assert_any_call(
+            calls['ctrl'],
+            "Site old.example.com not found in multitenancy tracking",
+            exit=False,
+        )
+        self._assert_no_rename_mutations(calls)
+
+    def test_rename_rejects_filesystem_or_nginx_target_conflict_before_mutation(self):
+        conflict_path = '/etc/nginx/sites-enabled/new.example.com'
+        calls = self._run_rename(extra_existing={conflict_path})
+
+        self.assertFalse(calls['result'])
+        calls['log_error'].assert_any_call(
+            calls['ctrl'], f"Target path already exists: {conflict_path}", exit=False,
+        )
+        self._assert_no_rename_mutations(calls)
+
+    def test_rename_moves_root_rewrites_wp_updates_databases_and_purges_caches(self):
+        manager = mock.Mock()
+        calls = self._run_rename(manager=manager)
+        ctrl = calls['ctrl']
+
+        self.assertTrue(calls['result'])
+        calls['os_rename'].assert_any_call('/var/www/old.example.com', '/var/www/new.example.com')
+        calls['rewrite_wp_config_for_rename'].assert_called_once_with(
+            ctrl,
+            '/var/www/new.example.com',
+            'old.example.com',
+            'new.example.com',
+            'new_example_com_',
+            'old_example_com_',
+        )
+        calls['update_wordpress_domain'].assert_called_once_with(
+            ctrl,
+            '/var/www/new.example.com/htdocs',
+            'old.example.com',
+            'new.example.com',
+            'http',
+        )
+        calls['renameSiteInfo'].assert_called_once_with(
+            ctrl,
+            'old.example.com',
+            'new.example.com',
+            site_path='/var/www/new.example.com',
+            ssl=False,
+        )
+        calls['rename_shared_site_domain'].assert_called_once_with(
+            ctrl,
+            'old.example.com',
+            'new.example.com',
+            site_path='/var/www/new.example.com',
+            redis_prefix='new_example_com_',
+            is_ssl=False,
+        )
+        self.assertEqual(calls['purge_site_cache'].call_args_list, [
+            mock.call(ctrl, 'old.example.com', 'old_example_com_'),
+            mock.call(ctrl, 'new.example.com', 'new_example_com_'),
+        ])
+
+        self.assertLess(self._first_call_index(manager, 'rename'), self._first_call_index(manager, 'rewrite_wp_config'))
+        self.assertLess(self._first_call_index(manager, 'rewrite_wp_config'), self._first_call_index(manager, 'write_nginx'))
+        self.assertLess(self._first_call_index(manager, 'write_nginx'), self._first_call_index(manager, 'enable_nginx'))
+        self.assertLess(self._first_call_index(manager, 'enable_nginx'), self._first_call_index(manager, 'validate_nginx'))
+        self.assertLess(self._first_call_index(manager, 'validate_nginx'), self._first_call_index(manager, 'update_wp'))
+        self.assertLess(self._first_call_index(manager, 'update_wp'), self._first_call_index(manager, 'rename_site_info'))
+        self.assertLess(self._first_call_index(manager, 'rename_site_info'), self._first_call_index(manager, 'rename_shared_site_domain'))
+        self.assertLess(self._first_call_index(manager, 'rename_shared_site_domain'), self._first_call_index(manager, 'purge_cache'))
+        self.assertLess(self._first_call_index(manager, 'purge_cache'), self._first_call_index(manager, 'reload_nginx'))
+
+    def test_rename_ssl_site_prepares_and_installs_ssl_and_records_ssl(self):
+        manager = mock.Mock()
+        calls = self._run_rename(old_ssl=True, manager=manager)
+        ctrl = calls['ctrl']
+
+        self.assertTrue(calls['result'])
+        calls['prepare_ssl_certificate_for_rename'].assert_called_once_with(
+            ctrl, 'new.example.com', calls['pargs'],
+        )
+        calls['install_ssl_config_for_rename'].assert_called_once_with(
+            ctrl, 'new.example.com', '/var/www/new.example.com', calls['pargs'],
+        )
+        calls['update_wordpress_domain'].assert_called_once_with(
+            ctrl,
+            '/var/www/new.example.com/htdocs',
+            'old.example.com',
+            'new.example.com',
+            'https',
+        )
+        calls['renameSiteInfo'].assert_called_once_with(
+            ctrl,
+            'old.example.com',
+            'new.example.com',
+            site_path='/var/www/new.example.com',
+            ssl=True,
+        )
+        calls['rename_shared_site_domain'].assert_called_once_with(
+            ctrl,
+            'old.example.com',
+            'new.example.com',
+            site_path='/var/www/new.example.com',
+            redis_prefix='new_example_com_',
+            is_ssl=True,
+        )
+        self.assertLess(self._first_call_index(manager, 'prepare_ssl'), self._first_call_index(manager, 'rename'))
+        self.assertLess(self._first_call_index(manager, 'update_wp'), self._first_call_index(manager, 'install_ssl'))
+        self.assertLess(self._first_call_index(manager, 'install_ssl'), self._first_call_index(manager, 'rename_site_info'))
+        self.assertLess(self._first_call_index(manager, 'install_ssl'), self._first_call_index(manager, 'rename_shared_site_domain'))
+
+    def test_rename_ssl_setup_failure_rolls_back_before_db_updates(self):
+        calls = self._run_rename(
+            old_ssl=True,
+            old_enabled=True,
+            old_available=True,
+            install_ssl_return=False,
+        )
+        ctrl = calls['ctrl']
+
+        self.assertFalse(calls['result'])
+        calls['update_wordpress_domain'].assert_any_call(
+            ctrl,
+            '/var/www/new.example.com/htdocs',
+            'old.example.com',
+            'new.example.com',
+            'https',
+        )
+        calls['renameSiteInfo'].assert_not_called()
+        calls['rename_shared_site_domain'].assert_not_called()
+        calls['os_rename'].assert_any_call('/var/www/old.example.com', '/var/www/new.example.com')
+        calls['os_rename'].assert_any_call('/var/www/new.example.com', '/var/www/old.example.com')
+        calls['os_symlink'].assert_any_call(
+            '/etc/nginx/sites-available/old.example.com',
+            '/etc/nginx/sites-enabled/old.example.com',
+        )
+        calls['log_info'].assert_any_call(
+            ctrl,
+            "site_rename_failed source=old.example.com target=new.example.com result=failure",
+        )
+
+    def test_rename_rolls_back_db_and_wp_when_reload_fails(self):
+        calls = self._run_rename(reload_return=False)
+        ctrl = calls['ctrl']
+
+        self.assertFalse(calls['result'])
+        calls['rename_shared_site_domain'].assert_any_call(
+            ctrl,
+            'new.example.com',
+            'old.example.com',
+            site_path='/var/www/old.example.com',
+            redis_prefix='old_example_com_',
+            is_ssl=False,
+        )
+        calls['renameSiteInfo'].assert_any_call(
+            ctrl,
+            'new.example.com',
+            'old.example.com',
+            site_path='/var/www/old.example.com',
+            ssl=False,
+        )
+        calls['update_wordpress_domain'].assert_any_call(
+            ctrl,
+            '/var/www/new.example.com/htdocs',
+            'new.example.com',
+            'old.example.com',
+            'http',
+        )
+        calls['os_rename'].assert_any_call('/var/www/new.example.com', '/var/www/old.example.com')
+
+    def test_rename_stale_ssl_includes_are_moved_and_restored_on_failure(self):
+        timestamp = '20260707-123456'
+        ssl_include = '/var/www/new.example.com/conf/nginx/ssl.conf'
+        hsts_include = '/var/www/new.example.com/conf/nginx/hsts.conf'
+        ssl_backup = f'{ssl_include}.rename.{timestamp}.bak'
+        hsts_backup = f'{hsts_include}.rename.{timestamp}.bak'
+        manager = mock.Mock()
+        calls = self._run_rename(
+            extra_existing={ssl_include, hsts_include},
+            reload_return=False,
+            manager=manager,
+            timestamp=timestamp,
+        )
+
+        self.assertFalse(calls['result'])
+        calls['os_rename'].assert_any_call(ssl_include, ssl_backup)
+        calls['os_rename'].assert_any_call(hsts_include, hsts_backup)
+        calls['os_rename'].assert_any_call(ssl_backup, ssl_include)
+        calls['os_rename'].assert_any_call(hsts_backup, hsts_include)
+        calls['os_rename'].assert_any_call('/var/www/new.example.com', '/var/www/old.example.com')
+
+        ssl_move_index = manager.mock_calls.index(mock.call.rename(ssl_include, ssl_backup))
+        hsts_move_index = manager.mock_calls.index(mock.call.rename(hsts_include, hsts_backup))
+        validate_index = self._first_call_index(manager, 'validate_nginx')
+        ssl_restore_index = manager.mock_calls.index(mock.call.rename(ssl_backup, ssl_include))
+        hsts_restore_index = manager.mock_calls.index(mock.call.rename(hsts_backup, hsts_include))
+        root_restore_index = manager.mock_calls.index(mock.call.rename('/var/www/new.example.com', '/var/www/old.example.com'))
+
+        self.assertLess(ssl_move_index, validate_index)
+        self.assertLess(hsts_move_index, validate_index)
+        self.assertLess(ssl_restore_index, root_restore_index)
+        self.assertLess(hsts_restore_index, root_restore_index)
+
+    def test_rename_does_not_use_alias_or_shared_cache_flush(self):
+        calls = self._run_rename()
+        ctrl = calls['ctrl']
+
+        self.assertTrue(calls['result'])
+        calls['os_rename'].assert_any_call('/var/www/old.example.com', '/var/www/new.example.com')
+        calls['update_wordpress_domain'].assert_called_once_with(
+            ctrl,
+            '/var/www/new.example.com/htdocs',
+            'old.example.com',
+            'new.example.com',
+            'http',
+        )
+        calls['rename_shared_site_domain'].assert_called_once_with(
+            ctrl,
+            'old.example.com',
+            'new.example.com',
+            site_path='/var/www/new.example.com',
+            redis_prefix='new_example_com_',
+            is_ssl=False,
+        )
+
+
+class MultitenancyRenameHelperTests(unittest.TestCase):
+    """Public helper contracts used by `wo multitenancy rename`."""
+
+    def _write_wp_config(self, site_root, content):
+        htdocs = os.path.join(site_root, 'htdocs')
+        os.makedirs(htdocs)
+        wp_config = os.path.join(htdocs, 'wp-config.php')
+        with open(wp_config, 'w') as fh:
+            fh.write(content)
+        return wp_config
+
+    def _db_session_for_domains(self, rows_by_domain):
+        session = mock.Mock()
+        query = mock.Mock()
+
+        def filter_by(**kwargs):
+            domain = kwargs['domain']
+            return mock.Mock(first=mock.Mock(return_value=rows_by_domain.get(domain)))
+
+        query.filter_by.side_effect = filter_by
+        session.query.return_value = query
+        return session
+
+    def test_rewrite_wp_config_for_rename_preserves_db_credentials_and_salts(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        original = "\n".join([
+            "<?php",
+            "define('DB_NAME', 'wordpress_old');",
+            "define('DB_USER', 'wordpress_user');",
+            "define('DB_PASSWORD', 'secret');",
+            "define('DB_HOST', 'localhost');",
+            "define('AUTH_KEY', 'auth salt value');",
+            "define('SECURE_AUTH_KEY', 'secure auth salt value');",
+            "define('LOGGED_IN_KEY', 'logged in salt value');",
+            "define('NONCE_KEY', 'nonce salt value');",
+            "define('WP_CONTENT_URL', 'https://old.example.com/wp-content');",
+            "$redis_server = array(",
+            "    'host' => '127.0.0.1',",
+            "    'prefix' => 'old_example_com_',",
+            "    'prefix' => 'secondary_prefix_must_not_change_',",
+            ");",
+            "",
+        ])
+        wp_config = self._write_wp_config(tmp, original)
+        protected_prefixes = (
+            "define('DB_",
+            "define('AUTH_KEY'",
+            "define('SECURE_AUTH_KEY'",
+            "define('LOGGED_IN_KEY'",
+            "define('NONCE_KEY'",
+        )
+        original_protected = [
+            line for line in original.splitlines()
+            if line.startswith(protected_prefixes)
+        ]
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod') as chmod, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
+            old_prefix = MTFunctions.rewrite_wp_config_for_rename(
+                mock.Mock(),
+                tmp,
+                'old.example.com',
+                'new.example.com',
+                'new_example_com_',
+                'old_example_com_',
+            )
+
+        with open(wp_config) as fh:
+            rewritten = fh.read()
+        rewritten_protected = [
+            line for line in rewritten.splitlines()
+            if line.startswith(protected_prefixes)
+        ]
+        self.assertEqual(old_prefix, 'old_example_com_')
+        self.assertEqual(rewritten_protected, original_protected)
+        self.assertEqual(rewritten.count("'prefix' => 'new_example_com_'"), 1)
+        self.assertIn("'prefix' => 'secondary_prefix_must_not_change_'", rewritten)
+        self.assertNotIn("https://old.example.com/wp-content", rewritten)
+        self.assertIn("https://new.example.com/wp-content", rewritten)
+        chmod.assert_called_once_with(wp_config, 0o640)
+
+    def test_rewrite_wp_config_for_rename_missing_redis_prefix_returns_none_without_rewrite(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        original = "\n".join([
+            "<?php",
+            "define('DB_NAME', 'wordpress_old');",
+            "define('WP_CONTENT_URL', 'https://old.example.com/wp-content');",
+            "",
+        ])
+        wp_config = self._write_wp_config(tmp, original)
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.chmod') as chmod, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.error'):
+            old_prefix = MTFunctions.rewrite_wp_config_for_rename(
+                mock.Mock(),
+                tmp,
+                'old.example.com',
+                'new.example.com',
+                'new_example_com_',
+                'old_example_com_',
+            )
+
+        self.assertIsNone(old_prefix)
+        with open(wp_config) as fh:
+            self.assertEqual(fh.read(), original)
+        chmod.assert_not_called()
+
+    def test_update_wordpress_domain_uses_allow_root_and_safe_search_replace_flags(self):
+        with mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run') as run:
+            result = MTFunctions.update_wordpress_domain(
+                mock.Mock(),
+                '/var/www/new.example.com/htdocs',
+                'old.example.com',
+                'new.example.com',
+                'https',
+            )
+
+        self.assertTrue(result)
+        expected_argvs = [
+            [
+                'wp', 'option', 'update', 'home', 'https://new.example.com',
+                '--path=/var/www/new.example.com/htdocs', '--allow-root',
+            ],
+            [
+                'wp', 'option', 'update', 'siteurl', 'https://new.example.com',
+                '--path=/var/www/new.example.com/htdocs', '--allow-root',
+            ],
+            [
+                'wp', 'search-replace', 'old.example.com', 'new.example.com',
+                '--all-tables-with-prefix',
+                '--skip-columns=guid',
+                '--precise',
+                '--recurse-objects',
+                '--path=/var/www/new.example.com/htdocs',
+                '--allow-root',
+            ],
+        ]
+        self.assertEqual([call.args[0] for call in run.call_args_list], expected_argvs)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs, {
+                'capture_output': True,
+                'text': True,
+                'check': True,
+            })
+            self.assertIn('--allow-root', call.args[0])
+            self.assertNotEqual(call.args[0][:3], ['wp', 'cache', 'flush'])
+        search_replace = run.call_args_list[2].args[0]
+        for flag in ('--all-tables-with-prefix', '--skip-columns=guid', '--precise', '--recurse-objects'):
+            self.assertIn(flag, search_replace)
+
+    def test_rename_shared_site_domain_recoverable_errors_and_preserved_fields(self):
+        from wo.cli.plugins.multitenancy_db import MTDatabase
+
+        app = mock.Mock()
+        missing_session = self._db_session_for_domains({})
+        conflict_old = mock.Mock()
+        conflict_new = mock.Mock()
+        conflict_session = self._db_session_for_domains({
+            'old.example.com': conflict_old,
+            'new.example.com': conflict_new,
+        })
+
+        with mock.patch('wo.cli.plugins.multitenancy_db.Log.error') as log_error, \
+                mock.patch('wo.core.database.db_session', missing_session), \
+                mock.patch('wo.cli.plugins.multitenancy_db.db_session', missing_session):
+            self.assertFalse(MTDatabase.rename_shared_site_domain(app, 'old.example.com', 'new.example.com'))
+        with mock.patch('wo.cli.plugins.multitenancy_db.Log.error') as conflict_log_error, \
+                mock.patch('wo.core.database.db_session', conflict_session), \
+                mock.patch('wo.cli.plugins.multitenancy_db.db_session', conflict_session):
+            self.assertFalse(MTDatabase.rename_shared_site_domain(app, 'old.example.com', 'new.example.com'))
+
+        for call in log_error.call_args_list + conflict_log_error.call_args_list:
+            self.assertIs(call.kwargs.get('exit'), False)
+
+        created_at = object()
+        site = mock.Mock()
+        site.id = 7
+        site.domain = 'old.example.com'
+        site.site_path = '/var/www/old.example.com'
+        site.redis_prefix = 'old_example_com_'
+        site.is_ssl = False
+        site.baseline_version = 12
+        site.is_enabled = True
+        site.shared_release = 'release-2026'
+        site.site_type = 'wp'
+        site.cache_type = 'wpfc'
+        site.php_version = '8.4'
+        site.created_at = created_at
+        site.updated_at = 'previous-updated-at'
+        rows = {'old.example.com': site, 'new.example.com': None}
+        success_session = self._db_session_for_domains(rows)
+
+        with mock.patch('wo.cli.plugins.multitenancy_db.Log.debug'), \
+                mock.patch('wo.core.database.db_session', success_session), \
+                mock.patch('wo.cli.plugins.multitenancy_db.db_session', success_session):
+            self.assertTrue(MTDatabase.rename_shared_site_domain(
+                app,
+                'old.example.com',
+                'new.example.com',
+                site_path='/var/www/new.example.com',
+                redis_prefix='new_example_com_',
+                is_ssl=True,
+            ))
+
+        self.assertIs(rows['old.example.com'], site)
+        self.assertEqual(site.id, 7)
+        self.assertEqual(site.baseline_version, 12)
+        self.assertTrue(site.is_enabled)
+        self.assertEqual(site.shared_release, 'release-2026')
+        self.assertEqual(site.site_type, 'wp')
+        self.assertEqual(site.cache_type, 'wpfc')
+        self.assertEqual(site.php_version, '8.4')
+        self.assertIs(site.created_at, created_at)
+        self.assertEqual(site.domain, 'new.example.com')
+        self.assertEqual(site.site_path, '/var/www/new.example.com')
+        self.assertEqual(site.redis_prefix, 'new_example_com_')
+        self.assertTrue(site.is_ssl)
+        self.assertNotEqual(site.updated_at, 'previous-updated-at')
+        success_session.commit.assert_called_once_with()
+
+    def test_rename_site_info_updates_sitename_and_path_without_changing_db_credentials(self):
+        from wo.cli.plugins.sitedb import renameSiteInfo
+
+        app = mock.Mock()
+        site = mock.Mock()
+        site.sitename = 'old.example.com'
+        site.site_path = '/var/www/old.example.com'
+        site.is_ssl = False
+        site.created_on = 'created-on'
+        site.site_type = 'wp'
+        site.cache_type = 'wpfc'
+        site.db_name = 'wordpress_old'
+        site.db_user = 'wordpress_user'
+        site.db_password = 'secret'
+        site.db_host = 'localhost'
+        site.php_version = '8.4'
+        old_lookup = mock.Mock(first=mock.Mock(return_value=site))
+        new_lookup = mock.Mock(first=mock.Mock(return_value=None))
+
+        with mock.patch('wo.cli.plugins.sitedb.SiteDB') as SiteDB, \
+                mock.patch('wo.cli.plugins.sitedb.db_session') as db_session:
+            SiteDB.query.filter.side_effect = [old_lookup, new_lookup]
+            self.assertTrue(renameSiteInfo(
+                app,
+                'old.example.com',
+                'new.example.com',
+                site_path='/var/www/new.example.com',
+                ssl=True,
+            ))
+
+        self.assertEqual(site.sitename, 'new.example.com')
+        self.assertEqual(site.site_path, '/var/www/new.example.com')
+        self.assertTrue(site.is_ssl)
+        self.assertEqual(site.created_on, 'created-on')
+        self.assertEqual(site.site_type, 'wp')
+        self.assertEqual(site.cache_type, 'wpfc')
+        self.assertEqual(site.db_name, 'wordpress_old')
+        self.assertEqual(site.db_user, 'wordpress_user')
+        self.assertEqual(site.db_password, 'secret')
+        self.assertEqual(site.db_host, 'localhost')
+        self.assertEqual(site.php_version, '8.4')
+        db_session.commit.assert_called_once_with()
+
+    def test_recoverable_nginx_helpers_do_not_call_exiting_log_error(self):
+        app = mock.Mock()
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.error') as log_error:
+            with mock.patch(
+                    'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                    side_effect=RuntimeError('nginx unavailable')):
+                self.assertFalse(MTFunctions.validate_nginx_config_recoverable(app))
+
+            with mock.patch.object(
+                    MTFunctions,
+                    'generate_modular_nginx_config',
+                    side_effect=RuntimeError('render failed')):
+                self.assertIsNone(MTFunctions.write_nginx_config_for_rename(
+                    app,
+                    'new.example.com',
+                    '8.4',
+                    'wpfc',
+                    '/var/www/new.example.com',
+                ))
+
+            with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.lexists', return_value=False), \
+                    mock.patch('wo.cli.plugins.multitenancy_functions.os.path.exists', return_value=False), \
+                    mock.patch(
+                        'wo.cli.plugins.multitenancy_functions.os.symlink',
+                        side_effect=RuntimeError('symlink failed'),
+                    ):
+                self.assertFalse(MTFunctions.enable_nginx_site_for_rename(app, 'new.example.com'))
+
+            reload_failures = [
+                mtf.subprocess.CalledProcessError(1, ['systemctl', 'reload', 'nginx'], stderr='systemctl failed'),
+                mtf.subprocess.CalledProcessError(1, ['nginx', '-s', 'reload'], stderr='nginx reload failed'),
+            ]
+            with mock.patch.object(MTFunctions, 'validate_nginx_config_recoverable', return_value=True), \
+                    mock.patch(
+                        'wo.cli.plugins.multitenancy_functions.subprocess.run',
+                        side_effect=reload_failures,
+                    ), \
+                    mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'):
+                self.assertFalse(MTFunctions.reload_nginx_recoverable(app, 'new.example.com'))
+
+        self.assertTrue(log_error.call_args_list)
+        for call in log_error.call_args_list:
+            self.assertIs(call.kwargs.get('exit'), False)
 
 
 class BaselineApplicatorTests(unittest.TestCase):

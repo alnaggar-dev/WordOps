@@ -14,7 +14,8 @@ from wo.cli.plugins.site_functions import (
     site_package_check, sitebackup, pre_run_checks
 )
 from wo.cli.plugins.sitedb import (
-    addNewSite, deleteSiteInfo, getAllsites, getSiteInfo, updateSiteInfo
+    addNewSite, deleteSiteInfo, getAllsites, getSiteInfo, renameSiteInfo,
+    updateSiteInfo
 )
 from wo.core.domainvalidate import WODomain
 from wo.core.fileutils import WOFileUtils
@@ -62,6 +63,8 @@ class WOMultitenancyController(CementBaseController):
         arguments = [
             (['site_name'],
                 dict(help='Website domain name', nargs='?')),
+            (['newsite_name'],
+                dict(help='New website domain name for rename', nargs='?')),
             (['--force'],
                 dict(help='Force operation without confirmations', action='store_true')),
             (['--shared'],
@@ -920,6 +923,11 @@ class WOMultitenancyController(CementBaseController):
         """Delete a site from multitenancy system"""
         return self._delete_impl()
 
+    @expose(help="Rename a multitenancy site's primary domain")
+    def rename(self):
+        """Rename a shared-core tenant domain in place."""
+        return self._rename_impl()
+
     def _delete_impl(self):
         pargs = self.app.pargs
         domain = pargs.site_name
@@ -1010,6 +1018,334 @@ class WOMultitenancyController(CementBaseController):
             Log.warn(self, "Site deleted but tracking entry remains")
             Log.warn(self, f"Manually clean up with: sqlite3 /var/lib/wo/dbase.db \"DELETE FROM multitenancy_sites WHERE domain = '{domain}';\"")
 
+
+    def _rename_impl(self):
+        pargs = self.app.pargs
+
+        if not pargs.site_name or not pargs.newsite_name:
+            Log.error(self, "Usage: wo multitenancy rename <old-domain> <new-domain>", exit=False)
+            return False
+
+        old_domain = WODomain.validate(self, pargs.site_name)
+        new_domain = WODomain.validate(self, pargs.newsite_name)
+
+        if old_domain == new_domain:
+            Log.error(self, "Source and target domains are identical", exit=False)
+            return False
+
+        if not MTDatabase.is_initialized(self):
+            Log.error(self, "Multi-tenancy not initialized", exit=False)
+            return False
+
+        site_info = getSiteInfo(self, old_domain)
+        if not site_info:
+            Log.error(self, f"Site {old_domain} not found in WordOps database", exit=False)
+            return False
+
+        # Check if site exists in tracking
+        from wo.core.database import db_session
+        from wo.cli.plugins.multitenancy_db import MultitenancySite
+
+        session = db_session
+        mt_site = session.query(MultitenancySite).filter_by(domain=old_domain).first()
+
+        if not mt_site:
+            Log.error(self, f"Site {old_domain} not found in multitenancy tracking", exit=False)
+            return False
+
+        if check_domain_exists(self, new_domain):
+            Log.error(self, f"Site {new_domain} already exists", exit=False)
+            return False
+
+        if MTDatabase.is_shared_site(self, new_domain):
+            Log.error(self, f"Site {new_domain} already exists in multitenancy tracking", exit=False)
+            return False
+
+        target_paths = [
+            f'/var/www/{new_domain}',
+            f'/etc/nginx/sites-available/{new_domain}',
+            f'/etc/nginx/sites-enabled/{new_domain}',
+            f'/etc/nginx/conf.d/force-ssl-{new_domain}.conf',
+        ]
+        for target_path in target_paths:
+            if os.path.lexists(target_path) or os.path.exists(target_path):
+                Log.error(self, f"Target path already exists: {target_path}", exit=False)
+                return False
+
+        old_root = getattr(mt_site, 'site_path', None) or getattr(site_info, 'site_path', None) or f'/var/www/{old_domain}'
+        old_htdocs = f'{old_root}/htdocs'
+        old_wp_config = f'{old_htdocs}/wp-config.php'
+        if not old_root or not os.path.exists(old_root):
+            Log.error(self, f"Site root not found: {old_root}", exit=False)
+            return False
+        if not os.path.exists(old_wp_config):
+            Log.error(self, f"wp-config.php not found: {old_wp_config}", exit=False)
+            return False
+
+        new_root = f'/var/www/{new_domain}'
+        new_htdocs = f'{new_root}/htdocs'
+        cache_type = getattr(mt_site, 'cache_type', None) or getattr(site_info, 'cache_type', None) or 'basic'
+        php_version = getattr(mt_site, 'php_version', None) or getattr(site_info, 'php_version', None) or '8.4'
+        old_ssl = bool(getattr(mt_site, 'is_ssl', False) or getattr(site_info, 'is_ssl', False))
+        ssl_requested = old_ssl or bool(getattr(pargs, 'letsencrypt', False))
+        tracked_old_redis_prefix = getattr(mt_site, 'redis_prefix', None)
+        new_redis_prefix = MTDatabase.generate_redis_prefix(self, new_domain)
+        scheme = 'https' if ssl_requested else 'http'
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup_dir = f'/var/www/.wo-rename-{old_domain}-to-{new_domain}-{timestamp}'
+
+        if not pargs.force:
+            Log.warn(self, f"This will rename site: {old_domain} -> {new_domain}")
+            confirm = input("Continue? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                Log.info(self, "Aborted")
+                return False
+
+        config = MTFunctions.load_config(self)
+        shared_root = config.get('shared_root', '/var/www/shared')
+        if not MTFunctions.preflight_shared_config(self, shared_root):
+            return False
+
+        if ssl_requested:
+            if not MTFunctions.prepare_ssl_certificate_for_rename(self, new_domain, pargs):
+                Log.error(self, f"SSL certificate preparation failed for {new_domain}", exit=False)
+                return False
+
+        old_available_path = f'/etc/nginx/sites-available/{old_domain}'
+        old_enabled_path = f'/etc/nginx/sites-enabled/{old_domain}'
+        old_force_ssl_path = f'/etc/nginx/conf.d/force-ssl-{old_domain}.conf'
+        new_available_path = f'/etc/nginx/sites-available/{new_domain}'
+        new_enabled_path = f'/etc/nginx/sites-enabled/{new_domain}'
+        new_force_ssl_path = f'/etc/nginx/conf.d/force-ssl-{new_domain}.conf'
+
+        rollback = {
+            'old_enabled': os.path.lexists(f'/etc/nginx/sites-enabled/{old_domain}') or os.path.exists(f'/etc/nginx/sites-enabled/{old_domain}'),
+            'old_available_backup': None,
+            'old_force_ssl_backup': None,
+            'wp_config_backup': None,
+            'backup_dir': backup_dir,
+            'root_moved': False,
+            'new_nginx_created': False,
+            'new_enabled': False,
+            'wp_replaced': False,
+            'sitedb_updated': False,
+            'mt_updated': False,
+            'stale_include_backups': [],
+            'new_ssl_paths': [],
+        }
+
+        os.makedirs(backup_dir, mode=0o700, exist_ok=False)
+        wp_config_backup = f'{backup_dir}/wp-config.php'
+        shutil.copy2(old_wp_config, wp_config_backup)
+        os.chmod(wp_config_backup, 0o600)
+        rollback['wp_config_backup'] = wp_config_backup
+
+        if os.path.exists(old_available_path):
+            old_available_backup = f'{backup_dir}/nginx-site-available-{old_domain}'
+            shutil.copy2(old_available_path, old_available_backup)
+            rollback['old_available_backup'] = old_available_backup
+
+        if os.path.exists(old_force_ssl_path):
+            old_force_ssl_backup = f'{backup_dir}/force-ssl-{old_domain}.conf'
+            shutil.copy2(old_force_ssl_path, old_force_ssl_backup)
+            rollback['old_force_ssl_backup'] = old_force_ssl_backup
+
+        resolved_old_redis_prefix = None
+        ssl_enabled = False
+
+        try:
+            if os.path.lexists(old_enabled_path) or os.path.exists(old_enabled_path):
+                os.remove(old_enabled_path)
+            if os.path.exists(old_force_ssl_path):
+                os.remove(old_force_ssl_path)
+
+            os.rename(old_root, new_root)
+            rollback['root_moved'] = True
+
+            for stale_include_path in (
+                    f'{new_root}/conf/nginx/ssl.conf',
+                    f'{new_root}/conf/nginx/hsts.conf'):
+                if os.path.lexists(stale_include_path) or os.path.exists(stale_include_path):
+                    stale_include_backup = f'{stale_include_path}.rename.{timestamp}.bak'
+                    os.rename(stale_include_path, stale_include_backup)
+                    rollback['stale_include_backups'].append((stale_include_backup, stale_include_path))
+
+            resolved_old_redis_prefix = MTFunctions.rewrite_wp_config_for_rename(
+                self, new_root, old_domain, new_domain, new_redis_prefix, tracked_old_redis_prefix)
+            if not resolved_old_redis_prefix:
+                raise Exception("wp-config rewrite failed")
+
+            nginx_config_path = MTFunctions.write_nginx_config_for_rename(
+                self, new_domain, php_version, cache_type, new_root)
+            if not nginx_config_path:
+                raise Exception("Nginx config generation failed")
+            rollback['new_nginx_created'] = True
+
+            if not MTFunctions.enable_nginx_site_for_rename(self, new_domain):
+                raise Exception("Nginx site enable failed")
+            rollback['new_enabled'] = True
+
+            if not MTFunctions.validate_nginx_config_recoverable(self, log_errors=True):
+                raise Exception("Nginx configuration invalid after rename")
+
+            rollback['wp_replaced'] = True
+            if not MTFunctions.update_wordpress_domain(self, new_htdocs, old_domain, new_domain, scheme):
+                raise Exception("WordPress domain update failed")
+
+            if ssl_requested:
+                if not MTFunctions.install_ssl_config_for_rename(self, new_domain, new_root, pargs):
+                    raise Exception("SSL setup failed for renamed domain")
+                ssl_enabled = True
+                for new_ssl_path in (
+                        f'/etc/nginx/conf.d/force-ssl-{new_domain}.conf',
+                        f'{new_root}/conf/nginx/ssl.conf',
+                        f'{new_root}/conf/nginx/hsts.conf'):
+                    if os.path.lexists(new_ssl_path) or os.path.exists(new_ssl_path):
+                        rollback['new_ssl_paths'].append(new_ssl_path)
+
+            if not renameSiteInfo(self, old_domain, new_domain, site_path=new_root, ssl=ssl_enabled):
+                raise Exception("WordOps site database rename failed")
+            rollback['sitedb_updated'] = True
+
+            if not MTDatabase.rename_shared_site_domain(
+                    self, old_domain, new_domain, site_path=new_root,
+                    redis_prefix=new_redis_prefix, is_ssl=ssl_enabled):
+                raise Exception("Multitenancy tracking rename failed")
+            rollback['mt_updated'] = True
+
+            MTFunctions.purge_site_cache(self, old_domain, resolved_old_redis_prefix)
+            MTFunctions.purge_site_cache(self, new_domain, new_redis_prefix)
+
+            if not MTFunctions.reload_nginx_recoverable(self, new_domain):
+                raise Exception("Nginx reload failed after rename")
+
+            try:
+                WOGit.add(self, ["/etc/nginx"], msg=f"Renamed shared WordPress site: {old_domain} -> {new_domain}")
+            except Exception as e:
+                Log.warn(self, f"Renamed site but failed to update nginx git tracking: {e}")
+
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+            Log.info(self, f"✅ Renamed site: {old_domain} -> {new_domain}")
+            Log.info(self, f"site_renamed source={old_domain} target={new_domain} result=success")
+            return True
+
+        except Exception as e:
+            try:
+                Log.error(self, f"Rename failed: {e}", exit=False)
+                Log.info(self, f"site_rename_failed source={old_domain} target={new_domain} result=failure")
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while logging failure: {rollback_error}")
+
+            try:
+                if rollback['mt_updated']:
+                    if not MTDatabase.rename_shared_site_domain(
+                            self, new_domain, old_domain, site_path=old_root,
+                            redis_prefix=resolved_old_redis_prefix or tracked_old_redis_prefix,
+                            is_ssl=old_ssl):
+                        Log.warn(self, "Failed to restore multitenancy tracking during rollback")
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring multitenancy tracking: {rollback_error}")
+
+            try:
+                if rollback['sitedb_updated']:
+                    if not renameSiteInfo(self, new_domain, old_domain, site_path=old_root, ssl=old_ssl):
+                        Log.warn(self, "Failed to restore WordOps site database during rollback")
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring WordOps site database: {rollback_error}")
+
+            try:
+                if rollback['wp_replaced']:
+                    if not MTFunctions.update_wordpress_domain(
+                            self, new_htdocs, new_domain, old_domain,
+                            'https' if old_ssl else 'http'):
+                        Log.warn(self, "Failed to restore WordPress domain during rollback")
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring WordPress domain: {rollback_error}")
+
+            ssl_cleanup_paths = []
+            try:
+                ssl_cleanup_paths = list(rollback['new_ssl_paths']) + [
+                    f'/etc/nginx/conf.d/force-ssl-{new_domain}.conf',
+                    f'{new_root}/conf/nginx/ssl.conf',
+                    f'{new_root}/conf/nginx/hsts.conf',
+                ]
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while preparing SSL cleanup: {rollback_error}")
+
+            seen_ssl_cleanup_paths = set()
+            for ssl_cleanup_path in ssl_cleanup_paths:
+                if ssl_cleanup_path in seen_ssl_cleanup_paths:
+                    continue
+                seen_ssl_cleanup_paths.add(ssl_cleanup_path)
+                try:
+                    if os.path.lexists(ssl_cleanup_path) or os.path.exists(ssl_cleanup_path):
+                        os.remove(ssl_cleanup_path)
+                except Exception as rollback_error:
+                    Log.warn(self, f"Rollback warning while removing SSL artifact {ssl_cleanup_path}: {rollback_error}")
+
+            try:
+                if rollback['wp_config_backup'] and os.path.exists(rollback['wp_config_backup']):
+                    active_wp_config = f'{new_htdocs}/wp-config.php' if rollback['root_moved'] else f'{old_htdocs}/wp-config.php'
+                    shutil.copy2(rollback['wp_config_backup'], active_wp_config)
+                    os.chmod(active_wp_config, 0o640)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring wp-config.php: {rollback_error}")
+
+            try:
+                if rollback['new_enabled']:
+                    if os.path.lexists(new_enabled_path) or os.path.exists(new_enabled_path):
+                        os.remove(new_enabled_path)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while removing new nginx symlink: {rollback_error}")
+
+            try:
+                if rollback['new_nginx_created']:
+                    if os.path.exists(new_available_path):
+                        os.remove(new_available_path)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while removing new nginx config: {rollback_error}")
+
+            try:
+                for stale_include_backup, stale_include_path in rollback['stale_include_backups']:
+                    if os.path.exists(stale_include_backup):
+                        os.rename(stale_include_backup, stale_include_path)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring stale SSL includes: {rollback_error}")
+
+            try:
+                if rollback['root_moved'] and os.path.exists(new_root) and not os.path.exists(old_root):
+                    os.rename(new_root, old_root)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring site root: {rollback_error}")
+
+            try:
+                if rollback['old_available_backup'] and os.path.exists(rollback['old_available_backup']):
+                    shutil.copy2(rollback['old_available_backup'], old_available_path)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring old nginx config: {rollback_error}")
+
+            try:
+                if rollback['old_enabled'] and (not os.path.exists(old_enabled_path) or not os.path.islink(old_enabled_path)):
+                    if os.path.lexists(old_enabled_path) or os.path.exists(old_enabled_path):
+                        os.remove(old_enabled_path)
+                    os.symlink(f'/etc/nginx/sites-available/{old_domain}', f'/etc/nginx/sites-enabled/{old_domain}')
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring old nginx symlink: {rollback_error}")
+
+            try:
+                if rollback['old_force_ssl_backup'] and os.path.exists(rollback['old_force_ssl_backup']):
+                    shutil.copy2(rollback['old_force_ssl_backup'], old_force_ssl_path)
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while restoring old force SSL config: {rollback_error}")
+
+            try:
+                if not MTFunctions.reload_nginx_recoverable(self, old_domain):
+                    Log.warn(self, "Rollback completed but nginx reload failed; run nginx -t")
+            except Exception as rollback_error:
+                Log.warn(self, f"Rollback warning while reloading nginx: {rollback_error}")
+
+            return False
 
     @expose(help="Add plugin to baseline")
     def add_plugin(self):
