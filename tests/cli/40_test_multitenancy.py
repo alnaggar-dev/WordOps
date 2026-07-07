@@ -2703,6 +2703,59 @@ bare-theme = owner/theme
         self.assertTrue(os.path.exists(os.path.join(target, 'old.txt')))
         self.assertEqual(backup_records, [])
 
+    def _make_asset_backup(self, stamp, kind, slug, root=None):
+        root = root or self.tmp
+        d = os.path.join(root, 'backups', 'assets', stamp, f'{kind}s', slug)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'marker.txt'), 'w') as fh:
+            fh.write(stamp)
+        return d
+
+    def test_prune_asset_backups_keeps_newest_per_asset(self):
+        infra = self._infra()
+        for stamp in ('20260101-000000-000001', '20260102-000000-000002',
+                      '20260103-000000-000003'):
+            self._make_asset_backup(stamp, 'plugin', 'alpha')
+        for stamp in ('20260101-000000-000001', '20260105-000000-000005'):
+            self._make_asset_backup(stamp, 'theme', 'child')
+        self._make_asset_backup('20260104-000000-000004', 'plugin', 'beta')
+
+        infra.prune_asset_backups(2)
+
+        base = os.path.join(self.tmp, 'backups', 'assets')
+
+        def stamps_for(kind, slug):
+            return sorted(
+                stamp for stamp in os.listdir(base)
+                if os.path.isdir(os.path.join(base, stamp, f'{kind}s', slug)))
+
+        # alpha had 3 backups -> keep the 2 newest, drop the oldest.
+        self.assertEqual(stamps_for('plugin', 'alpha'),
+                         ['20260102-000000-000002', '20260103-000000-000003'])
+        # child (2) and beta (1) are within keep and untouched.
+        self.assertEqual(stamps_for('theme', 'child'),
+                         ['20260101-000000-000001', '20260105-000000-000005'])
+        self.assertEqual(stamps_for('plugin', 'beta'), ['20260104-000000-000004'])
+        # The emptied plugins/ dir under the shared 01 stamp is removed, but the
+        # stamp dir survives because theme 'child' still lives there.
+        self.assertFalse(os.path.isdir(
+            os.path.join(base, '20260101-000000-000001', 'plugins')))
+        self.assertTrue(os.path.isdir(
+            os.path.join(base, '20260101-000000-000001', 'themes', 'child')))
+
+    def test_prune_asset_backups_zero_removes_all_negative_disables(self):
+        infra = self._infra()
+        self._make_asset_backup('20260101-000000-000001', 'plugin', 'alpha')
+        self._make_asset_backup('20260102-000000-000002', 'plugin', 'alpha')
+        base = os.path.join(self.tmp, 'backups', 'assets')
+
+        infra.prune_asset_backups(-1)  # disabled: nothing removed
+        self.assertEqual(sorted(os.listdir(base)),
+                         ['20260101-000000-000001', '20260102-000000-000002'])
+
+        infra.prune_asset_backups(0)  # remove every backup, clean empty dirs
+        self.assertEqual(os.listdir(base), [])
+
     def test_controller_bulk_update_restores_assets_on_canary_failure(self):
         if mt is None:
             self.skipTest(f'multitenancy controller import unavailable: {_mt_import_error}')

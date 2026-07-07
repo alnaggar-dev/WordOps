@@ -108,6 +108,7 @@ Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`. This file controls
 | `enable_plugin` | — | Cement plugin-loader gate; the plugin only loads when set to `true`. |
 | `shared_root` | `/var/www/shared` | Shared core, content, config, baseline, and release root. |
 | `keep_releases` | `3` | Number of WordPress core releases kept for rollback. |
+| `keep_asset_backups` | `3` | Per-plugin/theme backups kept under `backups/assets/` after `init --force`, `update`, `update-plugin`, and `update-theme`. `0` keeps none; a negative value disables pruning. |
 | `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest`, an exact version (e.g. `6.5.2`), or `nightly`; passed to `wp core download --version=...` when pinned. |
 | `php_version` | `8.4` | Default PHP version when the CLI/site does not specify one. |
 | `admin_email` | `admin@example.com` | Fallback admin email for site creation. |
@@ -332,6 +333,8 @@ Per-site tree:
 Core update and rollback are atomic symlink operations. `update` builds a new `releases/wp-<timestamp>` tree and repoints `current`; `rollback` repoints `current` to the previous release. By default, `keep_releases = 3` keeps three releases for rollback. When `wp_version` pins a version, `update` re-downloads that pinned version rather than the latest; change the pin or set it back to `latest` to move the core forward.
 
 Baseline changes are git-committed under `shared_root/.git`, with tracking limited to `config/baseline.json`. `history` shows recent baseline commits, and `baseline-rollback --to-version=N` checks out `baseline.json` from the commit for version `N` and commits that rollback. `update` changes the shared core and shared plugin/theme files only; it does not bump the baseline version.
+
+Plugin and theme refreshes leave a timestamped backup of the previous copy under `shared_root/backups/assets/<stamp>/<plugins|themes>/<slug>`. On success, `init --force`, `update`, `update-plugin`, and `update-theme` prune these to the newest `keep_asset_backups` (default 3) per asset; set it to `0` to keep none, or a negative value to disable pruning.
 
 Sites do not auto-upgrade on visit. Run `wo multitenancy apply`, or use `--apply-now` on baseline-changing commands that support it. By default `apply` is additive; include `--prune` only when you intentionally want plugins outside `baseline.json` deactivated.
 

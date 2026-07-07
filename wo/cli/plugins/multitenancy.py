@@ -189,6 +189,8 @@ class WOMultitenancyController(CementBaseController):
             release_manager = ReleaseManager(self, shared_root)
             keep_releases = int(config.get('keep_releases', 3))
             release_manager.cleanup_old_releases(keep_releases)
+            if not seed_failures:
+                infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
             # Update database
             MTDatabase.save_config(self, {
@@ -605,6 +607,7 @@ class WOMultitenancyController(CementBaseController):
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
             release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
+            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
 
             Log.info(self, "✅ Update completed successfully!")
@@ -1433,6 +1436,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"✅ Plugin {plugin_slug} updated successfully")
             Log.info(self, "")
             Log.info(self, "Shared plugin files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
+            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
         else:
             Log.error(self, f"Failed to update plugin {plugin_slug}")
             Log.error(self, "Check the error messages above for details")
@@ -1477,6 +1481,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"✅ Theme {theme_name} updated successfully")
             Log.info(self, "")
             Log.info(self, "Shared theme files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
+            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
         else:
             Log.error(self, f"Failed to update theme {theme_name}")
             Log.error(self, "Check the error messages above for details")

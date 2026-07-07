@@ -1618,6 +1618,52 @@ die($error_msg);
                     all_ok = False
         return all_ok
 
+    def prune_asset_backups(self, keep):
+        """Keep only the ``keep`` most recent backups of each plugin/theme under
+        backups/assets/, deleting older ones and any stamp dirs left empty.
+
+        Backups live at backups/assets/<stamp>/<plugins|themes>/<slug>; the
+        stamp (…-%f) sorts chronologically, so retention is per-asset, newest
+        first. keep<0 disables pruning; keep=0 removes every backup."""
+        if keep is None or keep < 0:
+            return
+        root = f"{self.shared_root}/backups/assets"
+        if not os.path.isdir(root):
+            return
+        groups = {}
+        for stamp in os.listdir(root):
+            stamp_dir = os.path.join(root, stamp)
+            if not os.path.isdir(stamp_dir):
+                continue
+            for kinds in os.listdir(stamp_dir):
+                kinds_dir = os.path.join(stamp_dir, kinds)
+                if not os.path.isdir(kinds_dir):
+                    continue
+                for slug in os.listdir(kinds_dir):
+                    groups.setdefault((kinds, slug), []).append(
+                        (stamp, os.path.join(kinds_dir, slug)))
+        for entries in groups.values():
+            entries.sort(reverse=True)  # newest stamp first
+            for _, path in entries[keep:]:
+                shutil.rmtree(path, ignore_errors=True)
+        # Drop stamp/kind directories left empty by pruning.
+        for stamp in os.listdir(root):
+            stamp_dir = os.path.join(root, stamp)
+            if not os.path.isdir(stamp_dir):
+                continue
+            for kinds in list(os.listdir(stamp_dir)):
+                kinds_dir = os.path.join(stamp_dir, kinds)
+                if os.path.isdir(kinds_dir) and not os.listdir(kinds_dir):
+                    try:
+                        os.rmdir(kinds_dir)
+                    except OSError:
+                        pass
+            if not os.listdir(stamp_dir):
+                try:
+                    os.rmdir(stamp_dir)
+                except OSError:
+                    pass
+
     def _dispatch_download(self, kind, slug, source, force=False, backup_records=None):
         """Call the correct download_* helper for a resolved source dict."""
         stype = (source or {}).get('type')
