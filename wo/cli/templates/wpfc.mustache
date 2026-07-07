@@ -11,7 +11,7 @@ location ~ \.php$ {
   try_files $uri =404;
   include fastcgi_params;
   fastcgi_pass {{upstream}};
-  fastcgi_cache_bypass $skip_cache;
+  fastcgi_cache_bypass $skip_cache_bypass;
   fastcgi_no_cache $skip_cache;
   fastcgi_cache WORDPRESS;
 }

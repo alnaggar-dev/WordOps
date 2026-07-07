@@ -25,7 +25,7 @@ location ~ \.php$ {
   set $key "nginx-cache:$scheme$request_method$host$request_uri";
   try_files $uri =404;
 
-  srcache_fetch_skip $skip_cache;
+  srcache_fetch_skip $skip_cache_bypass;
   srcache_store_skip $skip_cache;
 
   srcache_response_cache_control off;

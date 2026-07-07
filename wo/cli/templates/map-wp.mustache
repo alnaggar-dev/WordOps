@@ -13,21 +13,32 @@ map $http_authorization $http_auth_no_cache {
     "" 0;
 }
 
-# do not cache requests on cookies
+# Cookies that must ALWAYS reach PHP: never served from cache, never stored.
 map $http_cookie $cookie_no_cache {
     default 0;
     "~*wordpress_[a-f0-9]+" 1;
     "~*wp-postpass" 1;
-    #"~*wordpress_logged_in" 1;
     "~*wordpress_no_cache" 1;
     "~*comment_author" 1;
-    #"~*woocommerce_items_in_cart" 1;
-    "~*edd_items_in_cart" 1;
-    "~*woocommerce_cart_hash" 1;
-    "~*wptouch_switch_toogle" 1;
     "~*comment_author_email_" 1;
-    "~*wptouch_switch_toggle" 1;
+    "~*edd_items_in_cart" 1;
     "~*edd" 1;
+    "~*wptouch_switch_toogle" 1;
+    "~*wptouch_switch_toggle" 1;
+}
+
+# Cookies that MAY be served the shared public page from cache, but whose own
+# response must never be STORED. These carry per-user state (cart contents,
+# login session, nonces, admin bar); only the write side ($skip_cache) blocks
+# them, so a logged-in / AJAX-cart customer still gets a cache HIT while their
+# personalized response can never poison the cookie-agnostic public key.
+# Comment a line to make that cookie fully cacheable (served AND stored).
+map $http_cookie $cookie_no_store {
+    default 0;
+    "~*wordpress_logged_in" 1;
+    "~*woocommerce_items_in_cart" 1;
+    "~*woocommerce_cart_hash" 1;
+    "~*wp_woocommerce_session_" 1;
 }
 
 # do not cache the following uri
@@ -89,14 +100,26 @@ map $is_args_no_cache$args_to_cache $query_no_cache {
     11 0;
 }
 
-# if all previous check are passed, $skip_cache = 0
-map $http_request_no_cache$http_auth_no_cache$cookie_no_cache$uri_no_cache$query_no_cache $skip_cache {
+# READ side (fastcgi_cache_bypass / srcache_fetch_skip / $cache_uri): serve
+# from cache unless a truly-private signal is present. $cookie_no_store is NOT
+# included here, so cart & logged-in visitors still get cache HITs.
+map $http_request_no_cache$http_auth_no_cache$cookie_no_cache$uri_no_cache$query_no_cache $skip_cache_bypass {
     default 1;
     00000 0;
 }
 
-# map $skip_cache with $cache_uri for --wpsc --wpce & --wprocket stack
-map $skip_cache $cache_uri {
+# WRITE side (fastcgi_no_cache / srcache_store_skip): store the response only
+# when nothing private AND no per-user ($cookie_no_store) signal is present, so
+# cart/login responses are never written to the shared public cache.
+map $http_request_no_cache$http_auth_no_cache$cookie_no_cache$cookie_no_store$uri_no_cache$query_no_cache $skip_cache {
+    default 1;
+    000000 0;
+}
+
+# map $skip_cache_bypass with $cache_uri for --wpsc --wpce & --wprocket stack
+# (static-file caches): serve the plugin's cached page to cart/login visitors
+# too; the plugin decides what it writes to disk.
+map $skip_cache_bypass $cache_uri {
     0 $request_uri;
     default 'null cache';
 }
