@@ -148,9 +148,10 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Downloading WordPress core...")
             release_name = infra.download_wordpress_core(config.get('wp_version'))
             
-            # Seed plugins and themes
+            # Seed plugins and themes. On --force (reinitialize) this refreshes
+            # assets already on disk from their configured sources.
             Log.info(self, "Seeding plugins and themes...")
-            seed_failures = infra.seed_plugins_and_themes(config)
+            seed_failures = infra.seed_plugins_and_themes(config, force=pargs.force)
             
             # Create baseline configuration
             Log.info(self, "Creating baseline configuration...")

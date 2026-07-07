@@ -1440,12 +1440,17 @@ die($error_msg);
         os.chmod(router_path, 0o644)
         Log.debug(self.app, f"Created router wp-config.php in {release_path}")
     
-    def seed_plugins_and_themes(self, config):
+    def seed_plugins_and_themes(self, config, force=False):
         """Download initial plugins and themes.
 
         Returns a list of human-readable identifiers for items that failed to
         download, so callers can surface them. An empty list means everything
         succeeded (or there was nothing to seed).
+
+        When force=True, plugin/theme directories that already exist are
+        re-downloaded and replaced (backing up the previous copy), so
+        ``init --force`` refreshes assets already on disk. force=False leaves
+        existing assets untouched (the default for a first-time init).
         """
         failures = []
 
@@ -1464,7 +1469,7 @@ die($error_msg);
         for plugin in plugins:
             if plugin in github_plugins or plugin in url_plugins:
                 continue  # provided by a GitHub/URL source below
-            if not self.download_plugin(plugin):
+            if not self.download_plugin(plugin, force=force):
                 failures.append(f"plugin '{plugin}' (WordPress.org)")
 
         # Download GitHub plugins
@@ -1480,11 +1485,11 @@ die($error_msg);
                     tag = parsed['ref'] if parsed['ref_type'] == 'tag' else None
 
                     if branch:
-                        ok = self.download_plugin_from_github(github_repo, plugin_slug, branch=branch)
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug, branch=branch, force=force)
                     elif tag:
-                        ok = self.download_plugin_from_github(github_repo, plugin_slug, tag=tag)
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug, tag=tag, force=force)
                     else:
-                        ok = self.download_plugin_from_github(github_repo, plugin_slug)
+                        ok = self.download_plugin_from_github(github_repo, plugin_slug, force=force)
                     if not ok:
                         failures.append(f"plugin '{plugin_slug}' (GitHub {github_repo})")
 
@@ -1500,7 +1505,7 @@ die($error_msg);
         for theme in themes:
             if theme in github_themes or theme in url_themes:
                 continue  # provided by a GitHub/URL source below
-            if not self.download_theme(theme):
+            if not self.download_theme(theme, force=force):
                 failures.append(f"theme '{theme}' (WordPress.org)")
 
         # Download GitHub themes
@@ -1516,11 +1521,11 @@ die($error_msg);
                     tag = parsed['ref'] if parsed['ref_type'] == 'tag' else None
 
                     if branch:
-                        ok = self.download_theme_from_github(github_repo, theme_slug, branch=branch)
+                        ok = self.download_theme_from_github(github_repo, theme_slug, branch=branch, force=force)
                     elif tag:
-                        ok = self.download_theme_from_github(github_repo, theme_slug, tag=tag)
+                        ok = self.download_theme_from_github(github_repo, theme_slug, tag=tag, force=force)
                     else:
-                        ok = self.download_theme_from_github(github_repo, theme_slug)
+                        ok = self.download_theme_from_github(github_repo, theme_slug, force=force)
                     if not ok:
                         failures.append(f"theme '{theme_slug}' (GitHub {github_repo})")
 
@@ -1528,14 +1533,14 @@ die($error_msg);
         if url_plugins:
             for plugin_slug, url in url_plugins.items():
                 if isinstance(url, str):
-                    if not self.download_plugin_from_url(url, plugin_slug):
+                    if not self.download_plugin_from_url(url, plugin_slug, force=force):
                         failures.append(f"plugin '{plugin_slug}' (URL)")
 
         # Download URL themes
         if url_themes:
             for theme_slug, url in url_themes.items():
                 if isinstance(url, str):
-                    if not self.download_theme_from_url(url, theme_slug):
+                    if not self.download_theme_from_url(url, theme_slug, force=force):
                         failures.append(f"theme '{theme_slug}' (URL)")
 
         return failures

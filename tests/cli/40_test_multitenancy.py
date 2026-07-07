@@ -305,17 +305,55 @@ url-only = https://example.com/url-only.zip
             failures = infra.seed_plugins_and_themes(config)
 
         self.assertEqual(failures, [])
-        download_plugin.assert_called_once_with('wp-source')
-        download_github.assert_called_once_with('owner/repo', 'github-duplicate', branch='main')
+        download_plugin.assert_called_once_with('wp-source', force=False)
+        download_github.assert_called_once_with('owner/repo', 'github-duplicate', branch='main', force=False)
         download_url.assert_called_once_with(
             'https://example.com/url-duplicate.zip',
             'url-duplicate',
+            force=False,
         )
-        download_theme.assert_called_once_with('wp-theme')
-        download_theme_github.assert_called_once_with('owner/theme', 'github-theme', branch='main')
+        download_theme.assert_called_once_with('wp-theme', force=False)
+        download_theme_github.assert_called_once_with('owner/theme', 'github-theme', branch='main', force=False)
         download_theme_url.assert_called_once_with(
             'https://example.com/url-theme.zip',
             'url-theme',
+            force=False,
+        )
+
+    def test_seed_threads_force_true_to_all_download_helpers(self):
+        """init --force path: seed passes force=True to every plugin/theme download helper."""
+        infra = SharedInfrastructure(mock.Mock(), self.tmp)
+        config = {
+            'wordpress_plugins': {'wp-source': 'latest'},
+            'github_plugins': {'gh-plugin': 'owner/repo,branch,main'},
+            'url_plugins': {'url-plugin': 'https://example.com/url-plugin.zip'},
+            'wordpress_themes': {'wp-theme': 'latest'},
+            'github_themes': {'gh-theme': 'owner/theme,branch,main'},
+            'url_themes': {'url-theme': 'https://example.com/url-theme.zip'},
+        }
+
+        with mock.patch.object(infra, 'download_plugin', return_value=True) as download_plugin, \
+                mock.patch.object(infra, 'download_plugin_from_github', return_value=True) as download_github, \
+                mock.patch.object(infra, 'download_plugin_from_url', return_value=True) as download_url, \
+                mock.patch.object(infra, 'download_theme', return_value=True) as download_theme, \
+                mock.patch.object(infra, 'download_theme_from_github', return_value=True) as download_theme_github, \
+                mock.patch.object(infra, 'download_theme_from_url', return_value=True) as download_theme_url:
+            failures = infra.seed_plugins_and_themes(config, force=True)
+
+        self.assertEqual(failures, [])
+        download_plugin.assert_called_once_with('wp-source', force=True)
+        download_github.assert_called_once_with('owner/repo', 'gh-plugin', branch='main', force=True)
+        download_url.assert_called_once_with(
+            'https://example.com/url-plugin.zip',
+            'url-plugin',
+            force=True,
+        )
+        download_theme.assert_called_once_with('wp-theme', force=True)
+        download_theme_github.assert_called_once_with('owner/theme', 'gh-theme', branch='main', force=True)
+        download_theme_url.assert_called_once_with(
+            'https://example.com/url-theme.zip',
+            'url-theme',
+            force=True,
         )
 
     def test_seed_legacy_config_without_source_sections_uses_legacy_baseline_keys(self):
@@ -332,10 +370,10 @@ url-only = https://example.com/url-only.zip
 
         self.assertEqual(failures, [])
         self.assertEqual(download_plugin.call_args_list, [
-            mock.call('legacy-one'),
-            mock.call('legacy-two'),
+            mock.call('legacy-one', force=False),
+            mock.call('legacy-two', force=False),
         ])
-        download_theme.assert_called_once_with('legacy-theme')
+        download_theme.assert_called_once_with('legacy-theme', force=False)
 
     def test_create_baseline_config_leaves_existing_file_byte_identical(self):
         """bootstrap must never rewrite an operator-owned baseline.json."""

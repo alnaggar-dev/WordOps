@@ -97,7 +97,7 @@ Initialize the shared core, baseline file, config, database metadata, permission
 wo multitenancy init
 ```
 
-Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` is safe for infrastructure repair, but it never overwrites an existing `baseline.json`. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
+Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` re-downloads every configured plugin and theme from its source, backing up the previous copy the way `update` does, and repairs shared infrastructure; it never overwrites an existing `baseline.json`. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
 
 ## Configuration
 
@@ -210,7 +210,7 @@ Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-
 
 | Command | Purpose |
 | --- | --- |
-| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` is safe but never overwrites an existing baseline. |
+| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` re-downloads all configured plugins/themes from their sources (backing up previous copies) but never overwrites an existing baseline. |
 | `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. For `--wpfc`/`--wpredis` sites that include `nginx-helper` in the baseline, it also enables Nginx Helper cache purging automatically. See [create options](#create-options). |
 | `wo multitenancy update [--force]` | Download a new core honoring `wp_version` from config, refresh all shared plugin/theme sources from baseline metadata or config fallback, restore shared assets if a download/promote fails or the canary aborts, then back up and switch the core release and clear caches. `--force` skips the canary abort. This command does not bump the baseline version. |
 | `wo multitenancy rollback [--force]` | Switch `current` back to the previous WordPress core release only. It does not roll back plugin/theme updates after a successful update command. Failed bulk updates restore shared asset backups automatically before returning. `--force` skips confirmation. |
