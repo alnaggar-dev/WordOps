@@ -97,7 +97,7 @@ Initialize the shared core, baseline file, config, database metadata, permission
 wo multitenancy init
 ```
 
-Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` re-downloads every configured plugin and theme from its source, backing up the previous copy the way `update` does, and repairs shared infrastructure; it never overwrites an existing `baseline.json`. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
+Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` re-downloads every configured plugin and theme from its source, leaving a timestamped backup of each previous copy under `backups/assets/`, and repairs shared infrastructure; it never overwrites an existing `baseline.json`. Unlike `update`, a mid-seed failure is per-asset best-effort rather than an all-or-nothing rollback. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
 
 ## Configuration
 
