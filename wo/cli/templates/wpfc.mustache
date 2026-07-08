@@ -1,6 +1,6 @@
 # WPFC NGINX CONFIGURATION - WordOps {{release}}
 # DO NOT MODIFY, ALL CHANGES WILL BE LOST AFTER AN WordOps (wo) UPDATE
-# $skip_cache variable set in /etc/nginx/conf.d/map-wp.conf
+# $skip_cache & $shadow_warm variables set in /etc/nginx/conf.d/map-wp-fastcgi-cache.conf
 
 add_header X-FastCGI-Cache "$upstream_cache_status";
 # Use cached or actual file if they exists, Otherwise pass request to WordPress
@@ -12,8 +12,33 @@ location ~ \.php$ {
   include fastcgi_params;
   fastcgi_pass {{upstream}};
   fastcgi_cache_bypass $skip_cache_bypass;
-  fastcgi_no_cache $skip_cache;
+  # never store personalized responses, nor any response that sets a cookie
+  fastcgi_no_cache $skip_cache $upstream_http_set_cookie;
   fastcgi_cache WORDPRESS;
+  # store-blocked logged-in/cart GETs replay anonymously to warm the cache
+  mirror /wo-shadow-warm;
+  mirror_request_body off;
+}
+# Anonymous shadow warm: internal cookie-less replay of the original URL,
+# triggered by `mirror` above, gated by $shadow_warm (see
+# conf.d/map-wp-fastcgi-cache.conf). Renders as an anonymous visitor and
+# stores the response under the SAME cache key; the response body is
+# discarded — the client only ever receives the main request's response.
+location = /wo-shadow-warm {
+  internal;
+  access_log off;
+  if ($shadow_warm = 0) { return 204; }
+  rewrite ^ /index.php break;
+  include fastcgi_params;
+  fastcgi_param HTTP_COOKIE "";
+  fastcgi_param HTTP_AUTHORIZATION "";
+  fastcgi_param HTTP_IF_MODIFIED_SINCE "";
+  fastcgi_param HTTP_IF_NONE_MATCH "";
+  fastcgi_param CONTENT_LENGTH "";
+  fastcgi_pass_request_body off;
+  fastcgi_pass {{upstream}};
+  fastcgi_cache WORDPRESS;
+  fastcgi_no_cache $upstream_http_set_cookie;
 }
 location ~ /purge(/.*) {
   fastcgi_cache_purge WORDPRESS "$scheme$request_method$host$1";

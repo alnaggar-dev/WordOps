@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 -   Add PHP 8.4 support by @VirtuBox
 -   Add multitenancy `wp_version` config key to pin the shared WordPress core version
 -   Auto-enable the Object Cache Pro drop-in during multitenancy `create` and `wo multitenancy apply`; `WP_REDIS_CONFIG` in each tenant's `wp-config.php` is inert without `wp-content/object-cache.php`. Uses `wp redis enable --force` (idempotent, updates stale drop-ins), chowns the drop-in to `www-data`, and is best-effort so it never blocks provisioning
+-   Add anonymous shadow warming to FastCGI cache templates so logged-in/cart GETs warm public cache entries without storing personalized responses
 
 #### Changed
 

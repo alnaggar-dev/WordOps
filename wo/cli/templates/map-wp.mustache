@@ -116,6 +116,17 @@ map $http_request_no_cache$http_auth_no_cache$cookie_no_cache$cookie_no_store$ur
     000000 0;
 }
 
+# SHADOW WARM gate: 1 when the response would be stored EXCEPT that a
+# no-store cookie (logged-in / cart) is present on a plain GET. Such requests
+# trigger an internal cookie-less replay (location /wo-shadow-warm in
+# common/wpfc-*.conf) that renders the same URL anonymously and stores THAT
+# copy under the same cache key: the first logged-in visitor warms the page
+# for everyone, while personalized HTML still never enters the cache.
+map $request_method$http_request_no_cache$http_auth_no_cache$cookie_no_cache$cookie_no_store$uri_no_cache$query_no_cache $shadow_warm {
+    default 0;
+    "GET000100" 1;
+}
+
 # map $skip_cache_bypass with $cache_uri for --wpsc --wpce & --wprocket stack
 # (static-file caches): serve the plugin's cached page to cart/login visitors
 # too; the plugin decides what it writes to disk.
