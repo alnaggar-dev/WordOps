@@ -113,6 +113,12 @@ class WOMultitenancyController(CementBaseController):
             (['--verbose'], dict(help='Verbose per-site output', action='store_true', dest='verbose')),
         ]
         usage = "wo multitenancy <command> [options]"
+    CRON_SYNC_FAILURE_HINT = "cron sync failed; run `wo multitenancy apply` to regenerate /etc/cron.d/wo-multitenancy"
+
+    def _sync_wp_cron_or_fail(self):
+        if not MTFunctions.sync_wp_cron_entries(self):
+            Log.error(self, self.CRON_SYNC_FAILURE_HINT)
+
 
     @expose(hide=True)
     def default(self):
@@ -497,6 +503,7 @@ class WOMultitenancyController(CementBaseController):
                 self, wo_domain, current_version if baseline_complete else 0
             )
 
+
             # Git commit
             WOGit.add(self, ["/etc/nginx"], 
                      msg=f"Created shared WordPress site: {wo_domain}")
@@ -526,6 +533,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"   Admin URL: {site_url}/wp-admin")
             Log.info(self, f"   Admin user: {pargs.admin_user}")
             Log.info(self, f"   Admin password: {admin_pass}")
+            self._sync_wp_cron_or_fail()
             Log.info(self, "")
 
         except Exception as e:
@@ -1014,7 +1022,9 @@ class WOMultitenancyController(CementBaseController):
             session.commit()
             Log.info(self, "✅ Removed from multitenancy tracking")
 
+
             Log.info(self, f"site_deleted target={domain} result=success")
+            self._sync_wp_cron_or_fail()
 
         except Exception as e:
             Log.error(self, f"Error removing from tracking: {e}")
@@ -1221,6 +1231,7 @@ class WOMultitenancyController(CementBaseController):
                 raise Exception("Multitenancy tracking rename failed")
             rollback['mt_updated'] = True
 
+
             MTFunctions.purge_site_cache(self, old_domain, resolved_old_redis_prefix)
             MTFunctions.purge_site_cache(self, new_domain, new_redis_prefix)
 
@@ -1236,6 +1247,7 @@ class WOMultitenancyController(CementBaseController):
 
             Log.info(self, f"✅ Renamed site: {old_domain} -> {new_domain}")
             Log.info(self, f"site_renamed source={old_domain} target={new_domain} result=success")
+            self._sync_wp_cron_or_fail()
             return True
 
         except Exception as e:
@@ -1864,16 +1876,25 @@ class WOMultitenancyController(CementBaseController):
             self, config, baseline_version,
             dry_run=dry_run, verbose=verbose, prune=prune,
         )
+        cron_sync_ok = True
+        if not dry_run:
+            cron_sync_ok = MTFunctions.sync_wp_cron_entries(self)
+
         summary = result if isinstance(result, dict) else {}
         summary.setdefault('baseline_version', baseline_version)
         summary.setdefault('dry_run', dry_run)
+        summary_failed = summary.get('failed', 0)
+        if not cron_sync_ok:
+            summary_failed += 1
         Log.info(
             self,
-            f"baseline_applied target=baseline result=success "
+            f"baseline_applied target=baseline result={'success' if cron_sync_ok else 'failure'} "
             f"attempted={summary.get('attempted', 0)} "
             f"succeeded={summary.get('succeeded', 0)} "
-            f"failed={summary.get('failed', 0)}",
+            f"failed={summary_failed}",
         )
+        if not cron_sync_ok:
+            Log.error(self, self.CRON_SYNC_FAILURE_HINT)
 
     @expose(help="Remove multi-tenancy infrastructure (dangerous)")
     def remove(self):

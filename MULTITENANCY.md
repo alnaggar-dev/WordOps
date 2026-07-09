@@ -25,6 +25,8 @@ Multi-tenancy has three configuration layers:
 
 Each generated tenant `wp-config.php` does a `require_once` of `/var/www/shared/config/wp-config-shared.php` before defining its DB constants. The require is guarded by `WO_BYPASS_SHARED_CONFIG`, and risky paths lint the shared file with `php -l` before proceeding. The shared core is `current -> releases/wp-<timestamp>`; `update` builds a new release and repoints `current`, while `rollback` repoints it to the previous release.
 
+Generated shared config disables loopback WP-Cron (`DISABLE_WP_CRON` true). WordOps maintains `/etc/cron.d/wo-multitenancy` with one every-minute `wp cron event run --due-now` entry per enabled tenant, each prefixed with a deterministic per-domain sleep of 0–59 seconds (CRC32 of the domain, modulo 60) so fleet cron runs are splayed across the minute instead of starting simultaneously; `create`, `delete`, `rename`, and non-dry-run `apply` regenerate the whole file (a failed regeneration makes the command exit nonzero with a hint to run `wo multitenancy apply`), so `wo multitenancy apply` retrofits existing fleets. Because the shared define is guarded, a tenant may define `DISABLE_WP_CRON` as `false` in its own `wp-config.php` before the shared require, but that only re-enables loopback cron in addition to the managed entry — there is no per-site opt-out of `/etc/cron.d/wo-multitenancy`. The PHP stack defaults explicitly set `opcache.enable=1` and `opcache.interned_strings_buffer=64`.
+
 ## Quick start
 
 1. Configure shared infrastructure and download sources in `/etc/wo/plugins.d/multitenancy.conf`.
