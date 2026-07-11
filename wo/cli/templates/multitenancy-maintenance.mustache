@@ -2,6 +2,14 @@
 # Generated {{generated_at}}
 # Dropped into /var/www/{{domain}}/conf/nginx/ ; loaded by the main vhost.
 set $wo_mt_maintenance 1;
+{{#loopback_bypass}}
+if ($realip_remote_addr = 127.0.0.1) {
+    set $wo_mt_maintenance 0;
+}
+if ($realip_remote_addr = "::1") {
+    set $wo_mt_maintenance 0;
+}
+{{/loopback_bypass}}
 
 if ($wo_mt_maintenance = 1) {
     return 503;

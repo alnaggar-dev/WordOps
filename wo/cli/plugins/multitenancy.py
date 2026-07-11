@@ -585,6 +585,15 @@ class WOMultitenancyController(CementBaseController):
         core_db_bump = False
         db_backup_dir = None
         db_upgrade_failures = []
+        gated_domains = []
+        preexisting_gated_domains = []
+        cron_locks = {}
+        maintenance_message = None
+        loopback_bypass_may_be_active = False
+
+
+
+
 
 
         try:
@@ -607,9 +616,197 @@ class WOMultitenancyController(CementBaseController):
                 )
             core_db_bump = schema_transition == 'upgrade'
             if core_db_bump:
+                unsafe_domains = [
+                    site.get('domain') for site in shared_sites
+                    if not MTFunctions.valid_tenant_domain(
+                        site.get('domain')
+                    )
+                ]
+                if unsafe_domains:
+                    raise _UpdateAbort(
+                        "Unsafe tracked tenant domain; update aborted before "
+                        f"path construction: {unsafe_domains!r}"
+                    )
+
+
+            if not core_db_bump:
+                # Preserve the committed fast path for equal-schema updates.
+                Log.info(self, "Updating plugins and themes...")
+                assets_ok, asset_backups = (
+                    infra.update_plugins_and_themes(config)
+                )
+                if not assets_ok:
+                    Log.error(
+                        self,
+                        "Plugin/theme update failed; shared assets were restored"
+                    )
+                    return
+
+                if shared_sites and not pargs.force:
+                    canary = shared_sites[0]
+                    Log.info(
+                        self,
+                        f"Testing with canary site: {canary['domain']}"
+                    )
+                    if not MTFunctions.test_site(self, canary['domain']):
+                        infra.restore_asset_backups(asset_backups)
+                        Log.warn(
+                            self,
+                            "Canary test failed; shared assets restored. "
+                            "Use --force to proceed anyway."
+                        )
+                        return
+
+            # Backup current state
+            Log.info(self, "Backing up current release...")
+            release_manager.backup_current()
+            if core_db_bump:
+                old_nginx_worker_pids, nginx_worker_error = (
+                    MTFunctions.capture_nginx_worker_pids()
+                )
+                if nginx_worker_error:
+                    raise _UpdateAbort(
+                        "Could not capture pre-gate nginx workers: "
+                        f"{nginx_worker_error}"
+                    )
+                maintenance_message = (
+                    "WordPress database maintenance is in progress. "
+                    "Please try again shortly."
+                )
+                Log.info(self, "Enabling per-site update maintenance gates...")
+                for site in shared_sites:
+                    domain = site['domain']
+                    if _maintenance_gate_exists(domain):
+                        preexisting_gated_domains.append(domain)
+                        Log.warn(
+                            self,
+                            f"Preserving pre-existing maintenance gate for "
+                            f"{domain}"
+                        )
+                        continue
+                    gated_domains.append(domain)
+                    if not _maintenance_enable(
+                            self, domain, maintenance_message, config,
+                            loopback_bypass=False):
+                        raise _UpdateAbort(
+                            f"Could not enable maintenance gate for {domain}"
+                        )
+                if not MTFunctions.safe_nginx_reload(
+                        self, shared_sites[-1]['domain']):
+                    raise _UpdateAbort(
+                        "Could not reload nginx with tenant maintenance gates"
+                    )
+                cron_locks, cron_lock_failures = (
+                    MTFunctions.acquire_tenant_cron_locks(
+                        self, shared_sites, timeout=30
+                    )
+                )
+                if cron_lock_failures:
+                    raise _UpdateAbort(
+                        "Could not drain tenant WP-Cron before release flip: "
+                        f"{cron_lock_failures}"
+                    )
+                if not MTFunctions.sync_wp_cron_entries(self):
+                    raise _UpdateAbort(
+                        "Could not install maintenance-aware WP-Cron entries"
+                    )
+                drained, drain_blockers = MTFunctions.drain_tenant_active_work(
+                    self,
+                    shared_sites,
+                    cron_locks,
+                    old_nginx_worker_pids,
+                    timeout=330,
+                    sleeper_horizon=60,
+                    poll_interval=2,
+                )
+                if not drained:
+                    raise _UpdateAbort(
+                        "Could not drain active tenant work before promotion: "
+                        + ', '.join(drain_blockers)
+                    )
+                Log.info(self, "Updating plugins and themes...")
+                assets_ok, asset_backups = (
+                    infra.update_plugins_and_themes(config)
+                )
+                if not assets_ok:
+                    raise _UpdateAbort(
+                        "Plugin/theme update failed inside maintenance window"
+                    )
+
+                if shared_sites and not pargs.force:
+                    if not gated_domains:
+                        raise _UpdateAbort(
+                            "No update-owned gate is available for the "
+                            "loopback canary"
+                        )
+                    canary_domain = gated_domains[0]
+                    canary = next(
+                        site for site in shared_sites
+                        if site['domain'] == canary_domain
+                    )
+                    for domain in gated_domains:
+                        loopback_bypass_may_be_active = True
+                        if not _maintenance_enable(
+                                self, domain, maintenance_message, config,
+                                loopback_bypass=True):
+                            raise _UpdateAbort(
+                                "Could not enable loopback bypass for "
+                                f"{domain}"
+                            )
+                    if not MTFunctions.safe_nginx_reload(
+                            self, gated_domains[-1]):
+                        raise _UpdateAbort(
+                            "Could not reload nginx with loopback bypass"
+                        )
+
+                    Log.info(
+                        self,
+                        f"Testing gated canary locally: {canary_domain}"
+                    )
+                    canary_ok = MTFunctions.test_site_locally(self, canary)
+                    canary_nginx_pids, nginx_worker_error = (
+                        MTFunctions.capture_nginx_worker_pids()
+                    )
+                    if nginx_worker_error:
+                        raise _UpdateAbort(
+                            "Could not capture canary nginx workers: "
+                            f"{nginx_worker_error}"
+                        )
+                    close_failures = _close_update_loopback_bypass(
+                        self,
+                        gated_domains,
+                        maintenance_message,
+                        config,
+                    )
+                    if close_failures:
+                        raise _UpdateAbort(
+                            "Could not close loopback bypass: "
+                            + '; '.join(close_failures)
+                        )
+                    loopback_bypass_may_be_active = False
+                    if not canary_ok:
+                        raise _UpdateAbort(
+                            "Gated local canary failed; update aborted"
+                        )
+                    drained, drain_blockers = (
+                        MTFunctions.drain_tenant_active_work(
+                            self,
+                            shared_sites,
+                            cron_locks,
+                            canary_nginx_pids,
+                            timeout=330,
+                            sleeper_horizon=0,
+                            poll_interval=2,
+                        )
+                    )
+                    if not drained:
+                        raise _UpdateAbort(
+                            "Could not drain loopback canary work before "
+                            "tenant dumps: " + ', '.join(drain_blockers)
+                        )
                 Log.info(
                     self,
-                    "WordPress database schema change detected; backing up "
+                    "Tenant traffic and WP-Cron are quiesced; backing up "
                     "tenant databases..."
                 )
                 backups_ok, backup_failures, db_backup_dir = (
@@ -629,29 +826,11 @@ class WOMultitenancyController(CementBaseController):
                             exit=False,
                         )
                     raise _UpdateAbort(
-                        "Tenant database backup incomplete; update aborted"
+                        "Quiesced tenant database backup incomplete; "
+                        "update aborted"
                     )
 
 
-            # Update plugins and themes (staged; auto-restores on failure)
-            Log.info(self, "Updating plugins and themes...")
-            assets_ok, asset_backups = infra.update_plugins_and_themes(config)
-            if not assets_ok:
-                Log.error(self, "Plugin/theme update failed; shared assets were restored")
-                return
-
-            # Test with canary site if available
-            if shared_sites and not pargs.force:
-                canary = shared_sites[0]
-                Log.info(self, f"Testing with canary site: {canary['domain']}")
-                if not MTFunctions.test_site(self, canary['domain']):
-                    infra.restore_asset_backups(asset_backups)
-                    Log.warn(self, "Canary test failed; shared assets restored. Use --force to proceed anyway.")
-                    return
-
-            # Backup current state
-            Log.info(self, "Backing up current release...")
-            release_manager.backup_current()
 
             # Switch to new release
             Log.info(self, "Switching to new release...")
@@ -664,21 +843,90 @@ class WOMultitenancyController(CementBaseController):
             # Update database
             MTDatabase.update_release(self, new_release)
             if core_db_bump:
-                db_upgrade_failures = MTFunctions.run_core_db_upgrades(
-                    self, shared_sites
+                pending_ungate_domains = []
+                sites_by_domain = {
+                    site['domain']: site for site in shared_sites
+                }
+                for site in shared_sites:
+                    domain = site['domain']
+                    if domain in preexisting_gated_domains:
+                        failures = MTFunctions.run_core_db_upgrades(
+                            self, [site]
+                        )
+                        if failures:
+                            db_upgrade_failures.extend(failures)
+                        MTFunctions.release_tenant_cron_locks({
+                            domain: cron_locks.pop(domain)
+                        })
+                        continue
+                    failures = MTFunctions.run_core_db_upgrades(self, [site])
+                    if failures:
+                        db_upgrade_failures.extend(failures)
+                        MTFunctions.release_tenant_cron_locks({
+                            domain: cron_locks.pop(domain)
+                        })
+                        continue
+
+                    if _maintenance_disable(self, domain):
+                        pending_ungate_domains.append(domain)
+                        MTFunctions.release_tenant_cron_locks({
+                            domain: cron_locks.pop(domain)
+                        })
+                        continue
+
+                    # Keep the gate durable when its removal fails.
+                    _maintenance_enable(
+                        self, domain, maintenance_message, config
+                    )
+                    db_upgrade_failures.append({
+                        'domain': domain,
+                        'path': MTFunctions._site_htdocs(site),
+                        'error': 'database upgraded but maintenance ungate failed',
+                        'gate_failure': True,
+                    })
+                    MTFunctions.release_tenant_cron_locks({
+                        domain: cron_locks.pop(domain)
+                    })
+
+                # Apply every successful site's ungate in one nginx reload.
+                reload_target = shared_sites[-1]['domain']
+                ungate_reload_ok = MTFunctions.safe_nginx_reload(
+                    self, reload_target
                 )
+                if ungate_reload_ok:
+                    for domain in pending_ungate_domains:
+                        gated_domains.remove(domain)
+                else:
+                    # Running nginx is still gated. Restore the include files
+                    # so a future reload cannot accidentally open these sites.
+                    for domain in pending_ungate_domains:
+                        _maintenance_enable(
+                            self, domain, maintenance_message, config
+                        )
+                        site = sites_by_domain[domain]
+                        db_upgrade_failures.append({
+                            'domain': domain,
+                            'path': MTFunctions._site_htdocs(site),
+                            'error': (
+                                'database upgraded but batch maintenance '
+                                'ungate reload failed'
+                            ),
+                            'gate_failure': True,
+                        })
+
                 for failure in db_upgrade_failures:
                     Log.error(
                         self,
-                        f"DB upgrade failed for {failure['domain']}: "
+                        f"Tenant update failed for {failure['domain']}: "
                         f"{failure['error']}",
                         exit=False,
                     )
-                    Log.warn(
-                        self,
-                        "Run manually: wp core update-db "
-                        f"--path={failure['path']} --allow-root"
-                    )
+                    if not failure.get('gate_failure'):
+                        Log.warn(
+                            self,
+                            "Run manually: wp core update-db "
+                            f"--path={failure['path']} --allow-root"
+                        )
                 result = 'partial' if db_upgrade_failures else 'success'
                 Log.info(
                     self,
@@ -688,11 +936,19 @@ class WOMultitenancyController(CementBaseController):
                 )
 
 
+
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
             release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
             infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
+
+            for domain in preexisting_gated_domains:
+                Log.warn(
+                    self,
+                    f"Pre-existing maintenance gate remains active for "
+                    f"{domain}"
+                )
 
             if not db_upgrade_failures:
                 Log.info(self, "✅ Update completed successfully!")
@@ -705,15 +961,142 @@ class WOMultitenancyController(CementBaseController):
                 )
 
         except _UpdateAbort as e:
-            Log.error(self, str(e))
+            cleanup_failures = []
+            bypass_closed = True
+            if loopback_bypass_may_be_active and gated_domains:
+                bypass_failures = _close_update_loopback_bypass(
+                    self,
+                    gated_domains,
+                    maintenance_message,
+                    config,
+                )
+                cleanup_failures.extend(bypass_failures)
+                bypass_closed = not bypass_failures
+                if bypass_closed:
+                    loopback_bypass_may_be_active = False
+                else:
+                    cleanup_failures.append(
+                        "loopback bypass may still be active; keep maintenance "
+                        "gates in place. For each affected site run "
+                        "`wo multitenancy maintenance --enable --site=<domain>`, "
+                        "verify nginx reload, restore shared assets from "
+                        "shared_root/backups/assets, then disable maintenance"
+                    )
+            if cron_locks:
+                MTFunctions.release_tenant_cron_locks(cron_locks)
+            assets_restored = bypass_closed
+            if bypass_closed and asset_backups and not core_switched:
+                try:
+                    assets_restored = infra.restore_asset_backups(
+                        asset_backups
+                    )
+                except Exception:
+                    assets_restored = False
+            if (gated_domains and not core_switched
+                    and bypass_closed and assets_restored):
+                cleanup_failures.extend(
+                    _release_update_maintenance(self, gated_domains)
+                )
+                gated_domains = []
+            elif (gated_domains and not core_switched
+                  and bypass_closed and not assets_restored):
+                cleanup_failures.append(
+                    "asset restore failed; maintenance gates retained"
+                )
+            message = str(e)
+            if cleanup_failures:
+                message += (
+                    "; maintenance cleanup incomplete: "
+                    + "; ".join(cleanup_failures)
+                )
+            Log.error(self, message)
             return
 
         except Exception as e:
-            if asset_backups and not core_switched:
-                infra.restore_asset_backups(asset_backups)
-            Log.info(self, f"update_failed target=baseline result=failure")
-            Log.error(self, f"Update failed: {str(e)}")
-            Log.info(self, "Run 'wo multitenancy rollback' to revert")
+            if not core_db_bump:
+                if asset_backups and not core_switched:
+                    infra.restore_asset_backups(asset_backups)
+                Log.info(self, "update_failed target=baseline result=failure")
+                Log.error(self, f"Update failed: {str(e)}")
+                Log.info(self, "Run 'wo multitenancy rollback' to revert")
+                return
+
+            if cron_locks:
+                MTFunctions.release_tenant_cron_locks(cron_locks)
+            if not core_switched:
+                cleanup_failures = []
+                bypass_closed = True
+                if loopback_bypass_may_be_active and gated_domains:
+                    bypass_failures = _close_update_loopback_bypass(
+                        self,
+                        gated_domains,
+                        maintenance_message,
+                        config,
+                    )
+                    cleanup_failures.extend(bypass_failures)
+                    bypass_closed = not bypass_failures
+                    if bypass_closed:
+                        loopback_bypass_may_be_active = False
+                    else:
+                        cleanup_failures.append(
+                            "loopback bypass may still be active; keep "
+                            "maintenance gates in place. For each affected "
+                            "site run `wo multitenancy maintenance --enable "
+                            "--site=<domain>`, verify nginx reload, restore "
+                            "shared assets from shared_root/backups/assets, "
+                            "then disable maintenance"
+                        )
+                assets_restored = bypass_closed
+                if bypass_closed and asset_backups:
+                    try:
+                        assets_restored = infra.restore_asset_backups(
+                            asset_backups
+                        )
+                    except Exception:
+                        assets_restored = False
+                if gated_domains and bypass_closed and assets_restored:
+                    cleanup_failures.extend(
+                        _release_update_maintenance(self, gated_domains)
+                    )
+                    gated_domains = []
+                elif gated_domains and bypass_closed and not assets_restored:
+                    cleanup_failures.append(
+                        "asset restore failed; maintenance gates retained"
+                    )
+                message = f"Update failed: {str(e)}"
+                if cleanup_failures:
+                    message += (
+                        "; maintenance cleanup incomplete: "
+                        + "; ".join(cleanup_failures)
+                    )
+                Log.info(self, "update_failed target=baseline result=failure")
+                Log.error(self, message)
+                Log.info(self, "Run 'wo multitenancy rollback' to revert")
+                return
+
+            Log.info(
+                self,
+                "update_completed target=baseline result=partial "
+                "post_flip_exception=1"
+            )
+            for domain in gated_domains:
+                Log.warn(
+                    self,
+                    "Site remains maintenance-gated: "
+                    f"{domain}. Manual ungate: wo multitenancy maintenance "
+                    f"--disable --site={domain}"
+                )
+            for domain in preexisting_gated_domains:
+                Log.warn(
+                    self,
+                    f"Pre-existing maintenance gate remains active for "
+                    f"{domain}"
+                )
+            Log.error(
+                self,
+                f"Post-flip update failed: {e}; new core remains active"
+            )
+            return
 
         if db_upgrade_failures:
             failed_domains = ','.join(
@@ -724,6 +1107,13 @@ class WOMultitenancyController(CementBaseController):
                 "update_completed target=baseline result=partial "
                 f"failed_db_upgrades={len(db_upgrade_failures)}"
             )
+            for domain in gated_domains:
+                Log.warn(
+                    self,
+                    "Site remains maintenance-gated: "
+                    f"{domain}. Manual ungate: wo multitenancy maintenance "
+                    f"--disable --site={domain}"
+                )
             Log.error(
                 self,
                 "WordPress core is active but DB upgrades failed for "
@@ -2443,7 +2833,13 @@ def _maintenance_paths(domain):
     }
 
 
-def _maintenance_enable(controller, domain, message, config):
+def _maintenance_gate_exists(domain):
+    """Return whether an operator gate already owns this tenant."""
+    return os.path.exists(_maintenance_paths(domain)['nginx_include_file'])
+
+
+def _maintenance_enable(
+        controller, domain, message, config, loopback_bypass=False):
     paths = _maintenance_paths(domain)
     retry_after = 600
     try:
@@ -2470,6 +2866,7 @@ def _maintenance_enable(controller, domain, message, config):
         'generated_at': datetime.utcnow().isoformat() + 'Z',
         'retry_after_seconds': retry_after,
         'site_htdocs': paths['site_htdocs'],
+        'loopback_bypass': loopback_bypass,
     }
     try:
         with open(paths['nginx_include_file'], 'w') as fh:
@@ -2491,6 +2888,33 @@ def _maintenance_disable(controller, domain):
                 Log.warn(controller, f"could not remove {path}: {exc}")
                 ok = False
     return ok
+
+
+def _close_update_loopback_bypass(
+        controller, domains, message, config):
+    """Render update-owned gates closed and reload nginx once."""
+    failures = []
+    for domain in domains:
+        if not _maintenance_enable(
+                controller, domain, message, config,
+                loopback_bypass=False):
+            failures.append(f"could not close loopback bypass for {domain}")
+    if domains and not MTFunctions.safe_nginx_reload(
+            controller, domains[-1]):
+        failures.append("could not reload nginx after closing loopback bypass")
+    return failures
+
+
+def _release_update_maintenance(controller, domains):
+    """Clean pre-flip update gates and return any incomplete cleanup."""
+    failures = []
+    for domain in domains:
+        if not _maintenance_disable(controller, domain):
+            failures.append(f"could not remove maintenance gate for {domain}")
+    if domains and not MTFunctions.safe_nginx_reload(
+            controller, domains[-1]):
+        failures.append("could not reload nginx after gate cleanup")
+    return failures
 
 
 def _humanize_seconds(seconds):

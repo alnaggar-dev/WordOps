@@ -3920,8 +3920,36 @@ $wp_version = '6.9.1';
             ['exit.example', 'raise.example'],
         )
         self.assertEqual(failures[1]['error'], 'wp unavailable')
+
+    def test_core_db_upgrade_timeout_is_failed_and_next_site_continues(self):
+        sites = [
+            {'domain': 'hung.example', 'site_path': '/srv/hung'},
+            {'domain': 'ok.example', 'site_path': '/srv/ok'},
+        ]
+        results = [
+            mtf.subprocess.TimeoutExpired(cmd='wp', timeout=300),
+            mock.Mock(returncode=0, stdout='', stderr=''),
+        ]
+        with mock.patch.object(
+                mtf.subprocess, 'run', side_effect=results) as run:
+            failures = MTFunctions.run_core_db_upgrades(mock.Mock(), sites)
+
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertEqual(run.call_args_list[0].kwargs['timeout'], 300)
+        self.assertEqual([item['domain'] for item in failures], ['hung.example'])
+        self.assertEqual(
+            failures[0]['error'],
+            'wp core update-db timed out after 300 seconds',
+        )
+
     def _run_update(self, force, backups, upgrades=None,
-                    transition='upgrade'):
+                    transition='upgrade', switch_error=None, sites=None,
+                    asset_records=None, reload_results=None,
+                    preexisting_domains=None, ungate_results=None,
+                    record_error=None, cron_failures=None,
+                    asset_restore_ok=True, local_canary_ok=True,
+                    drain_result=None, drain_results=None,
+                    gate_results=None, capture_results=None):
         if mt is None:
             self.skipTest(
                 f'multitenancy controller import unavailable: {_mt_import_error}'
@@ -3931,19 +3959,49 @@ $wp_version = '6.9.1';
         )
         ctrl.app = mock.Mock()
         ctrl.app.pargs = mock.Mock(force=force)
+        if sites is None:
+            sites = [{
+                'domain': 'site.example',
+                'site_path': '/srv/site',
+            }]
         infra = mock.Mock()
         infra.download_wordpress_core.return_value = 'wp-staged'
-        infra.update_plugins_and_themes.return_value = (True, [])
         order = []
+        infra.update_plugins_and_themes.side_effect = lambda config: (
+            order.append('assets') or (True, asset_records or [])
+        )
+        infra.restore_asset_backups.side_effect = lambda records: (
+            order.append('asset-restore') or asset_restore_ok
+        )
+        reload_results = iter(reload_results or [])
+        ungate_results = iter(ungate_results or [])
+        preexisting_domains = set(preexisting_domains or [])
+        drain_results = iter(drain_results or [])
+        gate_results = iter(gate_results or [])
+        capture_results = iter(capture_results or [])
+
+
+        def switch_release(release):
+            order.append('flip')
+            if switch_error:
+                raise switch_error
+        def update_record(app, release):
+            order.append('record')
+            if record_error:
+                raise record_error
+
+
+        infra.switch_release.side_effect = switch_release
+
 
         with contextlib.ExitStack() as stack:
             info = stack.enter_context(
                 mock.patch('wo.core.logging.Log.info')
             )
-            for method in ('warn', 'debug'):
-                stack.enter_context(
-                    mock.patch(f'wo.core.logging.Log.{method}')
-                )
+            warn = stack.enter_context(
+                mock.patch('wo.core.logging.Log.warn')
+            )
+            stack.enter_context(mock.patch('wo.core.logging.Log.debug'))
             error = stack.enter_context(mock.patch(
                 'wo.core.logging.Log.error',
                 side_effect=lambda controller, message, exit=True: (
@@ -3959,12 +4017,7 @@ $wp_version = '6.9.1';
                 mock.patch.object(
                     mt.MTDatabase,
                     'get_shared_sites',
-                    return_value=[
-                        {
-                            'domain': 'site.example',
-                            'site_path': '/srv/site',
-                        }
-                    ],
+                    return_value=sites,
                 )
             )
             stack.enter_context(
@@ -3988,22 +4041,125 @@ $wp_version = '6.9.1';
                     return_value=transition,
                 )
             )
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'test_site',
+                side_effect=lambda app, domain: (
+                    order.append(f'canary:{domain}') or True
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'test_site_locally',
+                side_effect=lambda app, site: (
+                    order.append(f"canary-local:{site['domain']}")
+                    or local_canary_ok
+                ),
+            ))
             backup = stack.enter_context(
                 mock.patch.object(
                     mt.MTFunctions,
                     'backup_tenant_databases',
-                    return_value=backups,
+                    side_effect=lambda app, sites, root: (
+                        order.append('dumps') or backups
+                    ),
                 )
             )
             upgrade = stack.enter_context(
                 mock.patch.object(
                     mt.MTFunctions,
                     'run_core_db_upgrades',
-                    side_effect=lambda app, sites: (
-                        order.append('upgrade') or (upgrades or [])
+                    side_effect=lambda app, target_sites: (
+                        order.append('upgrade')
+                        or (
+                            upgrades(target_sites[0])
+                            if callable(upgrades) else (upgrades or [])
+                        )
                     ),
                 )
             )
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'capture_nginx_worker_pids',
+                side_effect=lambda: (
+                    order.append('nginx-capture')
+                    or next(capture_results, ({101}, None))
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                mt,
+                '_maintenance_gate_exists',
+                side_effect=lambda domain: domain in preexisting_domains,
+            ))
+            gate = stack.enter_context(mock.patch.object(
+                mt,
+                '_maintenance_enable',
+                side_effect=lambda app, domain, message, config, **kwargs: (
+                    order.append(f'gate:{domain}')
+                    or next(gate_results, True)
+                ),
+            ))
+            ungate = stack.enter_context(mock.patch.object(
+                mt,
+                '_maintenance_disable',
+                side_effect=lambda app, domain: (
+                    order.append(f'ungate:{domain}')
+                    or next(ungate_results, True)
+                ),
+            ))
+            def acquire_locks(app, target_sites, timeout):
+                if cron_failures:
+                    return {}, list(cron_failures)
+                locks = {}
+                for site in target_sites:
+                    domain = site['domain']
+                    order.append(f'lock:{domain}')
+                    locks[domain] = object()
+                return locks, []
+
+            def release_locks(locks):
+                for domain in list(locks):
+                    order.append(f'unlock:{domain}')
+                locks.clear()
+
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'acquire_tenant_cron_locks',
+                side_effect=acquire_locks,
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'release_tenant_cron_locks',
+                side_effect=release_locks,
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'sync_wp_cron_entries',
+                side_effect=lambda app: (
+                    order.append('cron-sync') or True
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'drain_tenant_active_work',
+                side_effect=lambda app, sites, locks, old_pids, **kwargs: (
+                    order.append(
+                        f"drain:{kwargs['timeout']}:"
+                        f"{kwargs['sleeper_horizon']}"
+                    )
+                    or next(
+                        drain_results,
+                        drain_result if drain_result is not None else (True, [])
+                    )
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions,
+                'safe_nginx_reload',
+                side_effect=lambda app, domain: (
+                    order.append('reload') or next(reload_results, True)
+                ),
+            ))
             stack.enter_context(
                 mock.patch.object(mt.MTFunctions, 'clear_all_caches')
             )
@@ -4011,7 +4167,7 @@ $wp_version = '6.9.1';
                 mock.patch.object(
                     mt.MTDatabase,
                     'update_release',
-                    side_effect=lambda app, release: order.append('record'),
+                    side_effect=update_record,
                 )
             )
             stack.enter_context(
@@ -4024,45 +4180,66 @@ $wp_version = '6.9.1';
             )
             ctrl.update()
 
-        return infra, order, backup, upgrade, info, error, ctrl
+        return (
+            infra, order, backup, upgrade, info, warn, error, ctrl, gate, ungate
+        )
 
     def test_update_aborts_on_backup_failure_even_with_force(self):
-        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
             True,
             (
                 False,
                 [{'domain': 'site.example', 'error': 'export failed'}],
                 '/backups/db/stamp',
             ),
+            asset_records=asset_records,
         )
-        infra.update_plugins_and_themes.assert_not_called()
+        infra.update_plugins_and_themes.assert_called_once()
+        infra.restore_asset_backups.assert_called_once_with(asset_records)
         infra.switch_release.assert_not_called()
-        self.assertEqual(order, [])
+        self.assertEqual(order, [
+            'nginx-capture',
+            'gate:site.example', 'reload', 'lock:site.example',
+            'cron-sync', 'drain:330:60', 'assets', 'dumps',
+            'unlock:site.example', 'asset-restore',
+            'ungate:site.example', 'reload',
+        ])
 
     def test_update_runs_db_upgrade_only_after_release_record(self):
-        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
             True, (True, [], '/backups/db/stamp')
         )
         infra.switch_release.assert_called_once_with('wp-staged')
-        self.assertEqual(order, ['record', 'upgrade'])
+        self.assertEqual(order, [
+            'nginx-capture',
+            'gate:site.example', 'reload', 'lock:site.example',
+            'cron-sync', 'drain:330:60', 'assets', 'dumps',
+            'flip', 'record', 'upgrade', 'ungate:site.example',
+            'unlock:site.example', 'reload',
+        ])
 
     def test_same_schema_keeps_fast_path_without_db_commands(self):
-        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
             True, (True, [], None), transition='equal'
         )
         infra.update_plugins_and_themes.assert_called_once()
         infra.switch_release.assert_called_once_with('wp-staged')
         backup.assert_not_called()
         upgrade.assert_not_called()
-        self.assertEqual(order, ['record'])
+        gate.assert_not_called()
+        ungate.assert_not_called()
+        self.assertEqual(order, ['assets', 'flip', 'record'])
 
     def test_downgrade_and_unknown_abort_before_assets_with_nonzero_status(self):
         for transition in ('downgrade', 'unknown'):
             with self.subTest(transition=transition):
-                infra, order, backup, upgrade, info, error, ctrl = (
-                    self._run_update(
-                        True, (True, [], None), transition=transition
-                    )
+                (infra, order, backup, upgrade, info, warn, error,
+                 ctrl, gate, ungate) = self._run_update(
+                    True, (True, [], None), transition=transition
                 )
                 infra.update_plugins_and_themes.assert_not_called()
                 infra.switch_release.assert_not_called()
@@ -4075,7 +4252,8 @@ $wp_version = '6.9.1';
             'path': '/srv/site/htdocs',
             'error': 'upgrade failed',
         }
-        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
             True,
             (True, [], '/backups/db/stamp'),
             upgrades=[failure],
@@ -4090,6 +4268,734 @@ $wp_version = '6.9.1';
             'backup_dir=/backups/db/stamp',
             error.call_args_list[-1].args[1],
         )
+        self.assertIn('gate:site.example', order)
+        self.assertNotIn('ungate:site.example', order)
+        warning_messages = [call.args[1] for call in warn.call_args_list]
+        self.assertTrue(any(
+            'wo multitenancy maintenance --disable --site=site.example' in msg
+            for msg in warning_messages
+        ))
+
+    def test_pre_flip_exception_ungates_every_activated_site(self):
+        sites = [
+            {'domain': 'one.example', 'site_path': '/srv/one'},
+            {'domain': 'two.example', 'site_path': '/srv/two'},
+        ]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            switch_error=RuntimeError('flip failed'),
+            sites=sites,
+        )
+
+        self.assertEqual(order, [
+            'nginx-capture',
+            'gate:one.example', 'gate:two.example', 'reload',
+            'lock:one.example', 'lock:two.example',
+            'cron-sync', 'drain:330:60', 'assets', 'dumps', 'flip',
+            'unlock:one.example', 'unlock:two.example',
+            'ungate:one.example', 'ungate:two.example', 'reload',
+        ])
+        ctrl.app.close.assert_called_once_with(1)
+
+    def test_gated_local_canary_and_batch_ungate_order(self):
+        sites = [
+            {'domain': 'one.example', 'site_path': '/srv/one'},
+            {'domain': 'two.example', 'site_path': '/srv/two'},
+        ]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            False,
+            (True, [], '/backups/db/stamp'),
+            sites=sites,
+        )
+
+        self.assertEqual(order, [
+            'nginx-capture',
+            'gate:one.example',
+            'gate:two.example',
+            'reload',
+            'lock:one.example',
+            'lock:two.example',
+            'cron-sync',
+            'drain:330:60',
+            'assets',
+            'gate:one.example',
+            'gate:two.example',
+            'reload',
+            'canary-local:one.example',
+            'nginx-capture',
+            'gate:one.example',
+            'gate:two.example',
+            'reload',
+            'drain:330:0',
+            'dumps',
+            'flip',
+            'record',
+            'upgrade',
+            'ungate:one.example',
+            'unlock:one.example',
+            'upgrade',
+            'ungate:two.example',
+            'unlock:two.example',
+            'reload',
+        ])
+        self.assertEqual(order.count('reload'), 4)
+        bypass_values = [
+            call.kwargs.get('loopback_bypass')
+            for call in gate.call_args_list
+        ]
+        self.assertEqual(
+            bypass_values,
+            [False, False, True, True, False, False],
+        )
+
+    def test_gate_reload_abort_restores_assets_without_core_switch(self):
+        asset_records = [{
+            'kind': 'plugin',
+            'slug': 'x',
+            'target': '/tmp/x',
+            'backup': '/tmp/b',
+        }]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            # Activation reload fails; pre-flip cleanup reload succeeds.
+            reload_results=[False, True],
+        )
+
+        infra.restore_asset_backups.assert_not_called()
+        infra.switch_release.assert_not_called()
+        self.assertEqual(order, [
+            'nginx-capture',
+            'gate:site.example', 'reload',
+            'ungate:site.example', 'reload',
+        ])
+
+    def test_restore_failure_keeps_gate_closed_and_reports_it(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (
+                False,
+                [{'domain': 'site.example', 'error': 'export failed'}],
+                '/backups/db/stamp',
+            ),
+            asset_records=asset_records,
+            asset_restore_ok=False,
+        )
+        self.assertIn('asset-restore', order)
+        self.assertNotIn('ungate:site.example', order)
+        self.assertEqual(order.count('reload'), 1)
+        self.assertIn(
+            'asset restore failed; maintenance gates retained',
+            error.call_args_list[-1].args[1],
+        )
+
+    def test_canary_failure_closes_bypass_then_restores_before_ungate(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            False,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            local_canary_ok=False,
+        )
+
+        self.assertFalse(gate.call_args_list[-1].kwargs['loopback_bypass'])
+        self.assertLess(
+            order.index('asset-restore'),
+            order.index('ungate:site.example'),
+        )
+        self.assertNotIn('dumps', order)
+        infra.switch_release.assert_not_called()
+        self.assertIn('unlock:site.example', order)
+
+    def test_second_drain_timeout_closes_bypass_and_unwinds_assets(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            False,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            drain_results=[
+                (True, []),
+                (False, ['old_nginx_workers=202']),
+            ],
+        )
+
+        self.assertFalse(gate.call_args_list[-1].kwargs['loopback_bypass'])
+        self.assertLess(
+            order.index('asset-restore'),
+            order.index('ungate:site.example'),
+        )
+        self.assertNotIn('dumps', order)
+        infra.switch_release.assert_not_called()
+        self.assertIn(
+            'old_nginx_workers=202',
+            error.call_args_list[-1].args[1],
+        )
+
+    def test_abort_close_render_failure_retains_gates_and_assets(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            False,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            capture_results=[
+                ({101}, None),
+                (set(), 'nginx_workers=unavailable'),
+            ],
+            gate_results=[True, True, False],
+        )
+
+        infra.restore_asset_backups.assert_not_called()
+        ungate.assert_not_called()
+        self.assertIn('unlock:site.example', order)
+        final_error = error.call_args_list[-1].args[1]
+        self.assertIn('could not close loopback bypass', final_error)
+        self.assertIn('loopback bypass may still be active', final_error)
+        self.assertIn('maintenance --enable --site=<domain>', final_error)
+
+    def test_abort_close_reload_failure_retains_gates_and_assets(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            False,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            capture_results=[
+                ({101}, None),
+                (set(), 'nginx_workers=unavailable'),
+            ],
+            reload_results=[True, True, False],
+        )
+
+        infra.restore_asset_backups.assert_not_called()
+        ungate.assert_not_called()
+        self.assertIn('unlock:site.example', order)
+        final_error = error.call_args_list[-1].args[1]
+        self.assertIn(
+            'could not reload nginx after closing loopback bypass',
+            final_error,
+        )
+        self.assertIn('loopback bypass may still be active', final_error)
+
+
+
+
+    def test_active_work_drain_timeout_aborts_before_asset_promotion(self):
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            drain_result=(False, [
+                'php_fpm_active=2', 'innodb_transactions=1',
+            ]),
+        )
+
+        infra.update_plugins_and_themes.assert_not_called()
+        infra.switch_release.assert_not_called()
+        self.assertNotIn('assets', order)
+        self.assertIn('ungate:site.example', order)
+        self.assertIn(
+            'php_fpm_active=2, innodb_transactions=1',
+            error.call_args_list[-1].args[1],
+        )
+
+    def test_active_work_drain_waits_for_old_generation_then_backstops(self):
+        locks = {'site.example': object()}
+        with mock.patch.object(
+                MTFunctions,
+                'live_nginx_worker_pids',
+                side_effect=[{101}, set(), set()]) as nginx_probe, \
+                mock.patch.object(
+                    MTFunctions,
+                    'probe_active_php_fpm_workers',
+                    side_effect=[(0, 1, None), (0, 0, None)]
+                ) as php_probe, \
+                mock.patch.object(
+                    MTFunctions,
+                    'probe_tenant_innodb_transactions',
+                    side_effect=[(1, None), (0, None)]) as db_probe, \
+                mock.patch.object(
+                    mtf._time, 'monotonic',
+                    side_effect=[0, 0, 1, 2]), \
+                mock.patch.object(mtf._time, 'sleep') as sleep:
+            drained, blockers = MTFunctions.drain_tenant_active_work(
+                mock.Mock(),
+                [{'domain': 'site.example'}],
+                locks,
+                {101},
+                timeout=10,
+                sleeper_horizon=0,
+                poll_interval=1,
+            )
+
+        self.assertTrue(drained)
+        self.assertEqual(blockers, [])
+        self.assertEqual(nginx_probe.call_count, 3)
+        self.assertEqual(php_probe.call_count, 2)
+        self.assertEqual(db_probe.call_count, 2)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_preexisting_gate_is_never_modified_or_removed(self):
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            preexisting_domains={'site.example'},
+        )
+
+        gate.assert_not_called()
+        ungate.assert_not_called()
+        self.assertIn('lock:site.example', order)
+        self.assertIn('unlock:site.example', order)
+        warning_messages = [call.args[1] for call in warn.call_args_list]
+        self.assertTrue(any(
+            'Pre-existing maintenance gate remains active for site.example'
+            in message for message in warning_messages
+        ))
+
+    def test_unsafe_domain_aborts_before_paths_or_backups(self):
+        site = {'domain': '../escape;rm', 'site_path': '/srv/unsafe'}
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            sites=[site],
+        )
+
+        backup.assert_not_called()
+        gate.assert_not_called()
+        ungate.assert_not_called()
+        infra.update_plugins_and_themes.assert_not_called()
+        ctrl.app.close.assert_called_once_with(1)
+
+    def test_equal_schema_post_flip_exception_keeps_legacy_failure_status(self):
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], None),
+            transition='equal',
+            record_error=RuntimeError('record failed'),
+        )
+
+        messages = [call.args[1] for call in info.call_args_list]
+        self.assertTrue(any(
+            'update_failed target=baseline result=failure' in message
+            for message in messages
+        ))
+        self.assertTrue(any(
+            "Run 'wo multitenancy rollback' to revert" in message
+            for message in messages
+        ))
+        self.assertFalse(any('result=partial' in message for message in messages))
+
+    def test_abort_surfaces_gate_cleanup_and_reload_failures(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            reload_results=[False, False],
+            ungate_results=[False],
+        )
+
+        final_error = error.call_args_list[-1].args[1]
+        self.assertIn('maintenance cleanup incomplete', final_error)
+        self.assertIn('could not remove maintenance gate', final_error)
+        self.assertIn('could not reload nginx after gate cleanup', final_error)
+        infra.restore_asset_backups.assert_not_called()
+
+    def test_post_loop_reload_failure_restores_gate_and_reports_partial(self):
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            reload_results=[True, False],
+        )
+
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(ungate.call_count, 1)
+        messages = [call.args[1] for call in info.call_args_list]
+        self.assertTrue(any('result=partial' in message for message in messages))
+        self.assertIn(
+            'batch maintenance ungate reload failed',
+            error.call_args_list[-2].args[1],
+        )
+
+    def test_mixed_db_result_only_ungates_successful_site(self):
+        sites = [
+            {'domain': 'ok.example', 'site_path': '/srv/ok'},
+            {'domain': 'bad.example', 'site_path': '/srv/bad'},
+        ]
+
+        def upgrades(site):
+            if site['domain'] == 'bad.example':
+                return [{
+                    'domain': 'bad.example',
+                    'path': '/srv/bad/htdocs',
+                    'error': 'upgrade failed',
+                }]
+            return []
+
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            upgrades=upgrades,
+            sites=sites,
+        )
+
+        self.assertIn('ungate:ok.example', order)
+        self.assertNotIn('ungate:bad.example', order)
+        self.assertLess(
+            order.index('unlock:ok.example'),
+            len(order) - 1,
+        )
+        self.assertIn('unlock:bad.example', order)
+
+    def test_cron_lock_drain_failure_aborts_and_cleans_preflip_state(self):
+        asset_records = [{'kind': 'plugin', 'slug': 'x'}]
+        (infra, order, backup, upgrade, info, warn, error, ctrl,
+         gate, ungate) = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            asset_records=asset_records,
+            cron_failures=['site.example'],
+        )
+
+        infra.switch_release.assert_not_called()
+        infra.restore_asset_backups.assert_not_called()
+        self.assertIn('ungate:site.example', order)
+
+    def test_cron_lock_helper_drains_and_holds_until_release(self):
+        domain = 'wordops-lock-test.example'
+        lock_path = f'/tmp/wo-cron-{domain}.lock'
+        locks = {}
+        retry = {}
+        try:
+            locks, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+            self.assertEqual(failures, [])
+            self.assertIn(domain, locks)
+
+            blocked, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+            self.assertEqual(blocked, {})
+            self.assertEqual(failures, [domain])
+
+            MTFunctions.release_tenant_cron_locks(locks)
+            retry, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+            self.assertEqual(failures, [])
+            self.assertIn(domain, retry)
+        finally:
+            MTFunctions.release_tenant_cron_locks(locks)
+            MTFunctions.release_tenant_cron_locks(retry)
+            try:
+                os.remove(lock_path)
+            except FileNotFoundError:
+                pass
+
+    def _guarded_cron_test_command(self, domain, splay, ran):
+        site_root = os.path.join(self.tmp, domain)
+        gate_dir = os.path.join(site_root, 'conf', 'nginx')
+        os.makedirs(gate_dir, exist_ok=True)
+        os.makedirs(os.path.join(site_root, 'htdocs'), exist_ok=True)
+        line = MTFunctions.build_tenant_cron_line(domain, splay=splay)
+        self.assertLess(line.index('sleep '), line.index('test -x'))
+        self.assertLess(line.index('test -x'), line.index('test ! -e'))
+        self.assertLess(line.index('test ! -e'), line.index('flock -n'))
+        command = line.split('www-data ', 1)[1]
+        command = command.replace(f'/var/www/{domain}', site_root)
+        command = command.replace(
+            f'/tmp/wo-cron-{domain}.lock',
+            os.path.join(self.tmp, 'cron.lock'),
+        )
+        wp_command = (
+            "/usr/local/bin/wp cron event run --due-now --quiet "
+            ">/dev/null 2>&1"
+        )
+        fake_flock = os.path.join(self.tmp, 'flock')
+        with open(fake_flock, 'w') as fh:
+            fh.write('#!/bin/sh\nshift 2\nexec "$@"\n')
+        os.chmod(fake_flock, 0o755)
+
+        command = command.replace('flock -n', f"'{fake_flock}' -n")
+        return command.replace(wp_command, f"touch '{ran}'"), gate_dir
+    def test_maintenance_bypass_uses_socket_source_not_rewritten_client(self):
+        with open('wo/cli/templates/multitenancy-maintenance.mustache') as fh:
+            template = fh.read()
+        self.assertIn('$realip_remote_addr = 127.0.0.1', template)
+        self.assertIn('$realip_remote_addr = "::1"', template)
+        self.assertNotIn('$remote_addr =', template)
+        import pystache
+        context = {
+            'domain': 'site.example',
+            'generated_at': 'now',
+            'retry_after_seconds': 600,
+            'site_htdocs': '/var/www/site.example/htdocs',
+        }
+        closed = pystache.render(
+            template, dict(context, loopback_bypass=False)
+        )
+        bypass = pystache.render(
+            template, dict(context, loopback_bypass=True)
+        )
+        self.assertNotIn('$realip_remote_addr', closed)
+        self.assertIn('$realip_remote_addr = 127.0.0.1', bypass)
+        self.assertIn('set $wo_mt_maintenance 0;', bypass)
+
+    def test_local_canary_curl_is_cacheproof_and_loopback_pinned(self):
+        result = mock.Mock(returncode=0, stdout='200\t', stderr='')
+        with mock.patch.object(
+                mtf.subprocess, 'run', return_value=result) as run:
+            first = MTFunctions.test_site_locally(mock.Mock(), {
+                'domain': 'shop.example',
+                'is_ssl': True,
+            })
+            second = MTFunctions.test_site_locally(mock.Mock(), {
+                'domain': 'shop.example',
+                'is_ssl': True,
+            })
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        commands = [call.args[0] for call in run.call_args_list]
+        urls = [command[-1] for command in commands]
+        prefix = 'https://shop.example/?wo_mt_canary='
+        tokens = [url[len(prefix):] for url in urls]
+        self.assertTrue(all(url.startswith(prefix) for url in urls))
+        self.assertTrue(all(
+            len(token) == 32
+            and all(char in '0123456789abcdef' for char in token)
+            for token in tokens
+        ))
+        self.assertNotEqual(tokens[0], tokens[1])
+        command = commands[0]
+        self.assertNotIn('--location', command)
+        self.assertEqual(command[command.index('--proto') + 1], '=http,https')
+        self.assertEqual(
+            command[command.index('--header') + 1],
+            'X-Requested-With: XMLHttpRequest',
+        )
+        for resolve in (
+                'shop.example:80:127.0.0.1',
+                'shop.example:443:127.0.0.1',
+                'www.shop.example:80:127.0.0.1',
+                'www.shop.example:443:127.0.0.1'):
+            self.assertIn(resolve, command)
+
+    def test_ungated_canary_manually_follows_allowed_redirect(self):
+        redirect = mock.Mock(
+            status_code=301,
+            headers={'Location': 'https://www.shop.example/landing'},
+        )
+        success = mock.Mock(status_code=200, headers={})
+        session = mock.Mock()
+        session.get.side_effect = [redirect, success]
+        with mock.patch('requests.Session', return_value=session):
+            ok = MTFunctions.test_site(mock.Mock(), 'shop.example')
+
+        self.assertTrue(ok)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(
+            session.get.call_args_list[1].args[0],
+            'https://www.shop.example/landing',
+        )
+        for call in session.get.call_args_list:
+            self.assertFalse(call.kwargs['allow_redirects'])
+            self.assertEqual(
+                call.kwargs['headers'],
+                {'X-Requested-With': 'XMLHttpRequest'},
+            )
+        initial_url = session.get.call_args_list[0].args[0]
+        prefix = 'http://shop.example/?wo_mt_canary='
+        self.assertTrue(initial_url.startswith(prefix))
+
+    def test_ungated_canary_rejects_terminal_non_2xx(self):
+        for status in (301, 404):
+            session = mock.Mock()
+            session.get.return_value = mock.Mock(
+                status_code=status,
+                headers={},
+            )
+            with mock.patch('requests.Session', return_value=session):
+                self.assertFalse(MTFunctions.test_site(
+                    mock.Mock(), 'shop.example'
+                ))
+
+    def test_ungated_canary_never_issues_unsafe_redirect(self):
+        for location in (
+                'https://unlisted.example/',
+                'http://shop.example:8080/',
+                'https://www.shop.example:8443/'):
+            session = mock.Mock()
+            session.get.return_value = mock.Mock(
+                status_code=302,
+                headers={'Location': location},
+            )
+            with mock.patch('requests.Session', return_value=session), \
+                    mock.patch.object(mtf.Log, 'warn') as warn:
+                self.assertFalse(MTFunctions.test_site(
+                    mock.Mock(), 'shop.example'
+                ))
+            self.assertEqual(session.get.call_count, 1)
+            self.assertIn(location, warn.call_args.args[1])
+
+    def test_local_canary_manually_follows_allowed_redirect(self):
+        results = [
+            mock.Mock(
+                returncode=0,
+                stdout='301\thttps://www.shop.example/landing',
+                stderr='',
+            ),
+            mock.Mock(returncode=0, stdout='200\t', stderr=''),
+        ]
+        with mock.patch.object(
+                mtf.subprocess, 'run', side_effect=results) as run:
+            ok = MTFunctions.test_site_locally(
+                mock.Mock(),
+                {'domain': 'shop.example', 'is_ssl': True},
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[1].args[0][-1],
+            'https://www.shop.example/landing',
+        )
+
+    def test_canary_redirect_limit_is_five(self):
+        redirect = mock.Mock(
+            status_code=302,
+            headers={'Location': '/again'},
+        )
+        session = mock.Mock()
+        session.get.return_value = redirect
+        with mock.patch('requests.Session', return_value=session):
+            self.assertFalse(MTFunctions.test_site(
+                mock.Mock(), 'shop.example'
+            ))
+        self.assertEqual(session.get.call_count, 6)
+
+        curl_redirect = mock.Mock(
+            returncode=0,
+            stdout='302\thttps://shop.example/again',
+            stderr='',
+        )
+        with mock.patch.object(
+                mtf.subprocess, 'run',
+                return_value=curl_redirect) as run:
+            self.assertFalse(MTFunctions.test_site_locally(
+                mock.Mock(),
+                {'domain': 'shop.example', 'is_ssl': True},
+            ))
+        self.assertEqual(run.call_count, 6)
+
+    def test_local_canary_rejects_terminal_or_unsafe_redirect(self):
+        for output in ('301\t', '404\t'):
+            result = mock.Mock(returncode=0, stdout=output, stderr='')
+            with mock.patch.object(
+                    mtf.subprocess, 'run', return_value=result):
+                self.assertFalse(MTFunctions.test_site_locally(
+                    mock.Mock(),
+                    {'domain': 'shop.example', 'is_ssl': True},
+                ))
+
+        for location in (
+                'https://unlisted.example/',
+                'http://shop.example:8080/',
+                'https://www.shop.example:8443/'):
+            result = mock.Mock(
+                returncode=0,
+                stdout=f'302\t{location}',
+                stderr='',
+            )
+            with mock.patch.object(
+                    mtf.subprocess, 'run',
+                    return_value=result) as run, \
+                    mock.patch.object(mtf.Log, 'warn') as warn:
+                self.assertFalse(MTFunctions.test_site_locally(
+                    mock.Mock(),
+                    {'domain': 'shop.example', 'is_ssl': True},
+                ))
+            self.assertEqual(run.call_count, 1)
+            self.assertIn(location, warn.call_args.args[1])
+
+    def test_fpm_probe_excludes_its_real_admin_uri_and_reports_queue(self):
+        payload = {
+            'listen queue': 2,
+            'processes': [
+                {
+                    'state': 'Running',
+                    'request uri': '/fpm/status/php84?json&full',
+                },
+                {
+                    'state': 'Running',
+                    'request uri': '/checkout/',
+                },
+                {'state': 'Idle', 'request uri': ''},
+            ],
+        }
+        result = mock.Mock(
+            returncode=0, stdout=json.dumps(payload), stderr=''
+        )
+        with mock.patch.object(
+                mtf.subprocess, 'run', return_value=result):
+            active, listen_queue, error = (
+                MTFunctions.probe_active_php_fpm_workers([
+                    {'php_version': '8.4'}
+                ])
+            )
+
+        self.assertEqual(active, 1)
+        self.assertEqual(listen_queue, 2)
+        self.assertIsNone(error)
+
+
+    def test_guarded_cron_healthy_path_reaches_flock_command(self):
+        domain = 'healthy.example'
+        ran = os.path.join(self.tmp, 'healthy-ran')
+        command, gate_dir = self._guarded_cron_test_command(
+            domain, 0, ran
+        )
+
+        result = mtf.subprocess.run(
+            ['/bin/sh', '-c', command], check=False
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(os.path.exists(ran))
+
+    def test_sleeping_cron_rechecks_marker_and_skips_after_gate_appears(self):
+        domain = 'race.example'
+        ran = os.path.join(self.tmp, 'race-ran')
+        command, gate_dir = self._guarded_cron_test_command(
+            domain, 0.2, ran
+        )
+        marker = os.path.join(
+            gate_dir, 'multitenancy-maintenance.conf'
+        )
+
+        process = mtf.subprocess.Popen(['/bin/sh', '-c', command])
+        mtf._time.sleep(0.05)
+        with open(marker, 'w') as fh:
+            fh.write('update gate')
+        process.wait(timeout=2)
+
+        self.assertFalse(os.path.exists(ran))
 
 
 if __name__ == '__main__':

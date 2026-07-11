@@ -15,6 +15,10 @@ import string
 import tarfile
 import configparser
 import glob
+import uuid
+from urllib.parse import urljoin, urlparse
+import fcntl
+
 from datetime import datetime
 from wo.core.logging import Log
 from wo.core.fileutils import WOFileUtils
@@ -1386,8 +1390,209 @@ server {{
                 Log.debug(app, "Reloaded nginx after cleanup")
         except Exception as e:
             Log.debug(app, f"Could not reload nginx after cleanup: {e}")
-
         Log.debug(app, f"Cleanup completed for {domain}")
+
+    @staticmethod
+    def build_tenant_cron_line(domain, splay=None):
+        """Build a guarded cron runner that checks maintenance after splay."""
+        if not MTFunctions.valid_tenant_domain(domain):
+            raise ValueError(f"Unsafe tenant domain: {domain!r}")
+        splay = (
+            zlib.crc32(domain.encode('utf-8')) % 60
+            if splay is None else splay
+        )
+        gate_dir = f"/var/www/{domain}/conf/nginx"
+        gate_file = f"{gate_dir}/multitenancy-maintenance.conf"
+        return (
+            f"* * * * * www-data sleep {splay} && "
+            f"test -x '{gate_dir}' && test ! -e '{gate_file}' && "
+            f"cd '/var/www/{domain}/htdocs' && "
+            f"flock -n '/tmp/wo-cron-{domain}.lock' /usr/local/bin/wp "
+            "cron event run --due-now --quiet >/dev/null 2>&1"
+        )
+
+    @staticmethod
+    def capture_nginx_worker_pids():
+        """Capture the pre-reload nginx worker generation."""
+        try:
+            result = subprocess.run(
+                ['ps', '-eo', 'pid=,args='],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            if result.returncode:
+                return (set(), 'nginx_workers=unavailable')
+            workers = set()
+            for line in result.stdout.splitlines():
+                if 'nginx: worker process' not in line:
+                    continue
+                pid_text = line.strip().split(None, 1)[0]
+                workers.add(int(pid_text))
+            if not workers:
+                return (set(), 'nginx_workers=unavailable')
+            return (workers, None)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return (set(), 'nginx_workers=unavailable')
+
+    @staticmethod
+    def live_nginx_worker_pids(pids):
+        """Return captured nginx PIDs that still exist."""
+        live = set()
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                live.add(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                live.add(pid)
+        return live
+
+    @staticmethod
+    def probe_active_php_fpm_workers(shared_sites):
+        """Return active tenant-serving FPM workers, or a fail-closed error."""
+        versions = sorted({
+            str(site.get('php_version') or '').strip()
+            for site in shared_sites
+        })
+        if not versions or any(
+                not re.fullmatch(r'\d+\.\d+', version)
+                for version in versions):
+            return (None, None, 'php_fpm_status=unavailable')
+
+        active = 0
+        listen_queue = 0
+        for version in versions:
+            short = version.replace('.', '')
+            url = (
+                "http://127.0.0.1:22222/fpm/status/"
+                f"php{short}?json&full"
+            )
+            try:
+                result = subprocess.run(
+                    ['curl', '--silent', '--show-error', '--fail',
+                     '--max-time', '5', url],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                if result.returncode:
+                    return (
+                        None, None,
+                        f'php_fpm_status_{version}=unavailable'
+                    )
+                payload = json.loads(result.stdout)
+                processes = payload.get('processes')
+                if not isinstance(processes, list):
+                    return (
+                        None, None,
+                        f'php_fpm_status_{version}=unparseable'
+                    )
+                active += sum(
+                    1 for process in processes
+                    if str(process.get('state', '')).lower() != 'idle'
+                    and not str(
+                        process.get('request uri', '')
+                    ).startswith(('/status', '/fpm/status/'))
+                )
+                listen_queue += int(payload.get('listen queue', 0))
+            except Exception:
+                return (
+                    None, None,
+                    f'php_fpm_status_{version}=unavailable'
+                )
+        return (active, listen_queue, None)
+
+    @staticmethod
+    def probe_tenant_innodb_transactions(shared_sites):
+        """Return open InnoDB transactions for tenant DBs, or an error."""
+        databases = []
+        for site in shared_sites:
+            config_path = os.path.join(
+                MTFunctions._site_htdocs(site), 'wp-config.php'
+            )
+            try:
+                with open(config_path, encoding='utf-8') as fh:
+                    contents = fh.read()
+            except (OSError, UnicodeError):
+                return (None, 'tenant_database_names=unavailable')
+            match = re.search(
+                r"""define\s*\(\s*['"]DB_NAME['"]\s*,\s*['"]([A-Za-z0-9_]+)['"]\s*\)""",
+                contents,
+            )
+            if not match:
+                return (None, 'tenant_database_names=unparseable')
+            databases.append(match.group(1))
+
+        quoted = ','.join(f"'{name}'" for name in sorted(set(databases)))
+        query = (
+            "SELECT COUNT(*) FROM information_schema.innodb_trx AS t "
+            "JOIN information_schema.processlist AS p "
+            "ON p.ID=t.trx_mysql_thread_id "
+            f"WHERE p.DB IN ({quoted})"
+        )
+        try:
+            result = subprocess.run(
+                ['mysql', '--batch', '--skip-column-names', '-e', query],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            if result.returncode:
+                return (None, 'innodb_transactions=unavailable')
+            return (int(result.stdout.strip()), None)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return (None, 'innodb_transactions=unavailable')
+
+    @staticmethod
+    def drain_tenant_active_work(
+            app, shared_sites, locks, old_nginx_worker_pids,
+            timeout=330, sleeper_horizon=60, poll_interval=2):
+        """Drain the pre-gate nginx generation, then FPM/DB backstops."""
+        start = _time.monotonic()
+        deadline = start + timeout
+        sleeper_deadline = start + sleeper_horizon
+        blockers = []
+        while True:
+            blockers = []
+            old_workers = MTFunctions.live_nginx_worker_pids(
+                old_nginx_worker_pids
+            )
+            if old_workers:
+                blockers.append(
+                    "old_nginx_workers="
+                    + ','.join(str(pid) for pid in sorted(old_workers))
+                )
+            else:
+                active, listen_queue, php_error = (
+                    MTFunctions.probe_active_php_fpm_workers(shared_sites)
+                )
+                transactions, db_error = (
+                    MTFunctions.probe_tenant_innodb_transactions(
+                        shared_sites
+                    )
+                )
+                if php_error:
+                    blockers.append(php_error)
+                else:
+                    if listen_queue:
+                        blockers.append(
+                            f'php_fpm_listen_queue={listen_queue}'
+                        )
+                    if active:
+                        blockers.append(f'php_fpm_active={active}')
+                if db_error:
+                    blockers.append(db_error)
+                elif transactions:
+                    blockers.append(
+                        f'innodb_transactions={transactions}'
+                    )
+
+            now = _time.monotonic()
+            if not blockers and now >= sleeper_deadline:
+                return (True, [])
+            if now >= deadline:
+                if now < sleeper_deadline:
+                    blockers.append('legacy_cron_sleepers=not_drained')
+                return (False, blockers)
+            _time.sleep(min(poll_interval, deadline - now))
+
+
 
     @staticmethod
     def sync_wp_cron_entries(app):
@@ -1403,7 +1608,7 @@ server {{
                 domain = site.get('domain')
                 if not domain or not site.get('is_enabled', True):
                     continue
-                if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", domain, re.IGNORECASE):
+                if not MTFunctions.valid_tenant_domain(domain):
                     invalid_domains.append(domain)
                     continue
                 enabled_domains.append(domain)
@@ -1431,12 +1636,7 @@ server {{
                 "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             ]
             for domain in enabled_domains:
-                splay = zlib.crc32(domain.encode('utf-8')) % 60
-                lines.append(
-                    f"* * * * * www-data sleep {splay} && cd '/var/www/{domain}/htdocs' && "
-                    f"flock -n '/tmp/wo-cron-{domain}.lock' /usr/local/bin/wp "
-                    "cron event run --due-now --quiet >/dev/null 2>&1"
-                )
+                lines.append(MTFunctions.build_tenant_cron_line(domain))
             content = "\n".join(lines) + "\n"
 
             cron_dir = os.path.dirname(cron_file)
@@ -1505,6 +1705,18 @@ server {{
         return 'equal'
 
     @staticmethod
+    def valid_tenant_domain(domain):
+        """Return whether a tracked domain is safe for paths and commands."""
+        return bool(
+            isinstance(domain, str)
+            and '..' not in domain
+            and re.fullmatch(
+                r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?',
+                domain,
+            )
+        )
+
+    @staticmethod
     def _site_htdocs(site):
         """Resolve a tracked tenant row to its existing htdocs path."""
         domain = site.get('domain')
@@ -1530,7 +1742,7 @@ server {{
 
         for site in shared_sites:
             domain = site.get('domain') or ''
-            if not re.fullmatch(r'[A-Za-z0-9.-]+', domain):
+            if not MTFunctions.valid_tenant_domain(domain):
                 failures.append({
                     'domain': domain or '<unknown>',
                     'error': 'invalid domain for backup filename',
@@ -1554,9 +1766,63 @@ server {{
                     })
             except Exception as exc:
                 failures.append({'domain': domain, 'error': str(exc)})
-
-
         return (not failures, failures, backup_dir)
+
+
+    @staticmethod
+    def acquire_tenant_cron_locks(app, shared_sites, timeout=30):
+        """Drain and exclusively hold the lock respected by managed WP-Cron."""
+        acquired = {}
+        deadline = _time.monotonic() + timeout
+        for site in shared_sites:
+            domain = site.get('domain')
+            if not MTFunctions.valid_tenant_domain(domain):
+                MTFunctions.release_tenant_cron_locks(acquired)
+                return ({}, [domain or '<unknown>'])
+            path = f'/tmp/wo-cron-{domain}.lock'
+            flags = os.O_RDONLY | os.O_CREAT
+            if hasattr(os, 'O_NOFOLLOW'):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(path, flags, 0o644)
+                handle = os.fdopen(fd, 'r')
+            except OSError:
+                MTFunctions.release_tenant_cron_locks(acquired)
+                return ({}, [domain])
+
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                    acquired[domain] = handle
+                    break
+                except BlockingIOError:
+                    if _time.monotonic() >= deadline:
+                        handle.close()
+                        MTFunctions.release_tenant_cron_locks(acquired)
+                        return ({}, [domain])
+                    _time.sleep(0.1)
+                except OSError:
+                    handle.close()
+                    MTFunctions.release_tenant_cron_locks(acquired)
+                    return ({}, [domain])
+        return (acquired, [])
+
+    @staticmethod
+    def release_tenant_cron_locks(locks):
+        """Release and close acquired tenant cron lock handles."""
+        for handle in list(locks.values()):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (OSError, ValueError):
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+        locks.clear()
+
 
     @staticmethod
     def run_core_db_upgrades(app, shared_sites):
@@ -1575,7 +1841,8 @@ server {{
                     'wp', 'core', 'update-db', f'--path={path}', '--allow-root'
                 ]
                 result = subprocess.run(
-                    cmd, capture_output=True, text=True, check=False
+                    cmd, capture_output=True, text=True, check=False,
+                    timeout=300,
                 )
                 if result.returncode:
                     failures.append({
@@ -1584,6 +1851,12 @@ server {{
                         'error': (result.stderr or result.stdout or
                                   f'exit {result.returncode}').strip(),
                     })
+            except subprocess.TimeoutExpired:
+                failures.append({
+                    'domain': domain,
+                    'path': path,
+                    'error': 'wp core update-db timed out after 300 seconds',
+                })
             except Exception as exc:
                 failures.append({
                     'domain': domain, 'path': path, 'error': str(exc)
@@ -1641,15 +1914,139 @@ server {{
             return False
     
     def test_site(app, domain):
-        """Test if a site is working"""
+        """Test a site through PHP, bypassing page-cache fetch and store."""
         import requests
-        
+
+        canary = uuid.uuid4().hex
+        session = requests.Session()
+        current_url = f"http://{domain}/?wo_mt_canary={canary}"
+        domain_lower = domain.lower()
+        apex = (
+            domain_lower[4:]
+            if domain_lower.startswith('www.')
+            else domain_lower
+        )
+        allowed_hosts = {apex, f'www.{apex}'}
         try:
-            response = requests.get(f"http://{domain}", timeout=5)
-            return response.status_code < 500
-        except:
+            for redirect_count in range(6):
+                response = session.get(
+                    current_url,
+                    timeout=5,
+                    allow_redirects=False,
+                    headers={'X-Requested-With': 'XMLHttpRequest'},
+                )
+                if 200 <= response.status_code < 300:
+                    return True
+                if not 300 <= response.status_code < 400:
+                    return False
+                location = response.headers.get('Location')
+                if not location or redirect_count == 5:
+                    return False
+                next_url = urljoin(current_url, location)
+                parsed = urlparse(next_url)
+                try:
+                    port = parsed.port
+                except ValueError:
+                    port = -1
+                expected_port = (
+                    80 if parsed.scheme == 'http' else 443
+                )
+                if (parsed.scheme not in ('http', 'https')
+                        or parsed.hostname not in allowed_hosts
+                        or port not in (None, expected_port)):
+                    Log.warn(
+                        app,
+                        f"Canary redirect rejected for {domain}: "
+                        f"{location}",
+                    )
+                    return False
+                current_url = next_url
+            return False
+        except Exception:
             return False
     
+    @staticmethod
+    def test_site_locally(app, site):
+        """Canary a gated tenant through nginx's loopback-only bypass."""
+        domain = site.get('domain')
+        if not MTFunctions.valid_tenant_domain(domain):
+            return False
+        scheme = 'https' if site.get('is_ssl') else 'http'
+        domain_lower = domain.lower()
+        apex = (
+            domain_lower[4:]
+            if domain_lower.startswith('www.')
+            else domain_lower
+        )
+        allowed_hosts = {apex, f'www.{apex}'}
+        variants = sorted(allowed_hosts)
+        base_cmd = [
+            'curl',
+            '--silent',
+            '--show-error',
+            '--insecure',
+            '--proto', '=http,https',
+            '--header', 'X-Requested-With: XMLHttpRequest',
+            '--max-time', '20',
+        ]
+        for variant in variants:
+            for port in (80, 443):
+                base_cmd.extend([
+                    '--resolve', f'{variant}:{port}:127.0.0.1',
+                ])
+        base_cmd.extend([
+            '--output', '/dev/null',
+            '--write-out', '%{http_code}\t%{redirect_url}',
+        ])
+        current_url = (
+            f'{scheme}://{domain}/?wo_mt_canary={uuid.uuid4().hex}'
+        )
+        try:
+            for redirect_count in range(6):
+                result = subprocess.run(
+                    base_cmd + [current_url],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=25,
+                )
+                if result.returncode != 0:
+                    return False
+                status_text, separator, redirect_url = (
+                    result.stdout.rstrip('\r\n').partition('\t')
+                )
+                if not separator:
+                    return False
+                status = int(status_text)
+                if 200 <= status < 300:
+                    return True
+                if not 300 <= status < 400:
+                    return False
+                if not redirect_url or redirect_count == 5:
+                    return False
+                next_url = urljoin(current_url, redirect_url)
+                parsed = urlparse(next_url)
+                try:
+                    port = parsed.port
+                except ValueError:
+                    port = -1
+                expected_port = (
+                    80 if parsed.scheme == 'http' else 443
+                )
+                if (parsed.scheme not in ('http', 'https')
+                        or parsed.hostname not in allowed_hosts
+                        or port not in (None, expected_port)):
+                    Log.warn(
+                        app,
+                        f"Canary redirect rejected for {domain}: "
+                        f"{redirect_url}",
+                    )
+                    return False
+                current_url = next_url
+            return False
+        except Exception:
+            return False
+
     @staticmethod
     def perform_health_check(app, shared_root):
         """Perform health check on shared infrastructure"""
