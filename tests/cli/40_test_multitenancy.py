@@ -3707,6 +3707,9 @@ bare-theme = owner/theme
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_shared_sites', return_value=[{'domain': 'example.com'}]))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'load_config', return_value={'shared_root': self.tmp}))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'core_schema_transition',
+                return_value='equal'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'test_site', return_value=False))
             stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'download_wordpress_core', return_value='wp-test'))
             stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'update_plugins_and_themes', return_value=(True, asset_records)))
@@ -3794,5 +3797,300 @@ bare-theme = owner/theme
             'type': 'url',
             'url': 'https://example.com/custom-theme.zip',
         })
+
+class CoreDatabaseSafetyTests(unittest.TestCase):
+    """Focused tests for schema-gated tenant database safety."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write_db_version(self, relative_root, value):
+        includes = os.path.join(self.tmp, relative_root, 'wp-includes')
+        os.makedirs(includes, exist_ok=True)
+        with open(os.path.join(includes, 'version.php'), 'w') as fh:
+            fh.write(f"<?php\n$wp_db_version = {value};\n")
+
+    def test_parse_wordpress_db_version(self):
+        contents = """<?php
+$wp_version = '6.9.1';
+  $wp_db_version = 60717;
+"""
+        self.assertEqual(
+            MTFunctions.parse_wordpress_db_version(contents), 60717
+        )
+        self.assertEqual(
+            MTFunctions.parse_wordpress_db_version(
+                "<?php\n$wp_db_version = '60718';\n"
+            ),
+            60718,
+        )
+        self.assertEqual(
+            MTFunctions.parse_wordpress_db_version(
+                '<?php\n$wp_db_version = "60719";\n'
+            ),
+            60719,
+        )
+        self.assertIsNone(
+            MTFunctions.parse_wordpress_db_version(
+                "<?php\n$wp_db_version = 'not-an-integer';\n"
+            )
+        )
+
+    def test_core_schema_transition_is_directional(self):
+        self._write_db_version('current', "'60717'")
+        self._write_db_version(
+            os.path.join('releases', 'wp-staged'), '"60717"'
+        )
+        self.assertEqual(
+            MTFunctions.core_schema_transition(
+                mock.Mock(), self.tmp, 'wp-staged'
+            ),
+            'equal',
+        )
+
+        self._write_db_version(
+            os.path.join('releases', 'wp-staged'), "'60718'"
+        )
+        self.assertEqual(
+            MTFunctions.core_schema_transition(
+                mock.Mock(), self.tmp, 'wp-staged'
+            ),
+            'upgrade',
+        )
+
+        self._write_db_version(
+            os.path.join('releases', 'wp-staged'), 60716
+        )
+        self.assertEqual(
+            MTFunctions.core_schema_transition(
+                mock.Mock(), self.tmp, 'wp-staged'
+            ),
+            'downgrade',
+        )
+
+    def test_core_schema_transition_reports_unknown_for_unreadable_version(self):
+        self._write_db_version('current', 60717)
+        self.assertEqual(
+            MTFunctions.core_schema_transition(
+                mock.Mock(), self.tmp, 'missing-release'
+            ),
+            'unknown',
+        )
+
+    def test_backup_aggregates_failures_and_secures_directory(self):
+        sites = [
+            {'domain': 'ok.example', 'site_path': '/srv/ok'},
+            {'domain': 'bad.example', 'site_path': '/srv/bad'},
+        ]
+        results = [
+            mock.Mock(returncode=0, stdout='', stderr=''),
+            mock.Mock(returncode=1, stdout='', stderr='export failed'),
+        ]
+        with mock.patch.object(
+                mtf.subprocess, 'run', side_effect=results) as run:
+            ok, failures, backup_dir = MTFunctions.backup_tenant_databases(
+                mock.Mock(), sites, self.tmp
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual([item['domain'] for item in failures], ['bad.example'])
+        self.assertEqual(os.stat(backup_dir).st_mode & 0o777, 0o700)
+        self.assertIn(
+            '--path=/srv/ok/htdocs',
+            run.call_args_list[0].args[0],
+        )
+
+    def test_core_db_upgrade_aggregates_command_and_exception_failures(self):
+        sites = [
+            {'domain': 'ok.example', 'site_path': '/srv/ok'},
+            {'domain': 'exit.example', 'site_path': '/srv/exit'},
+            {'domain': 'raise.example', 'site_path': '/srv/raise'},
+        ]
+        results = [
+            mock.Mock(returncode=0, stdout='', stderr=''),
+            mock.Mock(returncode=1, stdout='', stderr='upgrade failed'),
+            OSError('wp unavailable'),
+        ]
+        with mock.patch.object(mtf.subprocess, 'run', side_effect=results):
+            failures = MTFunctions.run_core_db_upgrades(mock.Mock(), sites)
+
+        self.assertEqual(
+            [item['domain'] for item in failures],
+            ['exit.example', 'raise.example'],
+        )
+        self.assertEqual(failures[1]['error'], 'wp unavailable')
+    def _run_update(self, force, backups, upgrades=None,
+                    transition='upgrade'):
+        if mt is None:
+            self.skipTest(
+                f'multitenancy controller import unavailable: {_mt_import_error}'
+            )
+        ctrl = mt.WOMultitenancyController.__new__(
+            mt.WOMultitenancyController
+        )
+        ctrl.app = mock.Mock()
+        ctrl.app.pargs = mock.Mock(force=force)
+        infra = mock.Mock()
+        infra.download_wordpress_core.return_value = 'wp-staged'
+        infra.update_plugins_and_themes.return_value = (True, [])
+        order = []
+
+        with contextlib.ExitStack() as stack:
+            info = stack.enter_context(
+                mock.patch('wo.core.logging.Log.info')
+            )
+            for method in ('warn', 'debug'):
+                stack.enter_context(
+                    mock.patch(f'wo.core.logging.Log.{method}')
+                )
+            error = stack.enter_context(mock.patch(
+                'wo.core.logging.Log.error',
+                side_effect=lambda controller, message, exit=True: (
+                    controller.app.close(1) if exit else None
+                ),
+            ))
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTDatabase, 'is_initialized', return_value=True
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTDatabase,
+                    'get_shared_sites',
+                    return_value=[
+                        {
+                            'domain': 'site.example',
+                            'site_path': '/srv/site',
+                        }
+                    ],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions,
+                    'load_config',
+                    return_value={'shared_root': self.tmp},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions,
+                    'preflight_shared_config',
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions,
+                    'core_schema_transition',
+                    return_value=transition,
+                )
+            )
+            backup = stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions,
+                    'backup_tenant_databases',
+                    return_value=backups,
+                )
+            )
+            upgrade = stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions,
+                    'run_core_db_upgrades',
+                    side_effect=lambda app, sites: (
+                        order.append('upgrade') or (upgrades or [])
+                    ),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mt.MTFunctions, 'clear_all_caches')
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTDatabase,
+                    'update_release',
+                    side_effect=lambda app, release: order.append('record'),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt, 'SharedInfrastructure', return_value=infra
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mt, 'ReleaseManager')
+            )
+            ctrl.update()
+
+        return infra, order, backup, upgrade, info, error, ctrl
+
+    def test_update_aborts_on_backup_failure_even_with_force(self):
+        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+            True,
+            (
+                False,
+                [{'domain': 'site.example', 'error': 'export failed'}],
+                '/backups/db/stamp',
+            ),
+        )
+        infra.update_plugins_and_themes.assert_not_called()
+        infra.switch_release.assert_not_called()
+        self.assertEqual(order, [])
+
+    def test_update_runs_db_upgrade_only_after_release_record(self):
+        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+            True, (True, [], '/backups/db/stamp')
+        )
+        infra.switch_release.assert_called_once_with('wp-staged')
+        self.assertEqual(order, ['record', 'upgrade'])
+
+    def test_same_schema_keeps_fast_path_without_db_commands(self):
+        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+            True, (True, [], None), transition='equal'
+        )
+        infra.update_plugins_and_themes.assert_called_once()
+        infra.switch_release.assert_called_once_with('wp-staged')
+        backup.assert_not_called()
+        upgrade.assert_not_called()
+        self.assertEqual(order, ['record'])
+
+    def test_downgrade_and_unknown_abort_before_assets_with_nonzero_status(self):
+        for transition in ('downgrade', 'unknown'):
+            with self.subTest(transition=transition):
+                infra, order, backup, upgrade, info, error, ctrl = (
+                    self._run_update(
+                        True, (True, [], None), transition=transition
+                    )
+                )
+                infra.update_plugins_and_themes.assert_not_called()
+                infra.switch_release.assert_not_called()
+                ctrl.app.close.assert_called_once_with(1)
+                self.assertEqual(order, [])
+
+    def test_partial_db_upgrade_reports_nonzero_without_success_status(self):
+        failure = {
+            'domain': 'site.example',
+            'path': '/srv/site/htdocs',
+            'error': 'upgrade failed',
+        }
+        infra, order, backup, upgrade, info, error, ctrl = self._run_update(
+            True,
+            (True, [], '/backups/db/stamp'),
+            upgrades=[failure],
+        )
+
+        messages = [call.args[1] for call in info.call_args_list]
+        self.assertTrue(any('result=partial' in msg for msg in messages))
+        self.assertFalse(any('result=success' in msg for msg in messages))
+        self.assertFalse(any('completed successfully' in msg for msg in messages))
+        ctrl.app.close.assert_called_once_with(1)
+        self.assertIn(
+            'backup_dir=/backups/db/stamp',
+            error.call_args_list[-1].args[1],
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

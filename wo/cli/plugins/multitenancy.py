@@ -52,6 +52,10 @@ def wo_multitenancy_hook(app):
     MTDatabase.initialize_tables(ctx)
 
 
+class _UpdateAbort(Exception):
+    """Abort an update before release mutation without generic rollback advice."""
+
+
 class WOMultitenancyController(CementBaseController):
     """WordOps Multi-tenancy Controller"""
     
@@ -578,11 +582,56 @@ class WOMultitenancyController(CementBaseController):
 
         asset_backups = []
         core_switched = False
+        core_db_bump = False
+        db_backup_dir = None
+        db_upgrade_failures = []
+
 
         try:
             # Create new release
             Log.info(self, "Creating new WordPress release...")
             new_release = infra.download_wordpress_core(config.get('wp_version'))
+            schema_transition = MTFunctions.core_schema_transition(
+                self, shared_root, new_release
+            )
+            if schema_transition == 'unknown':
+                raise _UpdateAbort(
+                    "Cannot read $wp_db_version from both active and staged "
+                    "WordPress cores; update aborted before asset promotion"
+                )
+            if schema_transition == 'downgrade':
+                raise _UpdateAbort(
+                    "Staged WordPress core has an older database schema; "
+                    "automated DB downgrade is unsupported. Restore the "
+                    "matching tenant DB dumps and older release manually."
+                )
+            core_db_bump = schema_transition == 'upgrade'
+            if core_db_bump:
+                Log.info(
+                    self,
+                    "WordPress database schema change detected; backing up "
+                    "tenant databases..."
+                )
+                backups_ok, backup_failures, db_backup_dir = (
+                    MTFunctions.backup_tenant_databases(
+                        self,
+                        shared_sites,
+                        shared_root,
+                    )
+                )
+                Log.info(self, f"Tenant DB backup directory: {db_backup_dir}")
+                if not backups_ok:
+                    for failure in backup_failures:
+                        Log.error(
+                            self,
+                            f"DB backup failed for {failure['domain']}: "
+                            f"{failure['error']}",
+                            exit=False,
+                        )
+                    raise _UpdateAbort(
+                        "Tenant database backup incomplete; update aborted"
+                    )
+
 
             # Update plugins and themes (staged; auto-restores on failure)
             Log.info(self, "Updating plugins and themes...")
@@ -614,6 +663,30 @@ class WOMultitenancyController(CementBaseController):
 
             # Update database
             MTDatabase.update_release(self, new_release)
+            if core_db_bump:
+                db_upgrade_failures = MTFunctions.run_core_db_upgrades(
+                    self, shared_sites
+                )
+                for failure in db_upgrade_failures:
+                    Log.error(
+                        self,
+                        f"DB upgrade failed for {failure['domain']}: "
+                        f"{failure['error']}",
+                        exit=False,
+                    )
+                    Log.warn(
+                        self,
+                        "Run manually: wp core update-db "
+                        f"--path={failure['path']} --allow-root"
+                    )
+                result = 'partial' if db_upgrade_failures else 'success'
+                Log.info(
+                    self,
+                    f"db_upgrade result={result} "
+                    f"failed={len(db_upgrade_failures)} "
+                    f"backup_dir={db_backup_dir}"
+                )
+
 
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
@@ -621,11 +694,19 @@ class WOMultitenancyController(CementBaseController):
             infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
 
-            Log.info(self, "✅ Update completed successfully!")
-            Log.info(self, f"   New release: {new_release}")
-            Log.info(self, f"   Updated {len(shared_sites)} sites")
+            if not db_upgrade_failures:
+                Log.info(self, "✅ Update completed successfully!")
+                Log.info(self, f"   New release: {new_release}")
+                Log.info(self, f"   Updated {len(shared_sites)} sites")
+                Log.info(
+                    self,
+                    f"update_completed target=baseline result=success "
+                    f"release={new_release}"
+                )
 
-            Log.info(self, f"update_completed target=baseline result=success release={new_release}")
+        except _UpdateAbort as e:
+            Log.error(self, str(e))
+            return
 
         except Exception as e:
             if asset_backups and not core_switched:
@@ -633,6 +714,23 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"update_failed target=baseline result=failure")
             Log.error(self, f"Update failed: {str(e)}")
             Log.info(self, "Run 'wo multitenancy rollback' to revert")
+
+        if db_upgrade_failures:
+            failed_domains = ','.join(
+                failure['domain'] for failure in db_upgrade_failures
+            )
+            Log.info(
+                self,
+                "update_completed target=baseline result=partial "
+                f"failed_db_upgrades={len(db_upgrade_failures)}"
+            )
+            Log.error(
+                self,
+                "WordPress core is active but DB upgrades failed for "
+                f"{failed_domains}; backup_dir={db_backup_dir}. Run the "
+                "per-site wp core update-db remediation commands above."
+            )
+            return
 
     @expose(help="Rollback to previous WordPress release")
     def rollback(self):
@@ -678,6 +776,15 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "✅ Rollback completed successfully!")
             Log.info(self, f"   Now running: {previous_release}")
             Log.info(self, f"rollback_triggered target=baseline result=success to={previous_release}")
+            Log.info(
+                self,
+                "WordPress DB migrations are forward-only. If `wp core "
+                "update-db` ran after the pre-upgrade dump, restore tenant "
+                f"dumps from {shared_root}/backups/db/<timestamp>/ with "
+                "`wp db import`, or validate the old core against the newer "
+                "schema."
+            )
+
 
         except Exception as e:
             Log.info(self, f"rollback_failed target=baseline result=failure")

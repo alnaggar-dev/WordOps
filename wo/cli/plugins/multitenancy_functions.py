@@ -1467,6 +1467,130 @@ server {{
             return False
 
     @staticmethod
+    def parse_wordpress_db_version(contents):
+        """Return the integer schema version assigned in version.php, or None."""
+        match = re.search(
+            r"""^\s*\$wp_db_version\s*=\s*(['"]?)(\d+)\1\s*;""",
+            contents,
+            re.MULTILINE,
+        )
+        return int(match.group(2)) if match else None
+
+    @staticmethod
+    def core_schema_transition(app, shared_root, staged_release):
+        """Classify the staged DB schema as upgrade, equal, downgrade, or unknown."""
+        version_files = (
+            os.path.join(shared_root, 'current', 'wp-includes', 'version.php'),
+            os.path.join(
+                shared_root, 'releases', staged_release,
+                'wp-includes', 'version.php'
+            ),
+        )
+        versions = []
+        for version_file in version_files:
+            try:
+                with open(version_file, encoding='utf-8') as fh:
+                    version = MTFunctions.parse_wordpress_db_version(fh.read())
+            except (OSError, UnicodeError):
+                return 'unknown'
+            if version is None:
+                return 'unknown'
+            versions.append(version)
+
+        active, staged = versions
+        if staged > active:
+            return 'upgrade'
+        if staged < active:
+            return 'downgrade'
+        return 'equal'
+
+    @staticmethod
+    def _site_htdocs(site):
+        """Resolve a tracked tenant row to its existing htdocs path."""
+        domain = site.get('domain')
+        site_root = site.get('site_path') or os.path.join('/var/www', domain or '')
+        return os.path.join(site_root, 'htdocs')
+
+
+    @staticmethod
+    def backup_tenant_databases(app, shared_sites, shared_root):
+        """Export every tenant database to a root-only timestamp directory."""
+        backup_root = os.path.join(shared_root, 'backups', 'db')
+        stamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+        backup_dir = os.path.join(backup_root, stamp)
+        failures = []
+
+        try:
+            os.makedirs(backup_root, mode=0o700, exist_ok=True)
+            os.chmod(backup_root, 0o700)
+            os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+            os.chmod(backup_dir, 0o700)
+        except OSError as exc:
+            return (False, [{'domain': '*', 'error': str(exc)}], backup_dir)
+
+        for site in shared_sites:
+            domain = site.get('domain') or ''
+            if not re.fullmatch(r'[A-Za-z0-9.-]+', domain):
+                failures.append({
+                    'domain': domain or '<unknown>',
+                    'error': 'invalid domain for backup filename',
+                })
+                continue
+            dump_path = os.path.join(backup_dir, f'{domain}.sql')
+            cmd = [
+                'wp', 'db', 'export', dump_path,
+                f"--path={MTFunctions._site_htdocs(site)}",
+                '--allow-root',
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False
+                )
+                if result.returncode:
+                    failures.append({
+                        'domain': domain,
+                        'error': (result.stderr or result.stdout or
+                                  f'exit {result.returncode}').strip(),
+                    })
+            except Exception as exc:
+                failures.append({'domain': domain, 'error': str(exc)})
+
+
+        return (not failures, failures, backup_dir)
+
+    @staticmethod
+    def run_core_db_upgrades(app, shared_sites):
+        """Run core schema upgrades for all tenants, aggregating every failure."""
+        failures = []
+        try:
+            sites = list(shared_sites)
+        except Exception as exc:
+            return [{'domain': '*', 'path': '', 'error': str(exc)}]
+        for site in sites:
+            domain = site.get('domain') or '<unknown>'
+            path = ''
+            try:
+                path = MTFunctions._site_htdocs(site)
+                cmd = [
+                    'wp', 'core', 'update-db', f'--path={path}', '--allow-root'
+                ]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False
+                )
+                if result.returncode:
+                    failures.append({
+                        'domain': domain,
+                        'path': path,
+                        'error': (result.stderr or result.stdout or
+                                  f'exit {result.returncode}').strip(),
+                    })
+            except Exception as exc:
+                failures.append({
+                    'domain': domain, 'path': path, 'error': str(exc)
+                })
+        return failures
+
+    @staticmethod
     def clear_cache(app, domain, cache_type):
         """Clear cache for a site"""
 
