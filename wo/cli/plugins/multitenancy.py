@@ -279,7 +279,16 @@ class WOMultitenancyController(CementBaseController):
         for flag in ('php85', 'ngxblocker'):
             if not hasattr(pargs, flag):
                 setattr(pargs, flag, False)
-        site_package_check(self, 'wp')
+        # Every shared-core site gets the Object Cache Pro drop-in, so Redis
+        # is a hard dependency regardless of the selected page-cache type.
+        # site_package_check only installs redis when pargs.wpredis is set,
+        # so force it for the check and restore the user's flag afterwards.
+        saved_wpredis = pargs.wpredis
+        pargs.wpredis = True
+        try:
+            site_package_check(self, 'wp')
+        finally:
+            pargs.wpredis = saved_wpredis
 
         Log.info(self, f"Creating shared WordPress site: {wo_domain}")
         Log.info(self, f"   PHP version: {php_version}")
