@@ -48,6 +48,9 @@ class MultitenancySite(Base):
     is_ssl = Column(Boolean, default=False)
     # Phase 1: Redis Object Cache prefix (unique per site for cache isolation)
     redis_prefix = Column(Text)
+    # Dedicated Redis database number (unique per site). Object Cache Pro
+    # flushes with FLUSHDB, so tenants must never share a database.
+    redis_db = Column(Integer)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -99,6 +102,29 @@ class MTDatabase:
                     Log.debug(app, "Ensured redis_prefix indexes")
                 except Exception:
                     pass  # Indexes might already exist
+
+                if 'redis_db' not in existing_columns:
+                    Log.info(app, "Adding redis_db column...")
+                    try:
+                        db_session.execute(text("""
+                            ALTER TABLE multitenancy_sites
+                            ADD COLUMN redis_db INTEGER
+                        """))
+                        db_session.commit()
+                        Log.debug(app, "Added redis_db column")
+                    except Exception:
+                        pass  # Column might already exist
+
+                try:
+                    db_session.execute(text('''
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_redis_db_unique
+                        ON multitenancy_sites(redis_db)
+                        WHERE redis_db IS NOT NULL
+                    '''))
+                    db_session.commit()
+                    Log.debug(app, "Ensured redis_db index")
+                except Exception:
+                    pass  # Index might already exist
 
             except Exception as migration_error:
                 Log.debug(app, f"Migration check/execution: {migration_error}")
@@ -276,6 +302,7 @@ class MTDatabase:
                     shared_release=site_data.get('shared_release'),
                     is_ssl=site_data.get('is_ssl', False),
                     redis_prefix=site_data.get('redis_prefix'),  # Phase 2: Store Redis prefix
+                    redis_db=site_data.get('redis_db'),
                 )
                 session.add(site)
             
@@ -305,6 +332,7 @@ class MTDatabase:
                     'is_enabled': site.is_enabled,
                     'is_ssl': site.is_ssl,
                     'redis_prefix': getattr(site, 'redis_prefix', None),
+                    'redis_db': getattr(site, 'redis_db', None),
                     'created_at': site.created_at,
                     'updated_at': site.updated_at
                 })
@@ -519,6 +547,42 @@ class MTDatabase:
         
         Log.debug(app, f"Generated Redis prefix for {domain}: {prefix}")
         return prefix
+
+    @staticmethod
+    def allocate_redis_db(app, domain):
+        """Return the site's dedicated Redis database number, allocating the
+        smallest free one (>= 1) if the site has none yet.
+
+        Object Cache Pro flushes with FLUSHDB, which ignores key prefixes.
+        Tenants sharing a Redis database therefore wipe each other's cache --
+        including OCP's per-site metadata key, whose absence triggers an
+        "integrity protection" FLUSHDB on every other tenant's next boot and
+        keeps the whole fleet's object cache permanently cold (update checks
+        and license pings then run inline in wp-admin on every page load).
+        A dedicated database per tenant scopes both kinds of flush to the
+        site itself. Database 0 is reserved for standard (non-multitenant)
+        sites.
+        """
+        try:
+            session = db_session
+            site = session.query(MultitenancySite).filter_by(
+                domain=domain
+            ).first()
+            if site is not None and getattr(site, 'redis_db', None):
+                return site.redis_db
+
+            used = {
+                row[0] for row in session.query(
+                    MultitenancySite.redis_db
+                ).filter(MultitenancySite.redis_db.isnot(None)).all()
+            }
+            candidate = 1
+            while candidate in used:
+                candidate += 1
+            Log.debug(app, f"Allocated Redis database {candidate} for {domain}")
+            return candidate
+        except Exception as e:
+            Log.error(app, f"Failed to allocate Redis database for {domain}: {e}")
     
     @staticmethod
     def check_redis_prefix_exists(app, prefix):

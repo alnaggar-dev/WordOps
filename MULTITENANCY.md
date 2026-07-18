@@ -13,7 +13,7 @@ Operating model: this fork assumes a trust model of one — a solo operator runn
 | Plugins, themes, MU plugins, languages | `/var/www/shared/wp-content/{plugins,themes,mu-plugins,languages}/` | `htdocs/wp-content/{plugins,themes,mu-plugins,languages}` symlink to shared tree |
 | Fleet config | `/var/www/shared/config/wp-config-shared.php` | Required by each generated tenant config |
 | Baseline | `/var/www/shared/config/baseline.json` | Site tracking stores the baseline version applied to that site |
-| Site config | Not shared | `htdocs/wp-config.php` with DB credentials, salts, unique Redis prefix |
+| Site config | Not shared | `htdocs/wp-config.php` with DB credentials, salts, unique Redis prefix and dedicated Redis database |
 | Mutable content | Not shared | `wp-content/uploads`, `wp-content/cache`, `wp-content/upgrade` real directories |
 | Web server | Not shared | nginx vhost and cache configuration |
 
@@ -309,7 +309,7 @@ Per-site tree:
 ```text
 /var/www/<domain>/
 ├── htdocs/
-│   ├── wp-config.php                # per-site DB creds, salts, Redis prefix
+│   ├── wp-config.php                # per-site DB creds, salts, Redis prefix + dedicated Redis database
 │   ├── wp -> /var/www/shared/current
 │   ├── wp-login.php -> shared core
 │   ├── wp-admin -> shared core
@@ -383,7 +383,7 @@ Plugins and themes are shared read-only symlinks. A plugin that writes into its 
 | PHP-FPM unavailable | Check `systemctl status php8.4-fpm` or the service matching the site's PHP version. |
 | Uploads fail or media cannot be written | Fix uploads ownership with `chown -R www-data:www-data …/wp-content/uploads`. |
 | SSL flag rejected as `unrecognized arguments` | Use `-le` or `--letsencrypt`; replace any copied em dash with a normal hyphen. |
-| Redis cross-talk or lost cache isolation | Each site needs a unique `redis_prefix`, enforced in the DB. Recreate a site whose `wp-config.php` lost its prefix. |
+| Redis cross-talk or lost cache isolation | Each site needs a unique `redis_prefix` and a dedicated `redis_db` (both enforced in the DB). Object Cache Pro flushes with `FLUSHDB`, so tenants sharing one Redis database wipe each other's cache — including OCP's metadata key, which triggers fleet-wide integrity-flush loops that keep every cache cold and make wp-admin run update/license checks inline on every page load. `wo multitenancy apply` backfills a dedicated database for tenants still on shared db 0; database 0 is reserved for standard sites. When the fleet outgrows the Redis `databases` limit, `create`/`apply` raise it in `/etc/redis/redis.conf` and restart Redis. |
 | `validate` flags a fresh site as behind | The create-time baseline version may not have been recorded; run `wo multitenancy apply`. |
 | Shared-config syntax error | Run `wo multitenancy shared-config --action edit` to use linted editing, or temporarily set `WO_BYPASS_SHARED_CONFIG` in the affected site's config while fixing the shared file. |
 

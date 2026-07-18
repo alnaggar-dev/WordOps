@@ -331,13 +331,15 @@ class WOMultitenancyController(CementBaseController):
             # 3. Stored in database via site_data for tracking and debugging
             Log.info(self, "Generating Redis cache prefix...")
             redis_prefix = MTDatabase.generate_redis_prefix(self, wo_domain)
-            Log.debug(self, f"Redis prefix for {wo_domain}: {redis_prefix}")
+            redis_db = MTDatabase.allocate_redis_db(self, wo_domain)
+            MTFunctions.ensure_redis_databases(self, redis_db + 1)
+            Log.debug(self, f"Redis prefix for {wo_domain}: {redis_prefix} (db {redis_db})")
 
             # A previous site with this exact domain leaves FastCGI page-cache
             # entries and Redis object-cache keys behind (delete does not purge
             # them, and both key on the domain). Clear them now so this fresh
             # site never serves the old incarnation's cached pages/options.
-            MTFunctions.purge_site_cache(self, wo_domain, redis_prefix)
+            MTFunctions.purge_site_cache(self, wo_domain, redis_prefix, redis_db)
             
             # ================================================================
             # Generate wp-config.php with Redis prefix and shared config
@@ -351,7 +353,8 @@ class WOMultitenancyController(CementBaseController):
             MTFunctions.generate_wp_config(
                 self, site_root, wo_domain,
                 db_name, db_user, db_pass, db_host,
-                redis_prefix=redis_prefix  # Pass explicit prefix for consistency
+                redis_prefix=redis_prefix,  # Pass explicit prefix for consistency
+                redis_db=redis_db,
             )
             
             # Generate nginx configuration
@@ -473,7 +476,8 @@ class WOMultitenancyController(CementBaseController):
                 'is_shared': True,
                 'is_ssl': False,  # Will be updated after SSL setup
                 'shared_release': MTDatabase.get_current_release(self),
-                'redis_prefix': redis_prefix  # Phase 2: Store Redis prefix with site data
+                'redis_prefix': redis_prefix,  # Phase 2: Store Redis prefix with site data
+                'redis_db': redis_db,  # Dedicated Redis database (OCP FLUSHDB isolation)
             }
             addNewSite(
                 self,
@@ -1520,7 +1524,8 @@ class WOMultitenancyController(CementBaseController):
         # keys behind (both key on the domain); purge them so a future recreate
         # of this domain never inherits stale pages/options.
         MTFunctions.purge_site_cache(
-            self, domain, getattr(site, 'redis_prefix', None))
+            self, domain, getattr(site, 'redis_prefix', None),
+            getattr(site, 'redis_db', None))
 
         # Remove from multitenancy tracking
         try:
@@ -1738,8 +1743,12 @@ class WOMultitenancyController(CementBaseController):
             rollback['mt_updated'] = True
 
 
-            MTFunctions.purge_site_cache(self, old_domain, resolved_old_redis_prefix)
-            MTFunctions.purge_site_cache(self, new_domain, new_redis_prefix)
+            MTFunctions.purge_site_cache(
+                self, old_domain, resolved_old_redis_prefix,
+                getattr(mt_site, 'redis_db', None))
+            MTFunctions.purge_site_cache(
+                self, new_domain, new_redis_prefix,
+                getattr(mt_site, 'redis_db', None))
 
             if not MTFunctions.reload_nginx_recoverable(self, new_domain):
                 raise Exception("Nginx reload failed after rename")
@@ -2377,6 +2386,26 @@ class WOMultitenancyController(CementBaseController):
         if dry_run:
             header += ' [DRY RUN]'
         Log.info(self, header + '...')
+
+        # Backfill dedicated Redis databases for tenants created before
+        # per-site databases existed. They shared db 0, where Object Cache
+        # Pro's FLUSHDB let tenants wipe each other's cache (including OCP's
+        # metadata key, causing fleet-wide integrity-flush loops) -- see
+        # MTDatabase.allocate_redis_db.
+        for mt_site in MTDatabase.get_shared_sites(self):
+            if mt_site.get('redis_db'):
+                continue
+            site_domain = mt_site['domain']
+            if dry_run:
+                Log.info(self, f"[DRY RUN] Would assign a dedicated Redis database to {site_domain}")
+                continue
+            site_redis_db = MTDatabase.allocate_redis_db(self, site_domain)
+            MTFunctions.ensure_redis_databases(self, site_redis_db + 1)
+            if MTFunctions.set_wp_config_redis_db(self, mt_site['site_path'], site_redis_db):
+                MTDatabase.add_shared_site(self, site_domain, {'redis_db': site_redis_db})
+                MTFunctions.purge_site_cache(
+                    self, site_domain, mt_site.get('redis_prefix'), site_redis_db)
+                Log.info(self, f"Assigned Redis database {site_redis_db} to {site_domain}")
 
         result = BaselineApplicator.apply_baseline_to_sites(
             self, config, baseline_version,

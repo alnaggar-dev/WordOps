@@ -110,6 +110,8 @@ class MultitenancyTests(unittest.TestCase):
             ))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_shared_symlinks'))
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'generate_redis_prefix', return_value='wp_example_'))
+            stack.enter_context(mock.patch.object(mt.MTDatabase, 'allocate_redis_db', return_value=3))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'ensure_redis_databases'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
@@ -725,12 +727,68 @@ class PurgeSiteCacheTests(unittest.TestCase):
         self.assertEqual(len(unlink), 1)
         self.assertEqual(unlink[0], ['redis-cli', 'unlink', 'example_com_k1', 'example_com_k2'])
 
+    def test_redis_purge_flushes_dedicated_database(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout='', stderr='')
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=False), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=fake_run), \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            MTFunctions.purge_site_cache(
+                mock.Mock(), 'example.com', redis_prefix='example_com_', redis_db=5)
+
+        self.assertIn(['redis-cli', '-n', '5', 'flushdb', 'async'], calls)
+        # The dedicated database is exclusive; no prefix scan must run.
+        self.assertFalse(any(c[:2] == ['redis-cli', '--scan'] for c in calls))
+
     def test_purge_is_best_effort_on_subprocess_error(self):
         with mock.patch('wo.cli.plugins.multitenancy_functions.os.path.isdir', return_value=True), \
                 mock.patch('wo.cli.plugins.multitenancy_functions.subprocess.run', side_effect=OSError('boom')), \
                 mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
             # Best-effort: a failing purge must never abort provisioning.
             MTFunctions.purge_site_cache(mock.Mock(), 'example.com', redis_prefix='example_com_')
+
+
+class SetWpConfigRedisDbTests(unittest.TestCase):
+    """MTFunctions.set_wp_config_redis_db rewrites only WP_REDIS_CONFIG's database."""
+
+    def test_rewrites_database_line_and_leaves_rest_untouched(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        os.makedirs(os.path.join(tmp, 'htdocs'))
+        wp_config = os.path.join(tmp, 'htdocs', 'wp-config.php')
+        with open(wp_config, 'w') as fh:
+            fh.write(
+                "<?php\n"
+                "define('WP_REDIS_CONFIG', [\n"
+                "    'database' => 0,  // All sites use database 0 with unique prefixes\n"
+                "    'prefix' => 'example_com_',\n"
+                "]);\n"
+                "define('DB_NAME', 'db0');\n"
+            )
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'):
+            result = MTFunctions.set_wp_config_redis_db(mock.Mock(), tmp, 7)
+
+        self.assertTrue(result)
+        with open(wp_config) as fh:
+            content = fh.read()
+        self.assertIn("'database' => 7,", content)
+        self.assertNotIn("'database' => 0,", content)
+        self.assertIn("define('DB_NAME', 'db0');", content)
+
+    def test_returns_false_when_database_key_missing(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        os.makedirs(os.path.join(tmp, 'htdocs'))
+        with open(os.path.join(tmp, 'htdocs', 'wp-config.php'), 'w') as fh:
+            fh.write("<?php define('DB_NAME', 'db0');\n")
+
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.warn'):
+            self.assertFalse(MTFunctions.set_wp_config_redis_db(mock.Mock(), tmp, 7))
 
 
 class MultitenancyDeleteCacheTests(unittest.TestCase):
@@ -747,6 +805,7 @@ class MultitenancyDeleteCacheTests(unittest.TestCase):
         ctrl.app.pargs = pargs
         site = mock.Mock()
         site.redis_prefix = 'example_com_'
+        site.redis_db = 3
         session = mock.Mock()
         session.query.return_value.filter_by.return_value.first.return_value = site
         with contextlib.ExitStack() as stack:
@@ -765,7 +824,7 @@ class MultitenancyDeleteCacheTests(unittest.TestCase):
 
     def test_delete_purges_cache_on_success(self):
         purge, ctrl = self._run_delete(returncode=0)
-        purge.assert_called_once_with(ctrl, 'example.com', 'example_com_')
+        purge.assert_called_once_with(ctrl, 'example.com', 'example_com_', 3)
 
     def test_delete_skips_purge_when_site_delete_fails(self):
         purge, ctrl = self._run_delete(returncode=1)
@@ -891,6 +950,7 @@ class MultitenancyRenameTests(unittest.TestCase):
             mt_site.php_version = '8.4'
             mt_site.is_ssl = old_ssl
             mt_site.redis_prefix = 'old_example_com_'
+            mt_site.redis_db = 3
 
         session = mock.Mock()
         session.query.return_value.filter_by.return_value.first.return_value = mt_site
@@ -1150,8 +1210,8 @@ class MultitenancyRenameTests(unittest.TestCase):
             is_ssl=False,
         )
         self.assertEqual(calls['purge_site_cache'].call_args_list, [
-            mock.call(ctrl, 'old.example.com', 'old_example_com_'),
-            mock.call(ctrl, 'new.example.com', 'new_example_com_'),
+            mock.call(ctrl, 'old.example.com', 'old_example_com_', 3),
+            mock.call(ctrl, 'new.example.com', 'new_example_com_', 3),
         ])
 
         self.assertLess(self._first_call_index(manager, 'rename'), self._first_call_index(manager, 'relink_core_files'))

@@ -541,7 +541,7 @@ require __DIR__ . '/wp/wp-blog-header.php';
             return False
     
     @staticmethod
-    def generate_wp_config(app, site_root, domain, db_name, db_user, db_pass, db_host, redis_prefix=None):
+    def generate_wp_config(app, site_root, domain, db_name, db_user, db_pass, db_host, redis_prefix=None, redis_db=0):
         """
         Generate wp-config.php for shared WordPress site with shared config include.
         
@@ -606,8 +606,8 @@ define('WP_REDIS_CONFIG', [
     'token' => 'e279430effe043b8c17d3f3c751c4c0846bc70c97f0eaaea766b4079001c',
     'host' => '127.0.0.1',
     'port' => 6379,
-    'database' => 0,  // All sites use database 0 with unique prefixes
-    'prefix' => '{redis_prefix}',  // UNIQUE PER SITE for cache isolation
+    'database' => {redis_db},  // Dedicated per-site database: OCP flushes via FLUSHDB, sharing one db lets tenants wipe each other
+    'prefix' => '{redis_prefix}',  // Per-site key prefix (isolation within the db, debuggability)
     'timeout' => 0.5,
     'read_timeout' => 0.5,
     'retry_interval' => 10,
@@ -706,7 +706,7 @@ if (!defined('WP_CLI')) {{
         # Set secure permissions (readable by www-data)
         os.chmod(wp_config_path, 0o640)
         Log.debug(app, f"Generated wp-config.php with shared config include at {wp_config_path}")
-        Log.debug(app, f"Redis prefix for {domain}: {redis_prefix}")
+        Log.debug(app, f"Redis prefix for {domain}: {redis_prefix} (db {redis_db})")
 
     @staticmethod
     def rewrite_wp_config_for_rename(app, site_root, old_domain, new_domain, new_redis_prefix, tracked_old_redis_prefix=None):
@@ -995,7 +995,7 @@ server {{
             return False
 
     @staticmethod
-    def purge_site_cache(app, domain, redis_prefix=None):
+    def purge_site_cache(app, domain, redis_prefix=None, redis_db=None):
         """Purge a tenant's stale caches so a (re)created domain never inherits them.
 
         The nginx FastCGI page cache (keyed by ``$scheme$request_method$host``)
@@ -1029,8 +1029,19 @@ server {{
                         app, f"Purged {len(files)} FastCGI cache entries for {domain}")
             except Exception as e:
                 Log.debug(app, f"FastCGI cache purge for {domain} failed: {e}")
-        # Redis object cache: delete only this tenant's prefixed keys.
-        if redis_prefix:
+        # Redis object cache: a tenant with a dedicated database is flushed
+        # wholesale; legacy tenants on shared db 0 fall back to prefix-scoped
+        # key deletion.
+        if redis_db:
+            try:
+                subprocess.run(
+                    ['redis-cli', '-n', str(redis_db), 'flushdb', 'async'],
+                    capture_output=True, text=True, timeout=30
+                )
+                Log.debug(app, f"Flushed Redis database {redis_db} for {domain}")
+            except Exception as e:
+                Log.debug(app, f"Redis flush of db {redis_db} for {domain} failed: {e}")
+        elif redis_prefix:
             try:
                 scan = subprocess.run(
                     ['redis-cli', '--scan', '--pattern', redis_prefix + '*'],
@@ -1047,6 +1058,70 @@ server {{
                         app, f"Purged {len(keys)} Redis object-cache keys for {redis_prefix}")
             except Exception as e:
                 Log.debug(app, f"Redis object-cache purge for {redis_prefix} failed: {e}")
+
+    @staticmethod
+    def ensure_redis_databases(app, needed):
+        """Make sure the Redis server has at least ``needed`` databases.
+
+        Redis defaults to 16 and ``databases`` is not runtime-tunable, so when
+        the fleet outgrows it the config file is raised (with headroom) and
+        Redis restarted. The restart only drops cached data; tenants rebuild
+        their object caches on the next request.
+        """
+        try:
+            current = subprocess.run(
+                ['redis-cli', 'config', 'get', 'databases'],
+                capture_output=True, text=True, timeout=10
+            )
+            fields = current.stdout.split()
+            configured = int(fields[1]) if len(fields) > 1 else 16
+        except Exception as e:
+            Log.debug(app, f"Could not read Redis databases setting: {e}")
+            return
+        if configured >= needed:
+            return
+        target = max(needed, 256)
+        conf = '/etc/redis/redis.conf'
+        try:
+            with open(conf, 'r') as f:
+                content = f.read()
+            new_content, count = re.subn(
+                r'(?m)^databases\s+\d+', f'databases {target}', content)
+            if count == 0:
+                new_content = content.rstrip('\n') + f'\ndatabases {target}\n'
+            with open(conf, 'w') as f:
+                f.write(new_content)
+        except Exception as e:
+            Log.error(app, f"Failed to raise Redis databases to {target} in {conf}: {e}")
+        Log.info(app, f"Raising Redis databases {configured} -> {target} (restarting Redis)")
+        if not WOService.restart_service(app, 'redis-server'):
+            Log.error(app, "Redis restart failed after raising databases limit")
+
+    @staticmethod
+    def set_wp_config_redis_db(app, site_root, redis_db):
+        """Point an existing tenant's WP_REDIS_CONFIG at its dedicated database.
+
+        Rewrites the first ``'database' => N,`` entry (only WP_REDIS_CONFIG
+        carries one in generated configs). Returns True when wp-config.php now
+        holds the new value.
+        """
+        wp_config = f"{site_root}/htdocs/wp-config.php"
+        try:
+            with open(wp_config, 'r') as f:
+                content = f.read()
+            new_content, count = re.subn(
+                r"('database'\s*=>\s*)\d+,[^\n]*",
+                f"\\g<1>{redis_db},  // Dedicated per-site database: OCP flushes via FLUSHDB, sharing one db lets tenants wipe each other",
+                content, count=1)
+            if count == 0:
+                Log.warn(app, f"No 'database' key found in {wp_config}; skipped")
+                return False
+            with open(wp_config, 'w') as f:
+                f.write(new_content)
+            return True
+        except Exception as e:
+            Log.warn(app, f"Failed to set Redis database in {wp_config}: {e}")
+            return False
 
     @staticmethod
     def get_admin_password(app, domain):
