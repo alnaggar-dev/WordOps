@@ -193,18 +193,18 @@ class MTFunctions:
                 return True
             else:
                 if log_errors:
-                    Log.error(app, f"Nginx configuration test failed!")
-                    Log.error(app, f"Error: {result.stderr.strip()}")
-                    Log.error(app, f"Output: {result.stdout.strip()}")
+                    Log.error(app, "Nginx configuration test failed!", exit=False)
+                    Log.error(app, f"Error: {result.stderr.strip()}", exit=False)
+                    Log.error(app, f"Output: {result.stdout.strip()}", exit=False)
                 return False
 
         except subprocess.TimeoutExpired:
             if log_errors:
-                Log.error(app, "Nginx configuration test timed out")
+                Log.error(app, "Nginx configuration test timed out", exit=False)
             return False
         except Exception as e:
             if log_errors:
-                Log.error(app, f"Nginx configuration test error: {e}")
+                Log.error(app, f"Nginx configuration test error: {e}", exit=False)
             return False
 
     @staticmethod
@@ -387,9 +387,10 @@ class MTFunctions:
             test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=30)
 
             if test_result.returncode != 0:
-                Log.error(app, f"Nginx configuration test failed before reload:")
-                Log.error(app, f"Error: {test_result.stderr}")
-                Log.error(app, f"Output: {test_result.stdout}")
+                Log.error(app, "Nginx configuration test failed before reload:",
+                          exit=False)
+                Log.error(app, f"Error: {test_result.stderr}", exit=False)
+                Log.error(app, f"Output: {test_result.stdout}", exit=False)
                 return False
 
             # Try systemctl reload first
@@ -412,13 +413,15 @@ class MTFunctions:
                 return True
 
             # Both methods failed
-            Log.error(app, f"All nginx reload methods failed for {domain}")
-            Log.error(app, f"systemctl error: {reload_result.stderr}")
-            Log.error(app, f"signal error: {signal_result.stderr}")
+            Log.error(app, f"All nginx reload methods failed for {domain}",
+                      exit=False)
+            Log.error(app, f"systemctl error: {reload_result.stderr}", exit=False)
+            Log.error(app, f"signal error: {signal_result.stderr}", exit=False)
             return False
 
         except Exception as e:
-            Log.error(app, f"Exception during nginx reload for {domain}: {e}")
+            Log.error(app, f"Exception during nginx reload for {domain}: {e}",
+                      exit=False)
             return False
     
     @staticmethod
@@ -923,7 +926,7 @@ server {{
             Log.debug(app, f"WordPress installed for {domain}")
             
         except subprocess.CalledProcessError as e:
-            Log.error(app, f"Failed to install WordPress: {e.stderr}")
+            Log.error(app, f"Failed to install WordPress: {e.stderr}", exit=False)
             raise
 
         # Force the permalink into the DB before the object-cache drop-in
@@ -961,7 +964,8 @@ server {{
             )
             Log.debug(app, f"Permalink structure set to Post name for {domain}")
         except subprocess.CalledProcessError as e:
-            Log.error(app, f"Failed to set permalink structure: {e.stderr}")
+            Log.error(app, f"Failed to set permalink structure: {e.stderr}",
+                      exit=False)
             raise
 
     @staticmethod
@@ -1411,9 +1415,10 @@ server {{
             return False
 
     @staticmethod
-    def cleanup_failed_site(app, domain, site_root):
+    def cleanup_failed_site(app, domain, site_root,
+                            db_name=None, db_user=None, db_grant_host=None):
         """Cleanup partially created site on failure"""
-        from wo.cli.plugins.sitedb import deleteSiteInfo
+        from wo.cli.plugins.sitedb import deleteSiteInfo, getSiteInfo
         from wo.core.fileutils import WOFileUtils
 
         Log.debug(app, f"Starting cleanup for failed site: {domain}")
@@ -1443,10 +1448,25 @@ server {{
             except Exception as e:
                 Log.debug(app, f"Could not remove site directory {site_root}: {e}")
 
-        # Remove from WordOps database if exists
+        # Drop the tenant database and user if setupdatabase got that far.
+        # db_grant_host is the DROP USER host (wo_mysql_grant_host), not the
+        # WordPress connection host.
+        if db_name:
+            try:
+                from wo.cli.plugins.site_functions import deleteDB
+                deleteDB(app, db_name, db_user or 'root',
+                         db_grant_host or 'localhost', exit=False)
+                Log.debug(app, f"Dropped database {db_name} during cleanup")
+            except Exception as e:
+                Log.debug(app, f"Could not drop database {db_name}: {e}")
+
+        # Remove from WordOps database if a record exists. deleteSiteInfo
+        # exits on a missing record, so guard with getSiteInfo: failures
+        # before addNewSite have nothing to remove.
         try:
-            deleteSiteInfo(app, domain)
-            Log.debug(app, f"Removed {domain} from WordOps database")
+            if getSiteInfo(app, domain):
+                deleteSiteInfo(app, domain)
+                Log.debug(app, f"Removed {domain} from WordOps database")
         except Exception as e:
             Log.debug(app, f"Could not remove {domain} from WordOps database: {e}")
 

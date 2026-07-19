@@ -1,5 +1,7 @@
 """WordOps log module"""
 
+import sys
+
 
 class Log:
     """
@@ -15,11 +17,21 @@ class Log:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
+    @staticmethod
+    def _print(msg, end='\n'):
+        """print() that degrades instead of raising when stdout cannot
+        encode the message (e.g. emoji on a non-UTF-8 locale)."""
+        try:
+            print(msg, end=end)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or 'ascii'
+            print(msg.encode(enc, errors='replace').decode(enc), end=end)
+
     def error(self, msg, exit=True):
         """
         Logs error into log file
         """
-        print(Log.FAIL + msg + Log.ENDC)
+        Log._print(Log.FAIL + msg + Log.ENDC)
         self.app.log.error(Log.FAIL + msg + Log.ENDC)
         if exit:
             self.app.close(1)
@@ -29,7 +41,7 @@ class Log:
         Logs info messages into log file
         """
 
-        print(Log.OKBLUE + msg + Log.ENDC, end=end)
+        Log._print(Log.OKBLUE + msg + Log.ENDC, end=end)
         if log:
             self.app.log.info(Log.OKBLUE + msg + Log.ENDC)
 
@@ -37,7 +49,7 @@ class Log:
         """
         Logs warning into log file
         """
-        print(Log.WARNING + msg + Log.ENDC)
+        Log._print(Log.WARNING + msg + Log.ENDC)
         self.app.log.warning(Log.BOLD + msg + Log.ENDC)
 
     def debug(self, msg):
@@ -52,7 +64,7 @@ class Log:
         """
         space_to_add = int(31 - len(msg[0:31]))
         space = "                             "
-        print(
+        Log._print(
             Log.OKBLUE + "{0}".format(msg[0:31]) +
             "{0}".format(space[0:space_to_add]) +
             " [" + Log.ENDC + ".." + Log.OKBLUE + "]" + Log.ENDC, end=end)
@@ -65,7 +77,7 @@ class Log:
         """
         space_to_add = int(31 - len(msg[0:31]))
         space = "                              "
-        print(
+        Log._print(
             Log.OKBLUE + "{0}".format(msg[0:31]) +
             "{0}".format(space[0:space_to_add]) +
             " [" + Log.ENDC + Log.OKGREEN + "OK" +
@@ -79,7 +91,7 @@ class Log:
         """
         space_to_add = int(31 - len(msg[0:31]))
         space = "                             "
-        print(
+        Log._print(
             Log.OKBLUE + "{0}".format(msg[0:31]) +
             "{0}".format(space[0:space_to_add]) +
             " [" + Log.ENDC + Log.FAIL + "KO" +

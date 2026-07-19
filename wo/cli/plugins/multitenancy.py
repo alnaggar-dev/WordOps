@@ -294,6 +294,10 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, f"   PHP version: {php_version}")
         Log.info(self, f"   Cache type: {cache_type}")
 
+        # Initialized before the try so the failure handler can drop whatever
+        # setupdatabase managed to create before the exception.
+        db_name = db_user = db_grant_host = None
+
         try:
             # Create site directory structure
             site_root = f"/var/www/{wo_domain}"
@@ -310,12 +314,14 @@ class WOMultitenancyController(CementBaseController):
             }
             db_data = setupdatabase(self, db_data)
             if not db_data or not all(k in db_data for k in ['wo_db_name', 'wo_db_user', 'wo_db_pass', 'wo_db_host']):
-                Log.error(self, "Failed to create database")
+                raise Exception("Failed to create database")
             
             db_name = db_data['wo_db_name']
             db_user = db_data['wo_db_user']
             db_pass = db_data['wo_db_pass']
             db_host = db_data['wo_db_host']
+            # DROP USER host for cleanup; distinct from the connection host.
+            db_grant_host = db_data.get('wo_mysql_grant_host', 'localhost')
             
             # Create symlinks to shared infrastructure
             Log.info(self, "Linking to shared WordPress core...")
@@ -431,9 +437,9 @@ class WOMultitenancyController(CementBaseController):
             setwebrootpermissions(self, site_htdocs)
             
             # Test nginx configuration before enabling site
-            if not MTFunctions.validate_nginx_config(self, log_errors=True):
-                Log.error(self, "Nginx configuration validation failed before enabling site")
-                raise Exception("Invalid nginx configuration")
+            if not MTFunctions.validate_nginx_config_recoverable(self, log_errors=True):
+                raise Exception("Nginx configuration validation failed "
+                                "before enabling site")
 
             # Enable site in nginx first (without SSL)
             WOFileUtils.create_symlink(self, [
@@ -442,9 +448,8 @@ class WOMultitenancyController(CementBaseController):
             ])
 
             # Test nginx configuration after enabling site
-            if not MTFunctions.validate_nginx_config(self, log_errors=True):
-                Log.error(self, "Nginx configuration validation failed after enabling site")
-                # Remove the symlink we just created
+            if not MTFunctions.validate_nginx_config_recoverable(self, log_errors=True):
+                # Remove the symlink we just created before failing
                 if os.path.exists(f"/etc/nginx/sites-enabled/{wo_domain}"):
                     os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
                 raise Exception("Nginx configuration invalid after enabling site")
@@ -452,12 +457,13 @@ class WOMultitenancyController(CementBaseController):
             # Reload nginx using our enhanced function
             try:
                 if not MTFunctions.safe_nginx_reload(self, wo_domain):
-                    Log.error(self, "Failed to reload nginx with enhanced diagnostics")
-                    raise Exception("Nginx reload failed")
+                    raise Exception("Failed to reload nginx "
+                                    "(see diagnostics above)")
                 else:
                     Log.debug(self, "Nginx reloaded successfully")
             except Exception as reload_error:
-                Log.error(self, f"Nginx reload error: {reload_error}")
+                Log.error(self, f"Nginx reload error: {reload_error}",
+                          exit=False)
                 # Try to disable the site and reload to restore working state
                 if os.path.exists(f"/etc/nginx/sites-enabled/{wo_domain}"):
                     os.remove(f"/etc/nginx/sites-enabled/{wo_domain}")
@@ -555,14 +561,18 @@ class WOMultitenancyController(CementBaseController):
 
         except Exception as e:
             Log.info(self, f"site_create_failed target={wo_domain} result=failure")
-            Log.error(self, f"Failed to create site: {str(e)}")
-            # Cleanup failed site creation
+            # Cleanup must run before Log.error: Log.error exits the process,
+            # so anything after it in this handler is unreachable.
             try:
                 Log.info(self, "Attempting cleanup of partially created site...")
-                MTFunctions.cleanup_failed_site(self, wo_domain, site_root)
+                MTFunctions.cleanup_failed_site(
+                    self, wo_domain, site_root,
+                    db_name=db_name, db_user=db_user,
+                    db_grant_host=db_grant_host)
                 Log.info(self, "Cleanup completed")
             except Exception as cleanup_error:
                 Log.warn(self, f"Cleanup failed: {cleanup_error}")
+            Log.error(self, f"Failed to create site: {str(e)}")
             return False
 
     @expose(help="Update WordPress core and plugins for all shared sites")

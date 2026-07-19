@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -68,7 +69,8 @@ class MultitenancyTests(unittest.TestCase):
             fh.write(content)
 
 
-    def _run_create_impl_with_mocks(self, cache_type='wpfc', baseline=None, manager=None):
+    def _run_create_impl_with_mocks(self, cache_type='wpfc', baseline=None, manager=None,
+                                    install_fails=False, nginx_validate_results=None):
         domain = 'example.com'
         shared_root = '/var/www/shared'
         if baseline is None:
@@ -78,13 +80,16 @@ class MultitenancyTests(unittest.TestCase):
         pargs.letsencrypt = False
         pargs.admin_user = 'admin'
         pargs.admin_email = 'admin@example.com'
+        pargs.wpredis = False
         ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
         ctrl.app = mock.Mock()
         ctrl.app.pargs = pargs
 
         with contextlib.ExitStack() as stack:
+            log_mocks = {}
             for method in ('info', 'warn', 'error', 'debug'):
-                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+                log_mocks[method] = stack.enter_context(
+                    mock.patch(f'wo.core.logging.Log.{method}'))
             stack.enter_context(mock.patch.object(mt.WODomain, 'validate', return_value=domain))
             stack.enter_context(mock.patch.object(mt, 'check_domain_exists', return_value=False))
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'is_initialized', return_value=True))
@@ -96,7 +101,13 @@ class MultitenancyTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'preflight_shared_config', return_value=True))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_php_version', return_value='8.4'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'get_cache_type', return_value=cache_type))
-            stack.enter_context(mock.patch.object(mt, 'site_package_check'))
+            spc_seen = {}
+
+            def _spc_side_effect(app_self, stype):
+                spc_seen['wpredis'] = app_self.app.pargs.wpredis
+
+            stack.enter_context(mock.patch.object(
+                mt, 'site_package_check', side_effect=_spc_side_effect))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'create_site_directories'))
             stack.enter_context(mock.patch.object(
                 mt,
@@ -114,7 +125,18 @@ class MultitenancyTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'ensure_redis_databases'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_wp_config'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'generate_nginx_config', return_value='nginx.conf'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
+            if install_fails:
+                # Leave the real install_wordpress in place and fail its
+                # wp-cli subprocess, exercising the helper's exit=False
+                # log-then-raise path end to end.
+                stack.enter_context(mock.patch.object(
+                    mtf.subprocess, 'run',
+                    side_effect=subprocess.CalledProcessError(
+                        1, ['wp', 'core', 'install'], stderr='wp core install failed')))
+            else:
+                stack.enter_context(mock.patch.object(mt.MTFunctions, 'install_wordpress'))
+            cleanup_mock = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'cleanup_failed_site'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'purge_site_cache'))
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_baseline_version', return_value=7))
             stack.enter_context(mock.patch.object(mt.os.path, 'exists', return_value=True))
@@ -132,8 +154,19 @@ class MultitenancyTests(unittest.TestCase):
             if manager is not None:
                 manager.attach_mock(apply_baseline, 'apply_baseline_to_site')
                 manager.attach_mock(set_permalink, 'set_permalink_structure')
+                manager.attach_mock(cleanup_mock, 'cleanup_failed_site')
+                manager.attach_mock(log_mocks['error'], 'log_error')
             stack.enter_context(mock.patch.object(mt, 'setwebrootpermissions'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'validate_nginx_config', return_value=True))
+            if nginx_validate_results is None:
+                stack.enter_context(mock.patch.object(
+                    mt.MTFunctions, 'validate_nginx_config_recoverable',
+                    return_value=True))
+            else:
+                stack.enter_context(mock.patch.object(
+                    mt.MTFunctions, 'validate_nginx_config_recoverable',
+                    side_effect=nginx_validate_results))
+            os_remove = stack.enter_context(mock.patch.object(mt.os, 'remove'))
+            stack.enter_context(mock.patch.object(mt.os, 'chmod'))
             stack.enter_context(mock.patch.object(mt.WOFileUtils, 'create_symlink'))
             stack.enter_context(mock.patch.object(mt.MTFunctions, 'safe_nginx_reload', return_value=True))
             stack.enter_context(mock.patch.object(mt.MTDatabase, 'get_current_release', return_value='current'))
@@ -148,6 +181,11 @@ class MultitenancyTests(unittest.TestCase):
         return {
             'apply_baseline': apply_baseline,
             'set_permalink_structure': set_permalink,
+            'pargs': pargs,
+            'wpredis_during_package_check': spc_seen.get('wpredis'),
+            'cleanup_failed_site': cleanup_mock,
+            'log_error': log_mocks['error'],
+            'os_remove': os_remove,
         }
 
     @unittest.skipIf(shutil.which('php') is None, 'php not on PATH')
@@ -235,6 +273,114 @@ class MultitenancyTests(unittest.TestCase):
             if call[0] == 'set_permalink_structure'
         )
         self.assertLess(apply_index, permalink_index)
+
+    def test_create_forces_redis_package_check_and_restores_flag(self):
+        """Shared-core sites always ship the Object Cache Pro drop-in, so
+        create must force the redis package check even for non-redis cache
+        types, then restore the user's original --wpredis flag."""
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+
+        calls = self._run_create_impl_with_mocks(cache_type='basic')
+
+        self.assertIs(calls['wpredis_during_package_check'], True)
+        self.assertIs(calls['pargs'].wpredis, False)
+
+    @staticmethod
+    def _exiting_error_index(manager):
+        """Index of the first Log.error call that exits (no exit=False)."""
+        return next(
+            index for index, call in enumerate(manager.mock_calls)
+            if call[0] == 'log_error' and call[2].get('exit', True)
+        )
+
+    def test_create_failure_runs_cleanup_before_exiting_error(self):
+        """A real install_wordpress failure (wp-cli CalledProcessError, logged
+        with exit=False then raised) must reach the create failure handler,
+        which runs cleanup_failed_site before the exiting Log.error."""
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+        manager = mock.Mock()
+
+        calls = self._run_create_impl_with_mocks(manager=manager, install_fails=True)
+
+        names = [call[0] for call in manager.mock_calls]
+        self.assertIn('cleanup_failed_site', names)
+        # Cleanup must receive the tenant DB credentials so it can drop them.
+        cleanup_kwargs = calls['cleanup_failed_site'].call_args.kwargs
+        self.assertEqual(cleanup_kwargs['db_name'], 'db')
+        self.assertEqual(cleanup_kwargs['db_user'], 'user')
+        self.assertEqual(cleanup_kwargs['db_grant_host'], 'localhost')
+        # The helper must have logged its own diagnostic without exiting.
+        self.assertTrue(any(
+            call[0] == 'log_error' and call[2].get('exit') is False
+            for call in manager.mock_calls))
+        self.assertLess(names.index('cleanup_failed_site'),
+                        self._exiting_error_index(manager))
+
+    def test_create_nginx_validate_failure_recovers_then_cleans_up(self):
+        """When nginx validation fails after the site symlink is enabled,
+        create must not exit on the spot: it must remove the symlink it just
+        created, then run cleanup_failed_site before the exiting Log.error.
+        Guards against inner default-exit Log.error calls bypassing both."""
+        if mt is None:
+            self.skipTest(f"multitenancy controller import unavailable: {_mt_import_error}")
+        manager = mock.Mock()
+
+        calls = self._run_create_impl_with_mocks(
+            manager=manager, nginx_validate_results=[True, False])
+
+        calls['os_remove'].assert_called_once_with(
+            '/etc/nginx/sites-enabled/example.com')
+        names = [call[0] for call in manager.mock_calls]
+        self.assertIn('cleanup_failed_site', names)
+        self.assertIn('log_error', names)
+        self.assertLess(names.index('cleanup_failed_site'),
+                        self._exiting_error_index(manager))
+
+    @contextlib.contextmanager
+    def _cleanup_failed_site_mocks(self, site_record=None):
+        """Isolate cleanup_failed_site from FS, nginx, and the app DBs."""
+        with contextlib.ExitStack() as stack:
+            for method in ('info', 'warn', 'error', 'debug'):
+                stack.enter_context(mock.patch(f'wo.core.logging.Log.{method}'))
+            stack.enter_context(mock.patch.object(mtf.os.path, 'exists', return_value=False))
+            stack.enter_context(mock.patch.object(mtf.os, 'listdir', return_value=[]))
+            get_info = stack.enter_context(mock.patch(
+                'wo.cli.plugins.sitedb.getSiteInfo', return_value=site_record))
+            delete_info = stack.enter_context(mock.patch(
+                'wo.cli.plugins.sitedb.deleteSiteInfo'))
+            delete_db = stack.enter_context(mock.patch(
+                'wo.cli.plugins.site_functions.deleteDB'))
+            stack.enter_context(mock.patch(
+                'wo.cli.plugins.multitenancy_db.MTDatabase.remove_shared_site'))
+            stack.enter_context(mock.patch.object(
+                MTFunctions, 'validate_nginx_config', return_value=False))
+            yield {'getSiteInfo': get_info, 'deleteSiteInfo': delete_info,
+                   'deleteDB': delete_db}
+
+    def test_cleanup_failed_site_drops_db_user_at_grant_host(self):
+        """Cleanup must drop the tenant DB/user via deleteDB(exit=False),
+        using the grant host (DROP USER host), when credentials are known."""
+        app = mock.Mock()
+        with self._cleanup_failed_site_mocks(site_record=object()) as mocks:
+            MTFunctions.cleanup_failed_site(
+                app, 'example.com', '/var/www/example.com',
+                db_name='dbn', db_user='dbu', db_grant_host='ghost')
+        mocks['deleteDB'].assert_called_once_with(
+            app, 'dbn', 'dbu', 'ghost', exit=False)
+        mocks['deleteSiteInfo'].assert_called_once_with(app, 'example.com')
+
+    def test_cleanup_failed_site_survives_missing_record_and_creds(self):
+        """Failures before addNewSite/setupdatabase leave no sitedb record and
+        no credentials: cleanup must skip deleteSiteInfo (which exits on a
+        missing record) and deleteDB, and complete without raising."""
+        app = mock.Mock()
+        with self._cleanup_failed_site_mocks(site_record=None) as mocks:
+            MTFunctions.cleanup_failed_site(
+                app, 'example.com', '/var/www/example.com')
+        mocks['deleteDB'].assert_not_called()
+        mocks['deleteSiteInfo'].assert_not_called()
 
 
     def test_load_config_parses_wordpress_sources_without_legacy_defaults(self):
