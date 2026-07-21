@@ -77,23 +77,23 @@ class WOCleanController(CementBaseController):
         if (os.path.exists('/usr/sbin/nginx') and
                 os.path.exists(
                     '/var/www/22222/htdocs/cache/opcache')):
-            try:
-                Log.info(self, "Cleaning opcache")
-                wo_php_version = list(WOVar.wo_php_versions.keys())
-                for wo_php in wo_php_version:
-                    if os.path.exists('{0}{1}.php'.format(opcache_dir, wo_php)):
-                        requests.get(
-                            "http://127.0.0.1/cache/opcache/{0}.php".format(wo_php))
-
-            except requests.HTTPError as e:
-                Log.debug(self, "{0}".format(e))
-                Log.debug(self, "Unable hit url, "
-                          " http://127.0.0.1/cache/opcache/"
-                          "phpXX.php,"
-                          " please check you have admin tools installed")
-                Log.debug(self, "please check you have admin tools installed,"
-                          " or install them with `wo stack install --admin`")
-                Log.error(self, "Unable to clean opcache", False)
+            Log.info(self, "Cleaning opcache")
+            wo_php_version = list(WOVar.wo_php_versions.keys())
+            for wo_php in wo_php_version:
+                if not os.path.exists(
+                        '{0}{1}.php'.format(opcache_dir, wo_php)):
+                    continue
+                try:
+                    r = requests.get(
+                        "http://127.0.0.1/cache/opcache/{0}.php"
+                        .format(wo_php), timeout=5)
+                    if r.status_code != 200:
+                        Log.warn(self, "Unable to clean opcache for {0} "
+                                 "(HTTP {1})".format(wo_php, r.status_code))
+                except requests.exceptions.RequestException as e:
+                    Log.debug(self, "{0}".format(e))
+                    Log.warn(self, "Unable to clean opcache for {0}"
+                             .format(wo_php))
 
 
 def load(app):

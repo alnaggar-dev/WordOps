@@ -179,9 +179,11 @@ class MTDatabase:
             
             session.commit()
             Log.debug(app, "Configuration saved to database")
-                
+            return True
+
         except Exception as e:
-            Log.error(app, f"Failed to save configuration: {e}")
+            Log.error(app, f"Failed to save configuration: {e}", False)
+            return False
     
     @staticmethod
     def get_config(app, key):
@@ -261,9 +263,11 @@ class MTDatabase:
             
             session.commit()
             Log.debug(app, f"Updated current release to {release_name}")
-                
+            return True
+
         except Exception as e:
-            Log.error(app, f"Failed to update release: {e}")
+            Log.error(app, f"Failed to update release: {e}", False)
+            return False
     
     @staticmethod
     def get_baseline_version(app):

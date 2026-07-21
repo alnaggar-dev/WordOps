@@ -206,6 +206,41 @@ class MultitenancyTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertFalse(log_error.called)
 
+    def test_lint_php_file_failure_paths_never_exit(self):
+        """Every lint_php_file failure reports with exit=False (recoverable)."""
+        app = mock.Mock()
+        cfg = os.path.join(self.tmp, 'present.php')
+        with open(cfg, 'w') as fh:
+            fh.write('<?php\n')
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.error') as log_error, \
+                mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            # Required file absent
+            self.assertFalse(mtf.lint_php_file(
+                app, os.path.join(self.tmp, 'missing.php')))
+            # php missing from PATH but required
+            with mock.patch.object(mtf.shutil, 'which', return_value=None):
+                self.assertFalse(mtf.lint_php_file(
+                    app, cfg, php_missing_ok=False))
+            # php -l crashes
+            with mock.patch.object(mtf.shutil, 'which',
+                                   return_value='/usr/bin/php'), \
+                    mock.patch.object(mtf.subprocess, 'run',
+                                      side_effect=OSError('boom')):
+                self.assertFalse(mtf.lint_php_file(app, cfg))
+            # Real syntax error
+            with mock.patch.object(mtf.shutil, 'which',
+                                   return_value='/usr/bin/php'), \
+                    mock.patch.object(
+                        mtf.subprocess, 'run',
+                        return_value=mock.Mock(returncode=255,
+                                               stderr='Parse error')):
+                self.assertFalse(mtf.lint_php_file(app, cfg))
+        self.assertEqual(len(log_error.call_args_list), 4)
+        for call in log_error.call_args_list:
+            exiting = call.kwargs.get(
+                'exit', call.args[2] if len(call.args) > 2 else True)
+            self.assertIs(exiting, False)
+
     def test_maintenance_enable_omits_admin_regex(self):
         """The nginx render context no longer carries admin-IP bypass keys."""
         if mt is None:
@@ -466,14 +501,16 @@ url-only = https://example.com/url-only.zip
             failures = infra.seed_plugins_and_themes(config)
 
         self.assertEqual(failures, [])
-        download_plugin.assert_called_once_with('wp-source', force=False)
+        download_plugin.assert_called_once_with(
+            'wp-source', version='latest', force=False)
         download_github.assert_called_once_with('owner/repo', 'github-duplicate', branch='main', force=False)
         download_url.assert_called_once_with(
             'https://example.com/url-duplicate.zip',
             'url-duplicate',
             force=False,
         )
-        download_theme.assert_called_once_with('wp-theme', force=False)
+        download_theme.assert_called_once_with(
+            'wp-theme', version='latest', force=False)
         download_theme_github.assert_called_once_with('owner/theme', 'github-theme', branch='main', force=False)
         download_theme_url.assert_called_once_with(
             'https://example.com/url-theme.zip',
@@ -502,14 +539,16 @@ url-only = https://example.com/url-only.zip
             failures = infra.seed_plugins_and_themes(config, force=True)
 
         self.assertEqual(failures, [])
-        download_plugin.assert_called_once_with('wp-source', force=True)
+        download_plugin.assert_called_once_with(
+            'wp-source', version='latest', force=True)
         download_github.assert_called_once_with('owner/repo', 'gh-plugin', branch='main', force=True)
         download_url.assert_called_once_with(
             'https://example.com/url-plugin.zip',
             'url-plugin',
             force=True,
         )
-        download_theme.assert_called_once_with('wp-theme', force=True)
+        download_theme.assert_called_once_with(
+            'wp-theme', version='latest', force=True)
         download_theme_github.assert_called_once_with('owner/theme', 'gh-theme', branch='main', force=True)
         download_theme_url.assert_called_once_with(
             'https://example.com/url-theme.zip',
@@ -531,10 +570,11 @@ url-only = https://example.com/url-only.zip
 
         self.assertEqual(failures, [])
         self.assertEqual(download_plugin.call_args_list, [
-            mock.call('legacy-one', force=False),
-            mock.call('legacy-two', force=False),
+            mock.call('legacy-one', version='latest', force=False),
+            mock.call('legacy-two', version='latest', force=False),
         ])
-        download_theme.assert_called_once_with('legacy-theme', force=False)
+        download_theme.assert_called_once_with(
+            'legacy-theme', version='latest', force=False)
 
     def test_create_baseline_config_leaves_existing_file_byte_identical(self):
         """bootstrap must never rewrite an operator-owned baseline.json."""
@@ -952,6 +992,7 @@ class MultitenancyDeleteCacheTests(unittest.TestCase):
         site = mock.Mock()
         site.redis_prefix = 'example_com_'
         site.redis_db = 3
+        site.php_version = '8.4'
         session = mock.Mock()
         session.query.return_value.filter_by.return_value.first.return_value = site
         with contextlib.ExitStack() as stack:
@@ -965,16 +1006,20 @@ class MultitenancyDeleteCacheTests(unittest.TestCase):
                 return_value=mock.Mock(returncode=returncode, stdout='', stderr='err'),
             ))
             purge = stack.enter_context(mock.patch.object(mt.MTFunctions, 'purge_site_cache'))
+            reset = stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'reset_opcache', return_value=True))
             ctrl._delete_impl()
-        return purge, ctrl
+        return purge, reset, ctrl
 
     def test_delete_purges_cache_on_success(self):
-        purge, ctrl = self._run_delete(returncode=0)
+        purge, reset, ctrl = self._run_delete(returncode=0)
         purge.assert_called_once_with(ctrl, 'example.com', 'example_com_', 3)
+        reset.assert_called_once_with(ctrl, php_key='php84')
 
     def test_delete_skips_purge_when_site_delete_fails(self):
-        purge, ctrl = self._run_delete(returncode=1)
+        purge, reset, ctrl = self._run_delete(returncode=1)
         purge.assert_not_called()
+        reset.assert_not_called()
 
 
 class MultitenancyRenameTests(unittest.TestCase):
@@ -3612,9 +3657,12 @@ bare-theme = owner/theme
                 mock.patch('wo.core.logging.Log.warn'), \
                 mock.patch('wo.core.logging.Log.error'), \
                 mock.patch('wo.core.logging.Log.debug'):
-            ok, backup_records = infra.update_plugins_and_themes(config)
+            ok, backup_records, restore_ok = (
+                infra.update_plugins_and_themes(config)
+            )
 
         self.assertTrue(ok)
+        self.assertTrue(restore_ok)
         self.assertIsInstance(backup_records, list)
         download_plugin.assert_called_once_with(
             'wp-source',
@@ -3670,9 +3718,12 @@ bare-theme = owner/theme
                 mock.patch('wo.core.logging.Log.warn') as log_warn, \
                 mock.patch('wo.core.logging.Log.error'), \
                 mock.patch('wo.core.logging.Log.debug'):
-            ok, backup_records = infra.update_plugins_and_themes({})
+            ok, backup_records, restore_ok = (
+                infra.update_plugins_and_themes({})
+            )
 
         self.assertTrue(ok)
+        self.assertTrue(restore_ok)
         self.assertIsInstance(backup_records, list)
         dispatch.assert_called_once_with(
             'plugin',
@@ -3717,9 +3768,19 @@ bare-theme = owner/theme
                 mock.patch('wo.core.logging.Log.debug'):
             result = infra.update_plugins_and_themes({})
 
-        self.assertEqual(result, (False, []))
+        # Real records are returned even on failure, plus the restore result.
+        self.assertEqual(result, (False, [record], True))
         self.assertEqual(dispatch_mock.call_count, 2)
         restore.assert_called_once_with([record])
+
+        with mock.patch.object(infra, '_dispatch_download', side_effect=dispatch), \
+                mock.patch.object(infra, 'restore_asset_backups', return_value=False), \
+                mock.patch('wo.core.logging.Log.error'), \
+                mock.patch('wo.core.logging.Log.warn'), \
+                mock.patch('wo.core.logging.Log.debug'):
+            result = infra.update_plugins_and_themes({})
+
+        self.assertEqual(result, (False, [record], False))
 
     def test_promote_asset_force_restores_existing_on_failed_rename(self):
         infra = self._infra()
@@ -3916,9 +3977,9 @@ bare-theme = owner/theme
             stack.enter_context(mock.patch.object(
                 mt.MTFunctions, 'core_schema_transition',
                 return_value='equal'))
-            stack.enter_context(mock.patch.object(mt.MTFunctions, 'test_site', return_value=False))
+            stack.enter_context(mock.patch.object(mt.MTFunctions, 'test_site_locally', return_value=False))
             stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'download_wordpress_core', return_value='wp-test'))
-            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'update_plugins_and_themes', return_value=(True, asset_records)))
+            stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'update_plugins_and_themes', return_value=(True, asset_records, True)))
             restore = stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'restore_asset_backups', return_value=True))
             switch_release = stack.enter_context(mock.patch.object(mt.SharedInfrastructure, 'switch_release'))
             stack.enter_context(mock.patch.object(mt.ReleaseManager, 'backup_current'))
@@ -4174,7 +4235,7 @@ $wp_version = '6.9.1';
         infra.download_wordpress_core.return_value = 'wp-staged'
         order = []
         infra.update_plugins_and_themes.side_effect = lambda config: (
-            order.append('assets') or (True, asset_records or [])
+            order.append('assets') or (True, asset_records or [], True)
         )
         infra.restore_asset_backups.side_effect = lambda records: (
             order.append('asset-restore') or asset_restore_ok
@@ -4195,11 +4256,13 @@ $wp_version = '6.9.1';
             order.append('record')
             if record_error:
                 raise record_error
+            return True
 
 
         infra.switch_release.side_effect = switch_release
 
 
+        os.makedirs(os.path.join(self.tmp, 'config'), exist_ok=True)
         with contextlib.ExitStack() as stack:
             info = stack.enter_context(
                 mock.patch('wo.core.logging.Log.info')
@@ -4247,13 +4310,6 @@ $wp_version = '6.9.1';
                     return_value=transition,
                 )
             )
-            stack.enter_context(mock.patch.object(
-                mt.MTFunctions,
-                'test_site',
-                side_effect=lambda app, domain: (
-                    order.append(f'canary:{domain}') or True
-                ),
-            ))
             stack.enter_context(mock.patch.object(
                 mt.MTFunctions,
                 'test_site_locally',
@@ -4368,6 +4424,11 @@ $wp_version = '6.9.1';
             ))
             stack.enter_context(
                 mock.patch.object(mt.MTFunctions, 'clear_all_caches')
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mt.MTFunctions, 'reset_opcache', return_value=True
+                )
             )
             stack.enter_context(
                 mock.patch.object(
@@ -4961,6 +5022,7 @@ $wp_version = '6.9.1';
         )
         self.assertNotIn('$realip_remote_addr', closed)
         self.assertIn('$realip_remote_addr = 127.0.0.1', bypass)
+        self.assertIn('$realip_remote_addr = 127.0.0.2', bypass)
         self.assertIn('set $wo_mt_maintenance 0;', bypass)
 
     def test_local_canary_curl_is_cacheproof_and_loopback_pinned(self):
@@ -4997,68 +5059,11 @@ $wp_version = '6.9.1';
             'X-Requested-With: XMLHttpRequest',
         )
         for resolve in (
-                'shop.example:80:127.0.0.1',
-                'shop.example:443:127.0.0.1',
-                'www.shop.example:80:127.0.0.1',
-                'www.shop.example:443:127.0.0.1'):
+                'shop.example:80:127.0.0.2',
+                'shop.example:443:127.0.0.2',
+                'www.shop.example:80:127.0.0.2',
+                'www.shop.example:443:127.0.0.2'):
             self.assertIn(resolve, command)
-
-    def test_ungated_canary_manually_follows_allowed_redirect(self):
-        redirect = mock.Mock(
-            status_code=301,
-            headers={'Location': 'https://www.shop.example/landing'},
-        )
-        success = mock.Mock(status_code=200, headers={})
-        session = mock.Mock()
-        session.get.side_effect = [redirect, success]
-        with mock.patch('requests.Session', return_value=session):
-            ok = MTFunctions.test_site(mock.Mock(), 'shop.example')
-
-        self.assertTrue(ok)
-        self.assertEqual(session.get.call_count, 2)
-        self.assertEqual(
-            session.get.call_args_list[1].args[0],
-            'https://www.shop.example/landing',
-        )
-        for call in session.get.call_args_list:
-            self.assertFalse(call.kwargs['allow_redirects'])
-            self.assertEqual(
-                call.kwargs['headers'],
-                {'X-Requested-With': 'XMLHttpRequest'},
-            )
-        initial_url = session.get.call_args_list[0].args[0]
-        prefix = 'http://shop.example/?wo_mt_canary='
-        self.assertTrue(initial_url.startswith(prefix))
-
-    def test_ungated_canary_rejects_terminal_non_2xx(self):
-        for status in (301, 404):
-            session = mock.Mock()
-            session.get.return_value = mock.Mock(
-                status_code=status,
-                headers={},
-            )
-            with mock.patch('requests.Session', return_value=session):
-                self.assertFalse(MTFunctions.test_site(
-                    mock.Mock(), 'shop.example'
-                ))
-
-    def test_ungated_canary_never_issues_unsafe_redirect(self):
-        for location in (
-                'https://unlisted.example/',
-                'http://shop.example:8080/',
-                'https://www.shop.example:8443/'):
-            session = mock.Mock()
-            session.get.return_value = mock.Mock(
-                status_code=302,
-                headers={'Location': location},
-            )
-            with mock.patch('requests.Session', return_value=session), \
-                    mock.patch.object(mtf.Log, 'warn') as warn:
-                self.assertFalse(MTFunctions.test_site(
-                    mock.Mock(), 'shop.example'
-                ))
-            self.assertEqual(session.get.call_count, 1)
-            self.assertIn(location, warn.call_args.args[1])
 
     def test_local_canary_manually_follows_allowed_redirect(self):
         results = [
@@ -5084,18 +5089,6 @@ $wp_version = '6.9.1';
         )
 
     def test_canary_redirect_limit_is_five(self):
-        redirect = mock.Mock(
-            status_code=302,
-            headers={'Location': '/again'},
-        )
-        session = mock.Mock()
-        session.get.return_value = redirect
-        with mock.patch('requests.Session', return_value=session):
-            self.assertFalse(MTFunctions.test_site(
-                mock.Mock(), 'shop.example'
-            ))
-        self.assertEqual(session.get.call_count, 6)
-
         curl_redirect = mock.Mock(
             returncode=0,
             stdout='302\thttps://shop.example/again',
@@ -5202,6 +5195,135 @@ $wp_version = '6.9.1';
         process.wait(timeout=2)
 
         self.assertFalse(os.path.exists(ran))
+
+
+class ReleaseRetentionTests(unittest.TestCase):
+    """cleanup_old_releases counts only promoted releases (E.3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.releases = os.path.join(self.tmp, 'releases')
+        os.makedirs(self.releases)
+        for name in ('wp-1', 'wp-2', 'wp-3', 'wp-4', 'wp-5'):
+            os.makedirs(os.path.join(self.releases, name))
+        # wp-3 is promoted; wp-4/wp-5 are leaked/staged (lexically newer).
+        os.symlink(os.path.join(self.releases, 'wp-3'),
+                   os.path.join(self.tmp, 'current'))
+
+    def test_prune_ignores_staged_newer_names_and_keeps_current(self):
+        manager = mtf.ReleaseManager(mock.Mock(), self.tmp)
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            manager.cleanup_old_releases(keep_count=2)
+        remaining = sorted(os.listdir(self.releases))
+        # current + one older promoted release survive; staged names are
+        # not deleted here and never displace a promoted one.
+        self.assertEqual(remaining, ['wp-2', 'wp-3', 'wp-4', 'wp-5'])
+
+    def test_prune_never_removes_current_even_with_keep_zero(self):
+        manager = mtf.ReleaseManager(mock.Mock(), self.tmp)
+        with mock.patch('wo.cli.plugins.multitenancy_functions.Log.debug'):
+            manager.cleanup_old_releases(keep_count=0)
+        self.assertIn('wp-3', os.listdir(self.releases))
+
+
+class RejectExtraPositionalsTests(unittest.TestCase):
+    """Stray positionals (e.g. a pasted em dash) must error out (G.2)."""
+
+    def test_em_dash_token_errors_with_ascii_hint(self):
+        if mt is None:
+            self.skipTest(
+                f'multitenancy controller import unavailable: {_mt_import_error}')
+        controller = mock.Mock()
+        pargs = mock.Mock()
+        pargs.newsite_name = '\u2014le'
+        pargs.plugin_slug = None
+        pargs.theme_slug = None
+        with mock.patch('wo.cli.plugins.multitenancy.Log.error') as log_error:
+            mt._reject_extra_positionals(controller, pargs)
+        self.assertTrue(log_error.called)
+        message = log_error.call_args.args[1]
+        self.assertIn('unrecognized arguments: \u2014le', message)
+        self.assertIn("use ASCII '--'", message)
+
+    def test_clean_pargs_pass_silently(self):
+        if mt is None:
+            self.skipTest(
+                f'multitenancy controller import unavailable: {_mt_import_error}')
+        pargs = mock.Mock()
+        pargs.newsite_name = None
+        pargs.plugin_slug = None
+        pargs.theme_slug = None
+        with mock.patch('wo.cli.plugins.multitenancy.Log.error') as log_error:
+            mt._reject_extra_positionals(mock.Mock(), pargs)
+        log_error.assert_not_called()
+
+
+class BaselineRollbackMintTests(unittest.TestCase):
+    """baseline-rollback mints current+1 with a greppable commit (J.1)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.baseline_file = os.path.join(self.tmp, 'config', 'baseline.json')
+        os.makedirs(os.path.dirname(self.baseline_file))
+
+    def _git(self, *args):
+        return subprocess.run(
+            ['git', *args], cwd=self.tmp, capture_output=True, text=True)
+
+    def _write_and_commit(self, version, plugins):
+        with open(self.baseline_file, 'w') as fh:
+            json.dump({'version': version, 'plugins': plugins,
+                       'generated': 'x'}, fh)
+        self._git('add', 'config/baseline.json')
+        self._git('commit', '-m', f'Baseline v{version}: test content')
+
+    def test_rollback_mints_new_version_and_commit_prefix(self):
+        if mt is None:
+            self.skipTest(
+                f'multitenancy controller import unavailable: {_mt_import_error}')
+        if shutil.which('git') is None:
+            self.skipTest('git not on PATH')
+        self._git('init')
+        self._git('config', 'user.email', 'test@example.invalid')
+        self._git('config', 'user.name', 'Test')
+        self._write_and_commit(1, ['alpha'])
+        self._write_and_commit(2, ['alpha', 'beta'])
+
+        ctrl = mt.WOMultitenancyController.__new__(mt.WOMultitenancyController)
+        ctrl.app = mock.Mock()
+        pargs = ctrl.app.pargs
+        pargs.to_version = 1
+        pargs.apply_now = False
+        pargs.force = True
+
+        with contextlib.ExitStack() as stack:
+            for name in ('info', 'warn', 'debug'):
+                stack.enter_context(
+                    mock.patch(f'wo.core.logging.Log.{name}'))
+            stack.enter_context(mock.patch(
+                'wo.core.logging.Log.error',
+                side_effect=lambda controller, message, exit=True: (
+                    controller.app.close(1) if exit else None
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                mt.MTDatabase, 'is_initialized', return_value=True))
+            stack.enter_context(mock.patch.object(
+                mt.MTDatabase, 'save_config', return_value=True))
+            stack.enter_context(mock.patch.object(
+                mt.MTFunctions, 'load_config',
+                return_value={'shared_root': self.tmp}))
+            ctrl.baseline_rollback()
+
+        with open(self.baseline_file) as fh:
+            rolled = json.load(fh)
+        # Pre-rollback version was 2 -> minted version is 3, with v1 content.
+        self.assertEqual(rolled['version'], 3)
+        self.assertEqual(rolled['plugins'], ['alpha'])
+        log_out = self._git('log', '--format=%s', '-1').stdout.strip()
+        self.assertEqual(log_out, 'Baseline v3: Rollback to v1 content')
 
 
 if __name__ == '__main__':

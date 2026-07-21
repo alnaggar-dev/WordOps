@@ -1,0 +1,19 @@
+# WordOps default catch-all server - WordOps {{release}}
+# Rejects requests whose Host/SNI matches no configured vhost.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+{{#quic}}
+    listen 443 quic default_server;
+    listen [::]:443 quic default_server;
+{{/quic}}
+    server_name _;
+    ssl_reject_handshake on;
+    return 444;
+}

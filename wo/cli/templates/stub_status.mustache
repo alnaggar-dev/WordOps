@@ -1,16 +1,5 @@
 # Stub status NGINX CONFIGURATION
 # DO NOT MODIFY, ALL CHANGES WILL BE LOST AFTER AN WordOps (wo) UPDATE
-{{#phpconf}}
-upstream phpstatus {
-    server unix:/run/php/php72-fpm.sock;
-}
-upstream php73opcache {
-    server unix:/run/php/php73-fpm.sock;
-}
-upstream php74opcache {
-    server unix:/run/php/php74-fpm.sock;
-}
-{{/phpconf}}
 server {
     listen 127.0.0.1:80;
     server_name 127.0.0.1 localhost;
@@ -26,36 +15,13 @@ server {
         access_log off;
         log_not_found off;
     }
-    {{#phpconf}}
-    location ~ /(status|ping) {
-        include fastcgi_params;
-        fastcgi_pass phpstatus;
-        access_log off;
-        log_not_found off;
-    }
-    location / {
-        try_files $uri $uri/ /index.php$is_args$args;
-    }
-    location /cache/opcache/php72.php {
+{{#php_versions}}
+    location /cache/opcache/{{php}}.php {
         try_files $uri =404;
         include fastcgi_params;
-        fastcgi_pass phpstatus;
+        fastcgi_pass {{php}};
         access_log off;
         log_not_found off;
     }
-    location /cache/opcache/php73.php {
-        try_files $uri =404;
-        include fastcgi_params;
-        fastcgi_pass php73opcache;
-        access_log off;
-        log_not_found off;
-    }
-    location /cache/opcache/php74.php {
-        try_files $uri =404;
-        include fastcgi_params;
-        fastcgi_pass php74opcache;
-        access_log off;
-        log_not_found off;
-    }
-    {{/phpconf}}
+{{/php_versions}}
 }

@@ -18,6 +18,7 @@ import glob
 import uuid
 from urllib.parse import urljoin, urlparse
 import fcntl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime
 from wo.core.logging import Log
@@ -137,7 +138,8 @@ class MTFunctions:
         cfg = f"{shared_root}/config/wp-config-shared.php"
         if not lint_php_file(app, cfg, missing_ok=True):
             Log.error(app, "wp-config-shared.php has a PHP syntax error. "
-                           "Fix via: wo multitenancy shared-config --action edit")
+                           "Fix via: wo multitenancy shared-config "
+                           "--action edit", False)
             return False
         return True
 
@@ -544,7 +546,7 @@ require __DIR__ . '/wp/wp-blog-header.php';
             return False
     
     @staticmethod
-    def generate_wp_config(app, site_root, domain, db_name, db_user, db_pass, db_host, redis_prefix=None, redis_db=0):
+    def generate_wp_config(app, site_root, domain, db_name, db_user, db_pass, db_host, redis_prefix=None, redis_db=0, shared_root='/var/www/shared'):
         """
         Generate wp-config.php for shared WordPress site with shared config include.
         
@@ -571,19 +573,28 @@ require __DIR__ . '/wp/wp-blog-header.php';
             - Unique Redis prefix for Redis Object Cache Pro integration
         """
         
+        # shared_root lands inside single-quoted PHP strings below; config
+        # values never contain quotes, so reject rather than escape.
+        if "'" in shared_root:
+            Log.error(app, f"Unsafe shared_root path: {shared_root!r}")
+
         # Generate Redis prefix if not provided
         if not redis_prefix:
             from wo.cli.plugins.multitenancy_db import MTDatabase
             redis_prefix = MTDatabase.generate_redis_prefix(app, domain)
         
-        # Get salts from WordPress.org
+        # Get salts from WordPress.org; fall back to local generation when
+        # the API is unreachable or returns a malformed body.
+        import requests
+        salts = None
         try:
-            salts = subprocess.check_output(
-                ['curl', '-s', 'https://api.wordpress.org/secret-key/1.1/salt/'],
-                universal_newlines=True
-            )
-        except:
-            # Generate fallback salts if API is unavailable
+            r = requests.get(
+                'https://api.wordpress.org/secret-key/1.1/salt/', timeout=10)
+            if r.ok and MTFunctions._valid_salts(r.text):
+                salts = r.text
+        except requests.exceptions.RequestException:
+            pass
+        if salts is None:
             salts = MTFunctions.generate_salts()
         
         # Following HandPressed pattern: wp-config.php goes IN the webroot (htdocs)
@@ -638,8 +649,8 @@ define('WP_REDIS_DISABLED', false);
 // define('WO_BYPASS_SHARED_CONFIG', true);
 
 if (!defined('WO_BYPASS_SHARED_CONFIG') || WO_BYPASS_SHARED_CONFIG !== true) {{
-    if (file_exists('/var/www/shared/config/wp-config-shared.php')) {{
-        require_once '/var/www/shared/config/wp-config-shared.php';
+    if (file_exists('{shared_root}/config/wp-config-shared.php')) {{
+        require_once '{shared_root}/config/wp-config-shared.php';
     }}
 }}
 
@@ -748,6 +759,25 @@ if (!defined('WP_CLI')) {{
         except Exception as e:
             Log.error(app, f"Failed to update wp-config.php for rename: {e}", exit=False)
             return None
+
+    @staticmethod
+    def _valid_salts(text):
+        """Accept only a well-formed WordPress.org salt block: exactly the
+        8 expected define('<NAME>', '...'); lines."""
+        names = {'AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY',
+                 'AUTH_SALT', 'SECURE_AUTH_SALT', 'LOGGED_IN_SALT',
+                 'NONCE_SALT'}
+        lines = [ln for ln in (text or '').strip().splitlines()
+                 if ln.strip()]
+        if len(lines) != 8:
+            return False
+        found = set()
+        for line in lines:
+            m = re.match(r"^define\('([A-Z_]+)',\s*'.*'\);$", line.strip())
+            if not m or m.group(1) not in names:
+                return False
+            found.add(m.group(1))
+        return found == names
     
     def generate_salts():
         """Generate WordPress salts"""
@@ -1266,10 +1296,24 @@ server {{
                     return False
                 Log.debug(app, f"SSL certificates deployed for {domain}")
 
+            def _remove_ssl_artifacts():
+                """Drop just-written SSL config so nginx stays valid."""
+                for conf in (f"/var/www/{domain}/conf/nginx/ssl.conf",
+                             f"/var/www/{domain}/conf/nginx/hsts.conf",
+                             f"/etc/nginx/conf.d/force-ssl-{domain}.conf"):
+                    if os.path.exists(conf):
+                        try:
+                            os.remove(conf)
+                        except OSError as e:
+                            Log.debug(app, f"Could not remove {conf}: {e}")
+                MTFunctions.validate_nginx_config(app)
+                MTFunctions.safe_nginx_reload(app, domain)
+
             # Test nginx configuration before applying SSL changes
             if not MTFunctions.validate_nginx_config(app):
                 Log.error(app, f"Nginx configuration invalid after "
-                          f"certificate deployment for {domain}")
+                          f"certificate deployment for {domain}", False)
+                _remove_ssl_artifacts()
                 return False
 
             # Configure HTTPS redirect
@@ -1283,7 +1327,8 @@ server {{
             # Final validation after all SSL changes
             if not MTFunctions.validate_nginx_config(app):
                 Log.error(app, f"Nginx configuration invalid after "
-                          f"SSL setup for {domain}")
+                          f"SSL setup for {domain}", False)
+                _remove_ssl_artifacts()
                 return False
 
             # Reload nginx to apply SSL configuration
@@ -1433,7 +1478,10 @@ server {{
             Log.debug(app, f"Removed nginx enabled symlink: {nginx_enabled}")
 
         # Remove configuration file and backups
-        nginx_files = [f for f in os.listdir('/etc/nginx/sites-available/') if f.startswith(domain)]
+        nginx_files = [
+            f for f in os.listdir('/etc/nginx/sites-available/')
+            if f == domain or f.startswith(f"{domain}.backup.")
+        ]
         for nginx_file in nginx_files:
             nginx_path = f"/etc/nginx/sites-available/{nginx_file}"
             if os.path.exists(nginx_path):
@@ -2007,59 +2055,35 @@ server {{
             Log.debug(app, f"Cache clear error: {e}")
             # Don't fail the entire operation if cache clear fails
             return False
-    
-    def test_site(app, domain):
-        """Test a site through PHP, bypassing page-cache fetch and store."""
+
+    @staticmethod
+    def reset_opcache(app, php_key=None):
+        """Reset PHP opcache via the local admin endpoints.
+
+        Scoped alternative to `wo clean`: hits the 127.0.0.1 opcache-reset
+        endpoint for one PHP version (e.g. 'php84') or all installed
+        versions. Returns False when any endpoint failed.
+        """
         import requests
 
-        canary = uuid.uuid4().hex
-        session = requests.Session()
-        current_url = f"http://{domain}/?wo_mt_canary={canary}"
-        domain_lower = domain.lower()
-        apex = (
-            domain_lower[4:]
-            if domain_lower.startswith('www.')
-            else domain_lower
-        )
-        allowed_hosts = {apex, f'www.{apex}'}
-        try:
-            for redirect_count in range(6):
-                response = session.get(
-                    current_url,
-                    timeout=5,
-                    allow_redirects=False,
-                    headers={'X-Requested-With': 'XMLHttpRequest'},
-                )
-                if 200 <= response.status_code < 300:
-                    return True
-                if not 300 <= response.status_code < 400:
-                    return False
-                location = response.headers.get('Location')
-                if not location or redirect_count == 5:
-                    return False
-                next_url = urljoin(current_url, location)
-                parsed = urlparse(next_url)
-                try:
-                    port = parsed.port
-                except ValueError:
-                    port = -1
-                expected_port = (
-                    80 if parsed.scheme == 'http' else 443
-                )
-                if (parsed.scheme not in ('http', 'https')
-                        or parsed.hostname not in allowed_hosts
-                        or port not in (None, expected_port)):
-                    Log.warn(
-                        app,
-                        f"Canary redirect rejected for {domain}: "
-                        f"{location}",
-                    )
-                    return False
-                current_url = next_url
-            return False
-        except Exception:
-            return False
-    
+        keys = [php_key] if php_key else list(WOVar.wo_php_versions.keys())
+        ok = True
+        for key in keys:
+            endpoint = f"/var/www/22222/htdocs/cache/opcache/{key}.php"
+            if not os.path.exists(endpoint):
+                continue
+            try:
+                r = requests.get(
+                    f"http://127.0.0.1/cache/opcache/{key}.php", timeout=5)
+                if r.status_code != 200:
+                    Log.warn(app, f"Opcache reset failed for {key} "
+                                  f"(HTTP {r.status_code})")
+                    ok = False
+            except requests.exceptions.RequestException as e:
+                Log.warn(app, f"Opcache reset failed for {key}: {e}")
+                ok = False
+        return ok
+
     @staticmethod
     def test_site_locally(app, site):
         """Canary a gated tenant through nginx's loopback-only bypass."""
@@ -2087,7 +2111,7 @@ server {{
         for variant in variants:
             for port in (80, 443):
                 base_cmd.extend([
-                    '--resolve', f'{variant}:{port}:127.0.0.1',
+                    '--resolve', f'{variant}:{port}:127.0.0.2',
                 ])
         base_cmd.extend([
             '--output', '/dev/null',
@@ -2371,6 +2395,9 @@ class SharedInfrastructure:
             return release_name
             
         except subprocess.CalledProcessError as e:
+            # Never leave a partial release dir behind: it would displace a
+            # promoted release in retention and confuse rollback.
+            shutil.rmtree(release_path, ignore_errors=True)
             Log.error(self.app, f"Failed to download WordPress: {e}")
             raise
     
@@ -2455,19 +2482,22 @@ die($error_msg);
         # Download WordPress.org plugin sources. New configs use
         # [wordpress_plugins]; legacy configs fall back to baseline_plugins.
         if 'wordpress_plugins' in config:
-            plugins = list(config.get('wordpress_plugins', {}).keys())
+            plugin_versions = dict(config.get('wordpress_plugins', {}))
         else:
-            plugins = config.get('baseline_plugins', ['nginx-helper', 'redis-cache'])
-            if isinstance(plugins, str):
-                plugins = [p.strip() for p in plugins.split(',')]
-        plugins = [p for p in plugins if p]
+            legacy = config.get('baseline_plugins',
+                                ['nginx-helper', 'redis-cache'])
+            if isinstance(legacy, str):
+                legacy = [p.strip() for p in legacy.split(',')]
+            plugin_versions = {p: None for p in legacy}
+        plugin_versions = {p: v for p, v in plugin_versions.items() if p}
 
         github_plugins = config.get('github_plugins', {})
         url_plugins = config.get('url_plugins', {})
-        for plugin in plugins:
+        for plugin, version in plugin_versions.items():
             if plugin in github_plugins or plugin in url_plugins:
                 continue  # provided by a GitHub/URL source below
-            if not self.download_plugin(plugin, force=force):
+            if not self.download_plugin(plugin, version=version or 'latest',
+                                        force=force):
                 failures.append(f"plugin '{plugin}' (WordPress.org)")
 
         # Download GitHub plugins
@@ -2496,14 +2526,17 @@ die($error_msg);
         github_themes = config.get('github_themes', {})
         url_themes = config.get('url_themes', {})
         if 'wordpress_themes' in config:
-            themes = list(config.get('wordpress_themes', {}).keys())
+            theme_versions = dict(config.get('wordpress_themes', {}))
         else:
-            themes = [config.get('baseline_theme', 'twentytwentyfour')]
-        themes = [t for t in themes if t]
-        for theme in themes:
+            theme_versions = {
+                config.get('baseline_theme', 'twentytwentyfour'): None
+            }
+        theme_versions = {t: v for t, v in theme_versions.items() if t}
+        for theme, version in theme_versions.items():
             if theme in github_themes or theme in url_themes:
                 continue  # provided by a GitHub/URL source below
-            if not self.download_theme(theme, force=force):
+            if not self.download_theme(theme, version=version or 'latest',
+                                       force=force):
                 failures.append(f"theme '{theme}' (WordPress.org)")
 
         # Download GitHub themes
@@ -2820,6 +2853,26 @@ die($error_msg);
         self._github_token = token or None
         return self._github_token
 
+    def _github_default_branch(self, repo):
+        """Resolve a repository's default branch via the GitHub API.
+
+        Returns the branch name or None on any failure; uses the same token
+        resolution as _github_curl.
+        """
+        import requests
+        headers = {}
+        token = self._get_github_token()
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        try:
+            r = requests.get(f"https://api.github.com/repos/{repo}",
+                             headers=headers, timeout=10)
+            if r.ok:
+                return r.json().get('default_branch') or None
+        except Exception as e:
+            Log.debug(self.app, f"GitHub default-branch lookup failed: {e}")
+        return None
+
     def _github_curl(self, url, zip_file):
         """Download `url` to `zip_file` with curl, authenticating with a GitHub
         token when one is available.
@@ -2878,9 +2931,8 @@ die($error_msg);
                 url = f"https://github.com/{github_repo}/archive/refs/heads/{branch}.zip"
                 Log.debug(self.app, f"Downloading from GitHub branch: {branch}")
             else:
-                # Try 'main' branch first (GitHub's default for new repos)
-                url = f"https://github.com/{github_repo}/archive/refs/heads/main.zip"
-                Log.debug(self.app, f"Downloading from GitHub (trying 'main' branch)")
+                # Resolved below: API default branch, then main -> master.
+                url = None
             
             # Create temporary directory for download and extraction
             os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
@@ -2889,13 +2941,22 @@ die($error_msg);
                 zip_file = f"{temp_dir}/{plugin_slug}.zip"
                 
                 # Download the zip (authenticated when a GitHub token is available)
-                result = self._github_curl(url, zip_file)
-                
-                # If download failed and we were trying 'main', fallback to 'master'
-                if result.returncode != 0 and not branch and not tag:
-                    Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
-                    url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                if url:
                     result = self._github_curl(url, zip_file)
+                else:
+                    candidates = []
+                    for cand in (self._github_default_branch(github_repo),
+                                 'main', 'master'):
+                        if cand and cand not in candidates:
+                            candidates.append(cand)
+                    for cand in candidates:
+                        url = (f"https://github.com/{github_repo}"
+                               f"/archive/refs/heads/{cand}.zip")
+                        Log.debug(self.app,
+                                  f"Downloading from GitHub branch: {cand}")
+                        result = self._github_curl(url, zip_file)
+                        if result.returncode == 0:
+                            break
                 
                 # Verify download was successful
                 if result.returncode != 0 or not os.path.exists(zip_file):
@@ -3056,8 +3117,8 @@ die($error_msg);
                 url = f"https://github.com/{github_repo}/archive/refs/heads/{branch}.zip"
                 Log.debug(self.app, f"Downloading theme from GitHub branch: {branch}")
             else:
-                url = f"https://github.com/{github_repo}/archive/refs/heads/main.zip"
-                Log.debug(self.app, f"Downloading theme from GitHub (trying 'main' branch)")
+                # Resolved below: API default branch, then main -> master.
+                url = None
             
             # Create temporary directory
             os.makedirs(f"{self.shared_root}/tmp/assets", exist_ok=True)
@@ -3066,13 +3127,22 @@ die($error_msg);
                 zip_file = f"{temp_dir}/{theme_slug}.zip"
                 
                 # Download
-                result = self._github_curl(url, zip_file)
-                
-                # Fallback to master if main failed
-                if result.returncode != 0 and not branch and not tag:
-                    Log.debug(self.app, "Failed to download 'main', trying 'master' branch")
-                    url = f"https://github.com/{github_repo}/archive/refs/heads/master.zip"
+                if url:
                     result = self._github_curl(url, zip_file)
+                else:
+                    candidates = []
+                    for cand in (self._github_default_branch(github_repo),
+                                 'main', 'master'):
+                        if cand and cand not in candidates:
+                            candidates.append(cand)
+                    for cand in candidates:
+                        url = (f"https://github.com/{github_repo}"
+                               f"/archive/refs/heads/{cand}.zip")
+                        Log.debug(self.app, "Downloading theme from GitHub "
+                                            f"branch: {cand}")
+                        result = self._github_curl(url, zip_file)
+                        if result.returncode == 0:
+                            break
                 
                 # Verify download
                 if result.returncode != 0 or not os.path.exists(zip_file):
@@ -3378,12 +3448,13 @@ die($error_msg);
         
         current_link = f"{self.shared_root}/current"
         
-        # Remove old symlink if exists
-        if os.path.islink(current_link):
-            os.unlink(current_link)
-        
-        # Create new symlink
-        os.symlink(release_path, current_link)
+        # Flip atomically: build the symlink aside, then rename over the
+        # old one so `current` never transiently disappears.
+        tmp_link = f"{current_link}.new"
+        if os.path.islink(tmp_link) or os.path.exists(tmp_link):
+            os.unlink(tmp_link)
+        os.symlink(release_path, tmp_link)
+        os.replace(tmp_link, current_link)
         Log.debug(self.app, f"Switched to release: {release_name}")
     
     def update_plugin(self, plugin_slug, config=None):
@@ -3400,7 +3471,10 @@ die($error_msg);
             return False
         backup_records = []
         if not self._dispatch_download('plugin', plugin_slug, source, force=True, backup_records=backup_records):
-            self.restore_asset_backups(backup_records)
+            if not self.restore_asset_backups(backup_records):
+                Log.warn(self.app, "Asset restore incomplete; restore "
+                                   "manually from "
+                                   f"{self.shared_root}/backups/assets/")
             return False
         for record in backup_records:
             if record.get('backup'):
@@ -3423,7 +3497,10 @@ die($error_msg);
             return False
         backup_records = []
         if not self._dispatch_download('theme', theme_slug, source, force=True, backup_records=backup_records):
-            self.restore_asset_backups(backup_records)
+            if not self.restore_asset_backups(backup_records):
+                Log.warn(self.app, "Asset restore incomplete; restore "
+                                   "manually from "
+                                   f"{self.shared_root}/backups/assets/")
             return False
         for record in backup_records:
             if record.get('backup'):
@@ -3433,9 +3510,12 @@ die($error_msg);
     def update_plugins_and_themes(self, config):
         """Refresh all shared plugin/theme sources.
 
-        Returns a tuple (success, backup_records). On any download/promote
-        failure every promoted asset is restored and (False, []) is returned.
-        Slugs without a resolvable source are warned and skipped, not failed.
+        Returns (success, backup_records, restore_ok). On any
+        download/promote failure every promoted asset is restored;
+        restore_ok reports whether that restore fully succeeded (True when
+        no restore was needed). backup_records are the real promote records
+        even on failure. Slugs without a resolvable source are warned and
+        skipped, not failed.
         """
         baseline = self._load_baseline()
         backup_records = []
@@ -3484,12 +3564,12 @@ die($error_msg);
                     failures.append(f"{kind} {slug}")
 
         if failures:
-            self.restore_asset_backups(backup_records)
+            restore_ok = self.restore_asset_backups(backup_records)
             for item in failures:
                 Log.error(self.app, f"Failed to update {item}", exit=False)
-            return (False, [])
+            return (False, backup_records, restore_ok)
 
-        return (True, backup_records)
+        return (True, backup_records, True)
     
     def set_permissions(self):
         """Set proper permissions on shared infrastructure"""
@@ -3585,28 +3665,34 @@ die($error_msg);
                 Log.debug(self.app, "Git not initialized, skipping commit")
                 return False
             
-            # Stage baseline.json
-            subprocess.run(
+            add = subprocess.run(
                 ['git', 'add', 'config/baseline.json'],
                 cwd=self.shared_root,
                 capture_output=True,
-                check=True
+                text=True,
             )
-            
-            # Commit with message
-            subprocess.run(
+            if add.returncode != 0:
+                Log.debug(self.app, f"Git add failed: {add.stderr}")
+                return False
+
+            commit = subprocess.run(
                 ['git', 'commit', '-m', message],
                 cwd=self.shared_root,
                 capture_output=True,
-                check=True
+                text=True,
             )
-            
+            if commit.returncode != 0:
+                output = f"{commit.stdout}\n{commit.stderr}"
+                if ('nothing to commit' in output
+                        or 'nothing added to commit' in output):
+                    # No staged changes — the baseline is already committed.
+                    return True
+                Log.debug(self.app, f"Git commit failed: {output}")
+                return False
+
             Log.debug(self.app, f"Git commit: {message}")
             return True
-            
-        except subprocess.CalledProcessError:
-            # No changes to commit (this is okay)
-            return True
+
         except Exception as e:
             Log.debug(self.app, f"Git commit failed: {e}")
             return False
@@ -3672,16 +3758,18 @@ class ReleaseManager:
         releases = self.list_releases()
         current = self.get_current_release()
         
-        if len(releases) > keep_count:
-            to_remove = releases[keep_count:]
-            
-            for release in to_remove:
-                # Never remove current release
-                if release != current:
-                    release_path = f"{self.releases_dir}/{release}"
-                    if os.path.exists(release_path):
-                        shutil.rmtree(release_path)
-                        Log.debug(self.app, f"Removed old release: {release}")
+        # Retention counts only promoted releases: ignore anything lexically
+        # newer than current (leaked/staged dirs) so they can't displace a
+        # promoted release; never delete current.
+        if current in releases:
+            releases = releases[releases.index(current):]
+        keep_count = max(1, keep_count)
+        for release in releases[keep_count:]:
+            if release != current:
+                release_path = f"{self.releases_dir}/{release}"
+                if os.path.exists(release_path):
+                    shutil.rmtree(release_path)
+                    Log.debug(self.app, f"Removed old release: {release}")
 
 class BaselineApplicator:
     """Helper class for applying baseline configuration to sites"""
@@ -4191,113 +4279,172 @@ class BaselineApplicator:
         failed_count = 0
         per_site = []
 
-        for site in production_sites:
+        # Per-site work is pure wp-cli/filesystem; all SQLite writes stay in
+        # the coordinator thread below. Workers must not touch db_session.
+        try:
+            apply_workers = int(config.get('apply_workers', 4))
+        except (TypeError, ValueError):
+            apply_workers = 4
+        apply_workers = max(1, min(16, apply_workers))
+        workers = min(apply_workers, len(production_sites)) or 1
+
+        def _dry_run_site(site):
             domain = site['domain']
-            site_path = site['site_path']
             cache_type = site.get('cache_type')
             # DB site_path is the site root; WordPress (and wp-cli --path)
             # lives in <root>/htdocs.
-            wp_path = os.path.join(site_path, 'htdocs')
-
-            if dry_run:
-                option_names = list(baseline.get('options', {}).keys())
-                plugins_to_deactivate = []
-                prune_error = None
-                if prune:
-                    try:
-                        baseline_plugins = set(baseline.get('plugins', []))
-                        active_plugins = set(
-                            BaselineApplicator._get_active_plugin_slugs(app, wp_path)
-                        )
-                        plugins_to_deactivate = sorted(active_plugins - baseline_plugins)
-                    except Exception as e:
-                        prune_error = str(e)
-                        Log.warn(
-                            app,
-                            f"  [dry-run] could not determine prune set for {domain}: {prune_error}"
-                        )
+            wp_path = os.path.join(site['site_path'], 'htdocs')
+            option_names = list(baseline.get('options', {}).keys())
+            plugins_to_deactivate = []
+            prune_error = None
+            if prune:
+                try:
+                    baseline_plugins = set(baseline.get('plugins', []))
+                    active_plugins = set(
+                        BaselineApplicator._get_active_plugin_slugs(app, wp_path)
+                    )
+                    plugins_to_deactivate = sorted(active_plugins - baseline_plugins)
+                except Exception as e:
+                    prune_error = str(e)
+                    Log.warn(
+                        app,
+                        f"  [dry-run] could not determine prune set for {domain}: {prune_error}"
+                    )
+            Log.info(
+                app,
+                f"  [dry-run] would apply baseline to {domain} "
+                f"(plugins={','.join(baseline.get('plugins', []))}, "
+                f"theme={baseline.get('theme', '')}, "
+                f"options={','.join(option_names)})"
+            )
+            if 'nginx-helper' in baseline.get('plugins', []):
                 Log.info(
                     app,
-                    f"  [dry-run] would apply baseline to {domain} "
-                    f"(plugins={','.join(baseline.get('plugins', []))}, "
-                    f"theme={baseline.get('theme', '')}, "
-                    f"options={','.join(option_names)})"
+                    f"  [dry-run] would grant Nginx Helper admin "
+                    f"capabilities for {domain}"
                 )
-                if 'nginx-helper' in baseline.get('plugins', []):
+                if cache_type in ('wpfc', 'wpredis'):
                     Log.info(
                         app,
-                        f"  [dry-run] would grant Nginx Helper admin "
-                        f"capabilities for {domain}"
+                        f"  [dry-run] would enable Nginx Helper purge "
+                        f"(cache_type={cache_type}) for {domain}"
                     )
-                    if cache_type in ('wpfc', 'wpredis'):
-                        Log.info(
-                            app,
-                            f"  [dry-run] would enable Nginx Helper purge "
-                            f"(cache_type={cache_type}) for {domain}"
-                        )
-                if prune:
-                    Log.info(
-                        app,
-                        f"  [dry-run] would deactivate for {domain}: "
-                        f"{','.join(plugins_to_deactivate) if plugins_to_deactivate else '(none)'}"
-                    )
-                per_site.append({
-                    'domain': domain,
-                    'status': 'dry_run',
-                    'options': option_names,
-                    'prune_deactivate': plugins_to_deactivate,
-                    'prune_error': prune_error,
-                })
-                continue
+            if prune:
+                Log.info(
+                    app,
+                    f"  [dry-run] would deactivate for {domain}: "
+                    f"{','.join(plugins_to_deactivate) if plugins_to_deactivate else '(none)'}"
+                )
+            return {
+                'domain': domain,
+                'status': 'dry_run',
+                'options': option_names,
+                'prune_deactivate': plugins_to_deactivate,
+                'prune_error': prune_error,
+            }
 
+        def _apply_site(site):
+            domain = site['domain']
+            wp_path = os.path.join(site['site_path'], 'htdocs')
             start = _time.monotonic()
             result = BaselineApplicator.apply_baseline_to_site(
                 app, domain, wp_path, baseline, prune=prune,
-                cache_type=cache_type,
+                cache_type=site.get('cache_type'),
             )
             dur = int((_time.monotonic() - start) * 1000)
+            return result, dur
 
-            if result['success']:
-                skipped = result.get('skipped_plugins') or []
-                site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
-                if site_obj:
-                    # Only advance the recorded baseline version when every
-                    # plugin applied. A site with skipped plugins is not fully
-                    # at this baseline, so leave its version untouched so
-                    # `validate` flags it and a later `apply` re-attempts.
-                    if not skipped:
-                        site_obj.baseline_version = baseline_version
-                    site_obj.updated_at = datetime.now()
-                    session.commit()
-                success_count += 1
-                if verbose:
-                    Log.info(app, f"  ✅ {domain} ({dur} ms)")
-                else:
-                    Log.debug(app, f"Applied to {domain}")
-                if skipped:
-                    Log.warn(
-                        app,
-                        f"  ⚠️  {domain}: skipped plugins (version not "
-                        f"advanced): {', '.join(skipped)}"
-                    )
-                per_site.append({
-                    'domain': domain,
-                    'status': 'partial' if skipped else 'success',
-                    'duration_ms': dur,
-                    'skipped_plugins': skipped,
-                })
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            if dry_run:
+                futures = {
+                    pool.submit(_dry_run_site, site): site
+                    for site in production_sites
+                }
+                for future in as_completed(futures):
+                    site = futures[future]
+                    try:
+                        per_site.append(future.result())
+                    except Exception as e:
+                        failed_count += 1
+                        Log.warn(app, f"  ❌ {site['domain']}: {e}")
+                        per_site.append({
+                            'domain': site['domain'], 'status': 'failed',
+                            'error': str(e), 'duration_ms': 0,
+                        })
             else:
-                failed_count += 1
-                Log.warn(app, f"  ❌ {domain}: {result['error']}")
-                per_site.append({
-                    'domain': domain, 'status': 'failed',
-                    'error': result['error'], 'duration_ms': dur,
-                })
+                futures = {
+                    pool.submit(_apply_site, site): site
+                    for site in production_sites
+                }
+                for future in as_completed(futures):
+                    site = futures[future]
+                    domain = site['domain']
+                    try:
+                        result, dur = future.result()
+                    except Exception as e:
+                        # One site blowing up must not abort the fleet.
+                        result = {'success': False, 'error': str(e)}
+                        dur = 0
+                    if result['success']:
+                        skipped = result.get('skipped_plugins') or []
+                        try:
+                            site_obj = session.query(MultitenancySite).filter_by(domain=domain).first()
+                            if site_obj:
+                                # Only advance the recorded baseline version
+                                # when every plugin applied. A site with
+                                # skipped plugins is not fully at this
+                                # baseline, so leave its version untouched so
+                                # `validate` flags it and a later `apply`
+                                # re-attempts.
+                                if not skipped:
+                                    site_obj.baseline_version = baseline_version
+                                site_obj.updated_at = datetime.now()
+                                session.commit()
+                        except Exception as e:
+                            # A tracking-DB hiccup fails this site only, not
+                            # the fleet; keep the session usable.
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            failed_count += 1
+                            Log.warn(app, f"  ❌ {domain}: applied but "
+                                          f"tracking update failed: {e}")
+                            per_site.append({
+                                'domain': domain, 'status': 'failed',
+                                'error': f'tracking update failed: {e}',
+                                'duration_ms': dur,
+                            })
+                            continue
+                        success_count += 1
+                        if verbose:
+                            Log.info(app, f"  ✅ {domain} ({dur} ms)")
+                        else:
+                            Log.debug(app, f"Applied to {domain}")
+                        if skipped:
+                            Log.warn(
+                                app,
+                                f"  ⚠️  {domain}: skipped plugins (version not "
+                                f"advanced): {', '.join(skipped)}"
+                            )
+                        per_site.append({
+                            'domain': domain,
+                            'status': 'partial' if skipped else 'success',
+                            'duration_ms': dur,
+                            'skipped_plugins': skipped,
+                        })
+                    else:
+                        failed_count += 1
+                        Log.warn(app, f"  ❌ {domain}: {result['error']}")
+                        per_site.append({
+                            'domain': domain, 'status': 'failed',
+                            'error': result['error'], 'duration_ms': dur,
+                        })
 
         if not dry_run:
             Log.info(app, "Clearing cache globally...")
-            from wo.core.shellexec import WOShellExec
-            WOShellExec.cmd_exec(app, "wo clean --all", errormsg="", log=False)
+            if not MTFunctions.clear_all_caches(app):
+                Log.warn(app, "Global cache clear failed after baseline apply")
 
         Log.info(app, "")
         Log.info(app, "=" * 60)
@@ -4520,22 +4667,21 @@ def lint_php_file(app, path, *, missing_ok=False, php_missing_ok=True):
     if not os.path.exists(path):
         if missing_ok:
             return True
-        Log.error(app, f"Config file not found: {path}")
+        Log.error(app, f"Config file not found: {path}", False)
         return False
     if shutil.which('php') is None:
         if php_missing_ok:
             Log.debug(app, "php not found on PATH; skipping syntax check")
             return True
-        Log.error(app, "php not found on PATH; cannot validate config")
+        Log.error(app, "php not found on PATH; cannot validate config", False)
         return False
     try:
         result = subprocess.run(['php', '-l', path], capture_output=True, text=True)
     except Exception as e:
-        Log.error(app, f"Could not validate {path}: {str(e)}")
+        Log.error(app, f"Could not validate {path}: {str(e)}", False)
         return False
     if result.returncode != 0:
-        Log.error(app, f"PHP syntax error in {path}:")
-        Log.error(app, result.stderr)
+        Log.error(app, f"PHP syntax error in {path}:\n{result.stderr}", False)
         return False
     Log.debug(app, f"PHP syntax valid: {path}")
     return True

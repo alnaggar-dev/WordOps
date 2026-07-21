@@ -52,6 +52,57 @@ def wo_multitenancy_hook(app):
     MTDatabase.initialize_tables(ctx)
 
 
+def _pending_upgrades_path(shared_root):
+    return f"{shared_root}/config/pending-db-upgrades.json"
+
+
+def _write_pending_upgrades(shared_root, payload):
+    """Atomically persist the pending-db-upgrades ledger."""
+    path = _pending_upgrades_path(shared_root)
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w') as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def _remove_pending_upgrade_domain(app, shared_root, domain):
+    """Drop one migrated domain from the ledger; delete it when empty."""
+    path = _pending_upgrades_path(shared_root)
+    try:
+        with open(path) as fh:
+            payload = json.load(fh)
+        domains = [d for d in payload.get('domains', []) if d != domain]
+        if domains:
+            payload['domains'] = domains
+            _write_pending_upgrades(shared_root, payload)
+        else:
+            os.remove(path)
+    except (OSError, ValueError) as e:
+        # Ledger bookkeeping must never kill post-flip migration work.
+        Log.warn(app, f"Could not update pending-db-upgrades ledger: {e}")
+
+
+def _reject_extra_positionals(controller, pargs,
+                              fields=('newsite_name', 'plugin_slug',
+                                      'theme_slug')):
+    """Reject stray positional tokens swallowed by optional positionals.
+
+    `create foo.com —le` (em dash) parks '—le' in newsite_name and silently
+    creates the site without SSL; surface it as an argument error instead.
+    """
+    extras = [
+        tok for tok in (getattr(pargs, f, None) for f in fields)
+        if isinstance(tok, str) and tok
+    ]
+    if extras:
+        hint = ''
+        if any(tok.startswith(('\u2014', '\u2013')) for tok in extras):
+            hint = (" (a Unicode dash was pasted; use ASCII '--', "
+                    "e.g. --le)")
+        Log.error(controller,
+                  f"unrecognized arguments: {' '.join(extras)}{hint}")
+
+
 class _UpdateAbort(Exception):
     """Abort an update before release mutation without generic rollback advice."""
 
@@ -147,7 +198,7 @@ class WOMultitenancyController(CementBaseController):
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         if not MTFunctions.preflight_shared_config(self, shared_root):
-            return
+            Log.error(self, "Aborted: wp-config-shared.php failed preflight")
         
         # Create shared infrastructure
         infra = SharedInfrastructure(self, shared_root)
@@ -192,6 +243,8 @@ class WOMultitenancyController(CementBaseController):
             # Make release current
             Log.info(self, "Activating release...")
             infra.switch_release(release_name)
+            if not MTDatabase.update_release(self, release_name):
+                Log.warn(self, "Could not record release in tracking DB")
             
             # Set permissions
             Log.info(self, "Setting permissions...")
@@ -206,11 +259,13 @@ class WOMultitenancyController(CementBaseController):
                 infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
             # Update database
-            MTDatabase.save_config(self, {
+            if not MTDatabase.save_config(self, {
                 'shared_root': shared_root,
                 'current_release': release_name,
                 'baseline_version': 1
-            })
+            }):
+                Log.error(self, "Failed to persist multitenancy "
+                                "configuration to the tracking database")
             
             if seed_failures:
                 Log.warn(self, "⚠️  Multi-tenancy initialized, but some assets failed to download:")
@@ -232,6 +287,7 @@ class WOMultitenancyController(CementBaseController):
 
     def _create_impl(self):
         pargs = self.app.pargs
+        _reject_extra_positionals(self, pargs)
 
         if not pargs.site_name:
             try:
@@ -242,16 +298,9 @@ class WOMultitenancyController(CementBaseController):
         
         # Validate domain
         wo_domain = WODomain.validate(self, pargs.site_name)
+        if not MTFunctions.valid_tenant_domain(wo_domain):
+            Log.error(self, f"Invalid domain name: {wo_domain!r}")
 
-        # Enhanced argument validation
-        if hasattr(pargs, 'letsencrypt') and pargs.letsencrypt:
-            # Check if the argument contains em dash instead of double hyphen
-            site_name_arg = getattr(pargs, 'site_name', '')
-            if '—' in ' '.join(sys.argv):  # Check for em dash in command line
-                Log.error(self, "Invalid argument syntax detected!")
-                Log.error(self, "Did you use '—le' (em dash) instead of '--le' (double hyphen)?")
-                Log.error(self, "Correct syntax: wo multitenancy create example.com --php83 --wpfc --le")
-                return
 
         # Check if site exists
         if check_domain_exists(self, wo_domain):
@@ -264,13 +313,22 @@ class WOMultitenancyController(CementBaseController):
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         if not MTFunctions.preflight_shared_config(self, shared_root):
-            return
+            Log.error(self, "Aborted: wp-config-shared.php failed preflight")
 
         # Determine PHP version
         php_version = MTFunctions.get_php_version(self, pargs)
 
         # Determine cache type
         cache_type = MTFunctions.get_cache_type(self, pargs)
+        if cache_type == 'wpredis':
+            if not pargs.force:
+                Log.error(self,
+                          "--wpredis is disabled: nginx-wo 1.30.4 workers "
+                          "segfault (signal 11) on the srcache/redis2 "
+                          "page-cache path, taking down all tenants. Use "
+                          "--wpfc instead, or pass --force to override.")
+            Log.warn(self, "--wpredis forced: nginx workers may segfault on "
+                           "every page view until the nginx build is fixed")
 
         # Ensure required stack packages (nginx, PHP-FPM, MariaDB, WP-CLI,
         # redis) are installed, exactly like `wo site create` does.
@@ -361,6 +419,7 @@ class WOMultitenancyController(CementBaseController):
                 db_name, db_user, db_pass, db_host,
                 redis_prefix=redis_prefix,  # Pass explicit prefix for consistency
                 redis_db=redis_db,
+                shared_root=shared_root,
             )
             
             # Generate nginx configuration
@@ -517,6 +576,9 @@ class WOMultitenancyController(CementBaseController):
                         Log.warn(self, "Failed to reload nginx after SSL setup")
                     else:
                         Log.debug(self, "Nginx reloaded successfully after SSL deployment")
+                else:
+                    Log.warn(self, f"SSL setup failed; {wo_domain} "
+                                   "stays on HTTP")
             
 
             # Record the baseline version so validate does not flag a fully
@@ -575,6 +637,88 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"Failed to create site: {str(e)}")
             return False
 
+    def _recover_pending_db_upgrades(self, config, shared_root,
+                                     shared_sites):
+        """Finish tenant DB migrations an interrupted update left pending."""
+        marker_path = _pending_upgrades_path(shared_root)
+        if not os.path.exists(marker_path):
+            return
+        try:
+            with open(marker_path) as fh:
+                marker = json.load(fh)
+        except (OSError, ValueError) as e:
+            Log.error(self, "Unreadable pending-db-upgrades ledger "
+                            f"{marker_path}: {e}; inspect and remove it "
+                            "before updating")
+            return
+        domains = list(marker.get('domains') or [])
+        if not domains:
+            try:
+                os.remove(marker_path)
+            except OSError:
+                pass
+            return
+        Log.warn(self, "Unfinished tenant DB migrations from release "
+                       f"{marker.get('release')}: {', '.join(domains)}")
+        Log.info(self, "Recovering pending tenant DB migrations...")
+        tracked = {
+            site.get('domain'): site for site in (shared_sites or [])
+        }
+        recovery_message = (
+            "WordPress database maintenance is in progress. "
+            "Please try again shortly."
+        )
+        sites = []
+        for domain in domains:
+            site = tracked.get(domain)
+            if site is None:
+                if not MTFunctions.valid_tenant_domain(domain):
+                    Log.error(self, "Invalid domain in pending-db-upgrades "
+                                    f"ledger: {domain!r}")
+                site = {'domain': domain, 'site_path': f'/var/www/{domain}'}
+            sites.append(site)
+        created_recovery_gates = []
+        for site in sites:
+            domain = site['domain']
+            if _maintenance_gate_exists(domain):
+                continue
+            if not _maintenance_enable(
+                    self, domain, recovery_message, config):
+                Log.error(self, "Could not enable recovery maintenance "
+                                f"gate for {domain}")
+            created_recovery_gates.append(domain)
+        if created_recovery_gates and not MTFunctions.safe_nginx_reload(
+                self, created_recovery_gates[-1]):
+            Log.error(self, "Could not reload nginx with recovery "
+                            "maintenance gates")
+        survivors = []
+        for site in sites:
+            domain = site['domain']
+            failures = MTFunctions.run_core_db_upgrades(self, [site])
+            if failures:
+                survivors.append(domain)
+                continue
+            _remove_pending_upgrade_domain(self, shared_root, domain)
+        ungate_failures = []
+        for domain in created_recovery_gates:
+            if not _maintenance_disable(self, domain):
+                ungate_failures.append(domain)
+        if created_recovery_gates and not MTFunctions.safe_nginx_reload(
+                self, created_recovery_gates[-1]):
+            ungate_failures.append('nginx reload')
+        if ungate_failures:
+            Log.warn(self, "Recovery ungate incomplete: "
+                     + ', '.join(ungate_failures))
+        if survivors:
+            cmds = '; '.join(
+                f"wp core update-db --path=/var/www/{d}/htdocs --allow-root"
+                for d in survivors
+            )
+            Log.error(self, "Pending tenant DB migrations still failing "
+                            f"for {', '.join(survivors)} (gates retained). "
+                            f"Run manually: {cmds}")
+        Log.info(self, "Recovered all pending tenant DB migrations")
+
     @expose(help="Update WordPress core and plugins for all shared sites")
     def update(self):
         """Update shared WordPress infrastructure"""
@@ -586,12 +730,17 @@ class WOMultitenancyController(CementBaseController):
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         if not MTFunctions.preflight_shared_config(self, shared_root):
-            return
+            Log.error(self, "Aborted: wp-config-shared.php failed preflight")
         
         Log.info(self, "Updating WordPress multi-tenancy infrastructure...")
 
         # Get list of shared sites
         shared_sites = MTDatabase.get_shared_sites(self)
+
+        # Finish tenant migrations a prior interrupted update left pending
+        # BEFORE the empty-fleet shortcut: get_shared_sites() returns [] on
+        # any DB exception and the ledger exists precisely for that case.
+        self._recover_pending_db_upgrades(config, shared_root, shared_sites)
 
         if not shared_sites:
             Log.info(self, "No shared sites found")
@@ -604,6 +753,7 @@ class WOMultitenancyController(CementBaseController):
         release_manager = ReleaseManager(self, shared_root)
 
         asset_backups = []
+        asset_restore_ok = True
         core_switched = False
         core_db_bump = False
         db_backup_dir = None
@@ -613,6 +763,7 @@ class WOMultitenancyController(CementBaseController):
         cron_locks = {}
         maintenance_message = None
         loopback_bypass_may_be_active = False
+        new_release = None
 
 
 
@@ -655,14 +806,23 @@ class WOMultitenancyController(CementBaseController):
             if not core_db_bump:
                 # Preserve the committed fast path for equal-schema updates.
                 Log.info(self, "Updating plugins and themes...")
-                assets_ok, asset_backups = (
+                assets_ok, asset_backups, asset_restore_ok = (
                     infra.update_plugins_and_themes(config)
                 )
                 if not assets_ok:
-                    Log.error(
-                        self,
-                        "Plugin/theme update failed; shared assets were restored"
-                    )
+                    if asset_restore_ok:
+                        Log.error(
+                            self,
+                            "Plugin/theme update failed; shared assets "
+                            "were restored"
+                        )
+                    else:
+                        Log.error(
+                            self,
+                            "Plugin/theme update failed AND asset restore "
+                            "was incomplete; restore manually from "
+                            f"{shared_root}/backups/assets/<newest stamp>"
+                        )
                     return
 
                 if shared_sites and not pargs.force:
@@ -671,8 +831,15 @@ class WOMultitenancyController(CementBaseController):
                         self,
                         f"Testing with canary site: {canary['domain']}"
                     )
-                    if not MTFunctions.test_site(self, canary['domain']):
-                        infra.restore_asset_backups(asset_backups)
+                    if not MTFunctions.test_site_locally(self, canary):
+                        if not infra.restore_asset_backups(asset_backups):
+                            Log.error(
+                                self,
+                                "Canary test failed AND asset restore was "
+                                "incomplete; restore manually from "
+                                f"{shared_root}/backups/assets/"
+                                "<newest stamp>"
+                            )
                         Log.warn(
                             self,
                             "Canary test failed; shared assets restored. "
@@ -748,10 +915,14 @@ class WOMultitenancyController(CementBaseController):
                         + ', '.join(drain_blockers)
                     )
                 Log.info(self, "Updating plugins and themes...")
-                assets_ok, asset_backups = (
+                assets_ok, asset_backups, asset_restore_ok = (
                     infra.update_plugins_and_themes(config)
                 )
                 if not assets_ok:
+                    # The failed updater already attempted its own restore;
+                    # its records are consumed (backups renamed back), so
+                    # cleanup must not restore them again.
+                    asset_backups = []
                     raise _UpdateAbort(
                         "Plugin/theme update failed inside maintenance window"
                     )
@@ -855,6 +1026,21 @@ class WOMultitenancyController(CementBaseController):
 
 
 
+            if core_db_bump:
+                # Durable per-tenant migration ledger: SQLite failing is the
+                # failure mode, so persist which tenants still need
+                # `wp core update-db` on the filesystem before the flip.
+                try:
+                    _write_pending_upgrades(shared_root, {
+                        'release': new_release,
+                        'created': datetime.now().isoformat(),
+                        'domains': [s['domain'] for s in shared_sites],
+                    })
+                except OSError as e:
+                    raise _UpdateAbort(
+                        f"Could not write pending-db-upgrades ledger: {e}"
+                    )
+
             # Switch to new release
             Log.info(self, "Switching to new release...")
             infra.switch_release(new_release)
@@ -862,9 +1048,12 @@ class WOMultitenancyController(CementBaseController):
 
             # Clear all caches globally (fast - ~2 seconds for any number of sites)
             MTFunctions.clear_all_caches(self)
+            if not MTFunctions.reset_opcache(self):
+                Log.warn(self, "Opcache reset incomplete after release flip")
 
             # Update database
-            MTDatabase.update_release(self, new_release)
+            if not MTDatabase.update_release(self, new_release):
+                Log.warn(self, "Could not record new release in tracking DB")
             if core_db_bump:
                 pending_ungate_domains = []
                 sites_by_domain = {
@@ -878,11 +1067,17 @@ class WOMultitenancyController(CementBaseController):
                         )
                         if failures:
                             db_upgrade_failures.extend(failures)
+                        else:
+                            _remove_pending_upgrade_domain(
+                                self, shared_root, domain)
                         MTFunctions.release_tenant_cron_locks({
                             domain: cron_locks.pop(domain)
                         })
                         continue
                     failures = MTFunctions.run_core_db_upgrades(self, [site])
+                    if not failures:
+                        _remove_pending_upgrade_domain(
+                            self, shared_root, domain)
                     if failures:
                         db_upgrade_failures.extend(failures)
                         MTFunctions.release_tenant_cron_locks({
@@ -1007,7 +1202,7 @@ class WOMultitenancyController(CementBaseController):
                     )
             if cron_locks:
                 MTFunctions.release_tenant_cron_locks(cron_locks)
-            assets_restored = bypass_closed
+            assets_restored = bypass_closed and asset_restore_ok
             if bypass_closed and asset_backups and not core_switched:
                 try:
                     assets_restored = infra.restore_asset_backups(
@@ -1038,7 +1233,10 @@ class WOMultitenancyController(CementBaseController):
         except Exception as e:
             if not core_db_bump:
                 if asset_backups and not core_switched:
-                    infra.restore_asset_backups(asset_backups)
+                    if not infra.restore_asset_backups(asset_backups):
+                        Log.warn(self, "Asset restore incomplete; restore "
+                                       "manually from "
+                                       f"{shared_root}/backups/assets/")
                 Log.info(self, "update_failed target=baseline result=failure")
                 Log.error(self, f"Update failed: {str(e)}")
                 Log.info(self, "Run 'wo multitenancy rollback' to revert")
@@ -1069,7 +1267,7 @@ class WOMultitenancyController(CementBaseController):
                             "shared assets from shared_root/backups/assets, "
                             "then disable maintenance"
                         )
-                assets_restored = bypass_closed
+                assets_restored = bypass_closed and asset_restore_ok
                 if bypass_closed and asset_backups:
                     try:
                         assets_restored = infra.restore_asset_backups(
@@ -1121,6 +1319,14 @@ class WOMultitenancyController(CementBaseController):
             )
             return
 
+        finally:
+            if new_release and not core_switched:
+                staged = f"{shared_root}/releases/{new_release}"
+                if (os.path.isdir(staged) and os.path.realpath(staged)
+                        != os.path.realpath(f"{shared_root}/current")):
+                    shutil.rmtree(staged, ignore_errors=True)
+                    Log.info(self, f"Removed staged release {new_release}")
+
         if db_upgrade_failures:
             failed_domains = ','.join(
                 failure['domain'] for failure in db_upgrade_failures
@@ -1160,7 +1366,7 @@ class WOMultitenancyController(CementBaseController):
         
         try:
             # Get available releases
-            current_release = MTDatabase.get_current_release(self)
+            current_release = release_manager.get_current_release()
             previous_release = release_manager.get_previous_release(current_release)
             
             if not previous_release:
@@ -1182,9 +1388,12 @@ class WOMultitenancyController(CementBaseController):
 
             # Clear all caches globally (fast - ~2 seconds for any number of sites)
             MTFunctions.clear_all_caches(self)
+            if not MTFunctions.reset_opcache(self):
+                Log.warn(self, "Opcache reset incomplete after rollback")
 
             # Update database
-            MTDatabase.update_release(self, previous_release)
+            if not MTDatabase.update_release(self, previous_release):
+                Log.warn(self, "Could not record release in tracking DB")
 
             Log.info(self, "✅ Rollback completed successfully!")
             Log.info(self, f"   Now running: {previous_release}")
@@ -1203,6 +1412,11 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"rollback_failed target=baseline result=failure")
             Log.error(self, f"Rollback failed: {str(e)}")
 
+    def _persist_baseline_version(self, version):
+        """Mirror the baseline.json version into the tracking DB."""
+        if not MTDatabase.save_config(self, {'baseline_version': version}):
+            Log.warn(self, "Could not sync baseline version to tracking DB")
+
     @expose(help="Show status of multi-tenancy infrastructure")
     def status(self):
         """Display multi-tenancy status and health check"""
@@ -1218,7 +1432,18 @@ class WOMultitenancyController(CementBaseController):
         # Get current state
         current_release = MTDatabase.get_current_release(self)
         shared_sites = MTDatabase.get_shared_sites(self)
-        baseline_version = MTDatabase.get_baseline_version(self)
+        # baseline.json is the source of truth for the baseline version;
+        # the DB key is a mirror kept for the file-missing case.
+        baseline = None
+        try:
+            with open(f"{shared_root}/config/baseline.json") as fh:
+                baseline = json.load(fh)
+        except (OSError, ValueError):
+            baseline = None
+        if isinstance(baseline, dict) and 'version' in baseline:
+            baseline_version = baseline['version']
+        else:
+            baseline_version = MTDatabase.get_baseline_version(self)
 
         Log.info(self, "")
         Log.info(self, "=== WordPress Multi-tenancy Status ===")
@@ -1267,9 +1492,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"  {key}: {value}")
         
         # Baseline configuration
-        if os.path.exists(f"{shared_root}/config/baseline.json"):
-            with open(f"{shared_root}/config/baseline.json", 'r') as f:
-                baseline = json.load(f)
+        if isinstance(baseline, dict):
             Log.info(self, "")
             Log.info(self, "BASELINE CONFIGURATION:")
             Log.info(self, f"  Plugins: {', '.join(baseline.get('plugins', []))}")
@@ -1354,6 +1577,23 @@ class WOMultitenancyController(CementBaseController):
         
         Log.info(self, "Validating Baseline Configuration...")
         Log.info(self, "=" * 60)
+
+        # Surface an interrupted update's pending tenant DB migrations.
+        marker_path = _pending_upgrades_path(shared_root)
+        if os.path.exists(marker_path):
+            marker = None
+            try:
+                with open(marker_path) as fh:
+                    marker = json.load(fh)
+                pending = ', '.join(marker.get('domains') or []) or '(none)'
+            except (OSError, ValueError, AttributeError):
+                pending = '(unreadable ledger)'
+            release = (marker or {}).get('release') \
+                if isinstance(marker, dict) else '?'
+            Log.warn(self, "⚠️  Pending tenant DB migrations from release "
+                           f"{release}: {pending}")
+            Log.warn(self, "   Run: wo multitenancy update (recovers first)")
+            Log.info(self, "")
         
         # 1. Check baseline.json exists and is valid JSON
         try:
@@ -1466,6 +1706,10 @@ class WOMultitenancyController(CementBaseController):
         if not domain:
             Log.error(self, "Usage: wo multitenancy delete <domain>")
             return
+        _reject_extra_positionals(self, pargs)
+        domain = WODomain.validate(self, domain)
+        if not MTFunctions.valid_tenant_domain(domain):
+            Log.error(self, f"Invalid domain name: {domain!r}")
         
         if not MTDatabase.is_initialized(self):
             Log.error(self, "Multi-tenancy not initialized")
@@ -1536,6 +1780,14 @@ class WOMultitenancyController(CementBaseController):
         MTFunctions.purge_site_cache(
             self, domain, getattr(site, 'redis_prefix', None),
             getattr(site, 'redis_db', None))
+
+        # Evict the deleted tenant's compiled PHP from opcache so a future
+        # recreate never executes stale bytecode.
+        php_version = str(getattr(site, 'php_version', '') or '')
+        php_key = ('php' + php_version.replace('.', '')) if php_version \
+            else None
+        if not MTFunctions.reset_opcache(self, php_key=php_key):
+            Log.warn(self, "Opcache reset failed after site deletion")
 
         # Remove from multitenancy tracking
         try:
@@ -2046,6 +2298,11 @@ class WOMultitenancyController(CementBaseController):
         commit_msg = f"Baseline v{new_version}: Added plugin {plugin_slug}"
         if infra.git_commit_baseline(commit_msg):
             Log.info(self, f"✅ Git: {commit_msg}")
+            self._persist_baseline_version(new_version)
+        else:
+            Log.error(self, "Baseline git commit failed; baseline.json is "
+                            "written but NOT committed. Fix git state in "
+                            f"{shared_root} and re-run.")
         
         # Apply to sites if requested
         if apply_now:
@@ -2217,6 +2474,11 @@ class WOMultitenancyController(CementBaseController):
         
         if infra.git_commit_baseline(commit_msg):
             Log.info(self, f"✅ Git: {commit_msg}")
+            self._persist_baseline_version(new_version)
+        else:
+            Log.error(self, "Baseline git commit failed; baseline.json is "
+                            "written but NOT committed. Fix git state in "
+                            f"{shared_root} and re-run.")
         
         # Apply to sites if requested
         if apply_now and set_default:
@@ -2274,6 +2536,11 @@ class WOMultitenancyController(CementBaseController):
         commit_msg = f"Baseline v{new_version}: Removed plugin {plugin_slug}"
         if infra.git_commit_baseline(commit_msg):
             Log.info(self, f"✅ Git: {commit_msg}")
+            self._persist_baseline_version(new_version)
+        else:
+            Log.error(self, "Baseline git commit failed; baseline.json is "
+                            "written but NOT committed. Fix git state in "
+                            f"{shared_root} and re-run.")
         
         Log.info(self, "")
         Log.info(self, f"Plugin {plugin_slug} removed from baseline.")
@@ -2380,7 +2647,7 @@ class WOMultitenancyController(CementBaseController):
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
         if not MTFunctions.preflight_shared_config(self, shared_root):
-            return
+            Log.error(self, "Aborted: wp-config-shared.php failed preflight")
         baseline_file = f"{shared_root}/config/baseline.json"
 
         with open(baseline_file, 'r') as f:
@@ -2440,6 +2707,10 @@ class WOMultitenancyController(CementBaseController):
         )
         if not cron_sync_ok:
             Log.error(self, self.CRON_SYNC_FAILURE_HINT)
+        if summary.get('failed', 0) > 0:
+            Log.error(self, f"{summary.get('failed', 0)} site(s) failed "
+                            "baseline apply", False)
+            self.app.close(1)
 
     @expose(help="Remove multi-tenancy infrastructure (dangerous)")
     def remove(self):
@@ -2552,6 +2823,11 @@ class WOMultitenancyController(CementBaseController):
         commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
         if infra.git_commit_baseline(commit_msg):
             Log.info(self, f"✅ Git: {commit_msg}")
+            self._persist_baseline_version(new_version)
+        else:
+            Log.error(self, "Baseline git commit failed; baseline.json is "
+                            "written but NOT committed. Fix git state in "
+                            f"{shared_root} and re-run.")
         
         # Apply to sites if requested
         if apply_now:
@@ -2724,29 +3000,49 @@ class WOMultitenancyController(CementBaseController):
             # Read the rolled-back baseline
             with open(baseline_file, 'r') as f:
                 rolled_back = json.load(f)
-            
-            rollback_version = rolled_back.get('version', 0)
-            
-            # Create a new commit documenting the rollback
-            subprocess.run(
+
+            # Mint a NEW version for the rolled-back content: versions only
+            # move forward, so `validate` flags every site as outdated and
+            # `apply` re-converges the fleet.
+            new_version = current_version + 1
+            rolled_back['version'] = new_version
+            rolled_back['generated'] = datetime.now().isoformat()
+            with open(baseline_file, 'w') as f:
+                json.dump(rolled_back, f, indent=2)
+
+            # Commit documenting the rollback. The `Baseline v{N}:` prefix is
+            # load-bearing: the rollback finder above greps for it.
+            commit_msg = (
+                f"Baseline v{new_version}: Rollback to v{to_version} content"
+            )
+            add = subprocess.run(
                 ['git', 'add', 'config/baseline.json'],
                 cwd=shared_root,
-                capture_output=True
+                capture_output=True,
+                text=True,
             )
-            subprocess.run(
-                ['git', 'commit', '-m', 
-                 f'Rollback: Restored baseline to v{rollback_version}'],
+            if add.returncode != 0:
+                Log.error(self, f"git add failed: {add.stderr}")
+            commit = subprocess.run(
+                ['git', 'commit', '-m', commit_msg],
                 cwd=shared_root,
-                capture_output=True
+                capture_output=True,
+                text=True,
             )
-            
-            Log.info(self, f"✅ Rolled back to version {rollback_version}")
-            
+            if commit.returncode != 0:
+                Log.error(self, "git commit failed: "
+                                f"{commit.stdout}\n{commit.stderr}")
+            self._persist_baseline_version(new_version)
+
+            Log.info(self, f"✅ Baseline v{new_version} created with "
+                           f"v{to_version} content")
+
             # Apply if requested
             if apply_now:
                 Log.info(self, "")
                 Log.info(self, "Applying rollback to all sites...")
-                BaselineApplicator.apply_baseline_to_sites(self, config, rollback_version)
+                BaselineApplicator.apply_baseline_to_sites(
+                    self, config, new_version)
             else:
                 Log.info(self, "")
                 Log.info(self, "Baseline rolled back in configuration.")
@@ -2795,6 +3091,7 @@ class WOMultitenancyController(CementBaseController):
             }
             if getattr(pargs, 'json_output', False):
                 print(json.dumps(payload, default=str))
+                self.app.close(1)
             else:
                 Log.error(self, "❌ Multi-tenancy not initialized")
             return
@@ -2808,6 +3105,12 @@ class WOMultitenancyController(CementBaseController):
             print(json.dumps(result, default=str))
         else:
             Log.info(self, render_health_text(result), log=False)
+        # Exit codes for automation: 0 healthy, 2 degraded, 1 unhealthy.
+        status = result.get('status') if isinstance(result, dict) else None
+        if status == 'unhealthy':
+            self.app.close(1)
+        elif status == 'degraded':
+            self.app.close(2)
 
     @expose(help="Toggle maintenance mode for one site or every shared site")
     def maintenance(self):
@@ -2864,6 +3167,9 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, f"{ico} {item['domain']}: {item['status']}")
             Log.info(self, f"{action_event} target={item['domain']} result={item['status']}")
         Log.info(self, f"Nginx reload: {'ok' if reload_ok else 'failed'}")
+        if not reload_ok or any(
+                item['status'] != 'success' for item in results):
+            self.app.close(1)
 
 
 # ---------------------------------------------------------------------------

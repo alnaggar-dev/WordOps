@@ -6,6 +6,9 @@ set $wo_mt_maintenance 1;
 if ($realip_remote_addr = 127.0.0.1) {
     set $wo_mt_maintenance 0;
 }
+if ($realip_remote_addr = 127.0.0.2) {
+    set $wo_mt_maintenance 0;
+}
 if ($realip_remote_addr = "::1") {
     set $wo_mt_maintenance 0;
 }

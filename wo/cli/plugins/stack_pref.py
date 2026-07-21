@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import string
+import subprocess
 
 import psutil
 from wo.core.apt_repo import WORepo
@@ -172,12 +173,42 @@ def post_pref(self, apt_packages, packages, upgrade=False):
                     self, '{0}/upstream.conf'.format(ngxcnf),
                     'upstream.mustache', data, overwrite=True)
 
-                data = dict(phpconf=(
-                    bool(WOAptGet.is_installed(self, 'php7.2-fpm'))),
+                data = dict(
+                    php_versions=[
+                        {'php': k} for k in WOVar.wo_php_versions.keys()],
                     release=WOVar.wo_version)
                 WOTemplate.deploy(
                     self, '{0}/stub_status.conf'.format(ngxcnf),
                     'stub_status.mustache', data)
+                try:
+                    nginx_v = subprocess.run(
+                        ['/usr/sbin/nginx', '-V'],
+                        capture_output=True, text=True)
+                    quic = 'http_v3_module' in (nginx_v.stderr or '')
+                except OSError:
+                    quic = False
+                # The distro's stock default vhost also claims
+                # default_server on :80; ours replaces it with return 444.
+                stock_enabled = '/etc/nginx/sites-enabled/default'
+                stock_available = '/etc/nginx/sites-available/default'
+                if (os.path.islink(stock_enabled)
+                        and os.path.realpath(stock_enabled) ==
+                        stock_available):
+                    try:
+                        with open(stock_available,
+                                  encoding='utf-8') as fh:
+                            stock = fh.read()
+                    except OSError:
+                        stock = ''
+                    if ('default_server' in stock
+                            and '/var/www/html' in stock):
+                        os.remove(stock_enabled)
+                        Log.debug(self, 'Disabled distro default vhost '
+                                  '(replaced by default-server.conf)')
+                data = dict(release=WOVar.wo_version, quic=quic)
+                WOTemplate.deploy(
+                    self, '{0}/default-server.conf'.format(ngxcnf),
+                    'default-server.mustache', data, overwrite=True)
                 data = dict(release=WOVar.wo_version)
                 WOTemplate.deploy(
                     self, '{0}/webp.conf'.format(ngxcnf),
@@ -490,8 +521,8 @@ def post_pref(self, apt_packages, packages, upgrade=False):
             config['Date']['date.timezone'] = WOVar.wo_timezone
             config['opcache']['opcache.enable'] = '1'
             config['opcache']['opcache.interned_strings_buffer'] = '64'
-            config['opcache']['opcache.max_accelerated_files'] = '10000'
-            config['opcache']['opcache.memory_consumption'] = '256'
+            config['opcache']['opcache.max_accelerated_files'] = '100000'
+            config['opcache']['opcache.memory_consumption'] = '384'
             config['opcache']['opcache.save_comments'] = '1'
             config['opcache']['opcache.revalidate_freq'] = '5'
             config['opcache']['opcache.consistency_checks'] = '0'
