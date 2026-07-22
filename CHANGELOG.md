@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 #### Changed
 
 -   Default PHP version bumped to 8.4 across `wo.conf`, installer fallback, and multitenancy defaults
--   Change generated PHP-FPM pools to use a tested six-worker static warm pool and remove the broad `open_basedir` restriction; keep the diagnostic debug pool ondemand. This avoids multitenancy symlink realpath overhead and cold worker forks for uncached wp-admin requests.
+-   Change generated PHP-FPM pools to use a tested six-worker static warm pool and remove the broad `open_basedir` restriction; keep diagnostic pools ondemand. This avoids multitenancy symlink realpath overhead and cold worker forks for uncached wp-admin requests. Hosts with multiple installed PHP versions should size or scope this policy per deployment because each version gets two production pools.
 
 #### Fixed
 
