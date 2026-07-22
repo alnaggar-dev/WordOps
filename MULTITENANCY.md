@@ -392,11 +392,12 @@ Plugins and themes are shared read-only symlinks. A plugin that writes into its 
 
 ## Logs
 
-All multi-tenancy logging goes to `/var/log/wo/wordops.log`.
+Interactive multi-tenancy commands log to `/var/log/wo/wordops.log`. Scheduled backup jobs also append their stdout and stderr to `/var/log/wo/backup.log`.
 
 ```bash
 wo --debug multitenancy <cmd>
 tail -f /var/log/wo/wordops.log
+tail -f /var/log/wo/backup.log  # exists after the first scheduled backup starts
 ```
 
 ## Fleet Backups (Cloudflare R2)
@@ -426,11 +427,24 @@ daily files use `files`; safety snapshots add `pre-restore`,
 
 ### Backup setup
 
-1. Create the R2 bucket and its S3 API credentials. The R2 bucket MUST have
-   **no lifecycle or expiry rules**. R2 lifecycle deletion removes restic pack
-   files rather than applying a coherent snapshot policy and corrupts the
-   repository. Retention belongs to restic alone.
-2. Run the setup command as root:
+1. Create a dedicated R2 bucket and an S3 API token with **Object Read & Write**
+   scoped only to that bucket. Use separate buckets and tokens for test and
+   production, and rotate any credential exposed in logs, chat, or shell
+   history. The bucket MUST have **no lifecycle or expiry rules**. R2 lifecycle
+   deletion removes restic pack files rather than applying a coherent snapshot
+   policy and corrupts the repository. Retention belongs to restic alone.
+2. Check whether this server already has backup credentials:
+
+   ```bash
+   test -f /etc/wo/backup.env \
+     && grep '^RESTIC_REPOSITORY=' /etc/wo/backup.env \
+     || echo 'No existing backup configuration'
+   ```
+
+   A complete `/etc/wo/backup.env` is reused: `backup init` will not prompt for
+   replacement credentials or generate a new repository password. If it names
+   an old or test repository, move it aside deliberately before continuing.
+3. Run the setup command as root:
 
    ```bash
    wo multitenancy backup init
@@ -441,8 +455,14 @@ daily files use `files`; safety snapshots add `pre-restore`,
    architecture before installing it, and refuses an unverified binary. This
    pinned release is new enough for `--stdin-from-command`,
    `--retry-lock`, and the restore behavior used here.
-3. Answer the R2 prompts. The command writes the credentials and generated
-   repository password to `/etc/wo/backup.env` as root-owned mode `0600`:
+4. Answer the R2 prompts. For an automatic-jurisdiction bucket, enter
+   `https://<account_id>.r2.cloudflarestorage.com` as the endpoint. For an EU
+   jurisdiction bucket, enter
+   `https://<account_id>.eu.r2.cloudflarestorage.com`; the default endpoint
+   returns `AccessDenied` for an EU bucket even when the credentials are
+   correct. The bucket name has its own prompt, so do not append it to the
+   endpoint. The command writes the credentials and generated repository
+   password to `/etc/wo/backup.env` as root-owned mode `0600`:
 
    ```sh
    AWS_ACCESS_KEY_ID=…
@@ -454,9 +474,21 @@ daily files use `files`; safety snapshots add `pre-restore`,
 
    It then runs `restic init` against that repository, writes the schedules to
    `/etc/cron.d/wo-backup`, and performs the first end-to-end database and
-   files run. Check that run and `/var/log/wo/backup.log` before considering
-   setup complete.
-4. `backup init` prints the repository password **once**. The exact warning is:
+   files run. Verify the installation before considering setup complete:
+
+   ```bash
+   stat -c '%U:%G %a %n' /etc/wo/backup.env /etc/cron.d/wo-backup
+   systemctl is-active cron
+   wo multitenancy backup status
+   wo multitenancy backup list --db
+   wo multitenancy backup list --files
+   wo multitenancy backup check
+   ```
+
+   `backup init` and manual backup commands write their output to the terminal.
+   `/var/log/wo/backup.log` is created by shell redirection when the first
+   scheduled cron job starts; its absence before that first run is expected.
+5. `backup init` prints the repository password **once**. The exact warning is:
 
    ```text
    WARNING: This repository password is printed only once. It MUST be stored off-box — losing it loses every backup.
@@ -466,8 +498,8 @@ daily files use `files`; safety snapshots add `pre-restore`,
    storage immediately. R2 credentials without `RESTIC_PASSWORD` cannot
    decrypt or restore this repository.
 
-The generated cron file runs the hourly database job at `:07`, the daily files
-job at `03:10` followed by the family retention pass, weekly
+The generated cron file uses the server's local timezone: hourly database at
+`:07`, daily files at `03:10` followed by the family retention pass, weekly
 `restic forget --prune` on Sunday at `04:00`, and the monthly metadata-only
 check on day 1 at `05:00`. All restic calls use `--retry-lock 5m`; a transient
 R2 failure or stale restic lock must not silently strand the next hourly slot.
