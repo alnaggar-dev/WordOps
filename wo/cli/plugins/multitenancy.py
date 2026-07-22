@@ -32,6 +32,9 @@ from wo.cli.plugins.multitenancy_functions import (
 )
 from wo.cli.plugins.multitenancy_db import MTDatabase
 from wo.cli.plugins.multitenancy_health import HealthChecker, render_text as render_health_text
+from wo.cli.plugins.multitenancy_backup_functions import (
+    fleet_operation, write_tombstone, repair_backup_cron
+)
 
 
 def wo_multitenancy_hook(app):
@@ -181,6 +184,7 @@ class WOMultitenancyController(CementBaseController):
         self.app.args.print_help()
 
     @expose(help="Initialize WordPress multi-tenancy shared infrastructure")
+    @fleet_operation('init')
     def init(self):
         """Initialize shared WordPress infrastructure"""
         pargs = self.app.pargs
@@ -281,6 +285,7 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"Failed to initialize multi-tenancy: {str(e)}")
 
     @expose(help="Create a WordPress site using shared core")
+    @fleet_operation('create')
     def create(self):
         """Create a new site with shared WordPress core"""
         return self._create_impl()
@@ -720,6 +725,7 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, "Recovered all pending tenant DB migrations")
 
     @expose(help="Update WordPress core and plugins for all shared sites")
+    @fleet_operation('update')
     def update(self):
         """Update shared WordPress infrastructure"""
         pargs = self.app.pargs
@@ -1352,6 +1358,7 @@ class WOMultitenancyController(CementBaseController):
             return
 
     @expose(help="Rollback to previous WordPress release")
+    @fleet_operation('rollback')
     def rollback(self):
         """Rollback to previous release"""
         pargs = self.app.pargs
@@ -1687,11 +1694,13 @@ class WOMultitenancyController(CementBaseController):
 
 
     @expose(help="Delete a multitenancy site and its tracking")
+    @fleet_operation('delete')
     def delete(self):
         """Delete a site from multitenancy system"""
         return self._delete_impl()
 
     @expose(help="Rename a multitenancy site's primary domain")
+    @fleet_operation('rename')
     def rename(self):
         """Rename a shared-core tenant domain in place."""
         result = self._rename_impl()
@@ -1793,6 +1802,12 @@ class WOMultitenancyController(CementBaseController):
         try:
             session.delete(site)
             session.commit()
+            if not write_tombstone(domain):
+                Log.warn(
+                    self,
+                    f"Could not write backup tombstone for {domain}; "
+                    "deleted-tenant snapshots will not be swept automatically"
+                )
             Log.info(self, "✅ Removed from multitenancy tracking")
 
 
@@ -2145,6 +2160,7 @@ class WOMultitenancyController(CementBaseController):
             return False
 
     @expose(help="Add plugin to baseline")
+    @fleet_operation('add_plugin')
     def add_plugin(self):
         """
         Add a plugin to the baseline configuration
@@ -2316,6 +2332,7 @@ class WOMultitenancyController(CementBaseController):
 
 
     @expose(help="Add theme to baseline")
+    @fleet_operation('add_theme')
     def add_theme(self):
         """
         Add a theme to the baseline configuration
@@ -2493,6 +2510,7 @@ class WOMultitenancyController(CementBaseController):
 
 
     @expose(help="Remove plugin from baseline")
+    @fleet_operation('remove_plugin')
     def remove_plugin(self):
         """Remove a plugin from the baseline"""
         pargs = self.app.pargs
@@ -2551,6 +2569,7 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Deactivate it per site with wp-cli if needed.")
 
     @expose(help="Update plugin from its original source")
+    @fleet_operation('update_plugin')
     def update_plugin(self):
         """
         Update a plugin from its original source (WordPress.org, GitHub, or URL)
@@ -2590,6 +2609,7 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, "Check the error messages above for details")
 
     @expose(help="Update theme from its original source")
+    @fleet_operation('update_theme')
     def update_theme(self):
         """
         Update the theme from its original source (WordPress.org, GitHub, or URL)
@@ -2635,6 +2655,7 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, "Check the error messages above for details")
 
     @expose(help="Apply current baseline to all sites")
+    @fleet_operation('apply')
     def apply(self):
         """Apply baseline to all sites immediately"""
         return self._apply_impl()
@@ -2691,6 +2712,10 @@ class WOMultitenancyController(CementBaseController):
         cron_sync_ok = True
         if not dry_run:
             cron_sync_ok = MTFunctions.sync_wp_cron_entries(self)
+            try:
+                repair_backup_cron(self.app)
+            except Exception as exc:
+                Log.warn(self, f"Could not repair backup cron: {exc}")
 
         summary = result if isinstance(result, dict) else {}
         summary.setdefault('baseline_version', baseline_version)
@@ -2713,6 +2738,7 @@ class WOMultitenancyController(CementBaseController):
             self.app.close(1)
 
     @expose(help="Remove multi-tenancy infrastructure (dangerous)")
+    @fleet_operation('remove')
     def remove(self):
         """Remove multi-tenancy infrastructure"""
         pargs = self.app.pargs
@@ -2759,6 +2785,7 @@ class WOMultitenancyController(CementBaseController):
     # ==========================================
     
     @expose(help="Set default theme for all sites")
+    @fleet_operation('set_theme')
     def set_theme(self):
         """
         Set the default theme in baseline configuration
@@ -2893,6 +2920,7 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"Error accessing git history: {e}")
     
     @expose(help="Rollback baseline to previous version")
+    @fleet_operation('baseline_rollback')
     def baseline_rollback(self):
         """
         Rollback baseline configuration to a previous version
@@ -3058,6 +3086,7 @@ class WOMultitenancyController(CementBaseController):
     
 
     @expose(help="Manage shared WordPress configuration")
+    @fleet_operation('shared_config')
     def shared_config(self):
         """Edit the shared wp-config (the only supported action)."""
         if not MTDatabase.is_initialized(self):
@@ -3285,4 +3314,6 @@ def _humanize_seconds(seconds):
 def load(app):
     """Load the multi-tenancy plugin"""
     app.handler.register(WOMultitenancyController)
+    from wo.cli.plugins.multitenancy_backup import WOMultitenancyBackupController
+    app.handler.register(WOMultitenancyBackupController)
     app.hook.register('post_setup', wo_multitenancy_hook)

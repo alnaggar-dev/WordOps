@@ -398,3 +398,486 @@ All multi-tenancy logging goes to `/var/log/wo/wordops.log`.
 wo --debug multitenancy <cmd>
 tail -f /var/log/wo/wordops.log
 ```
+
+## Fleet Backups (Cloudflare R2)
+
+Fleet backups are encrypted restic snapshots stored in one Cloudflare R2
+repository. The repository is shared by the whole multi-tenancy fleet, so
+restic can deduplicate shared assets and similar database dumps while tags keep
+each tenant addressable.
+
+- **Databases:** one full logical `mariadb-dump` per enabled tenant every hour
+  (the normal target is `:07`, so the RPO is one hour).
+- **Files:** one daily snapshot of the recoverability set: tenant uploads,
+  `wp-config.php`, nginx state, shared baseline/config/content, the tracking
+  database, and `/etc/letsencrypt`.
+- **Retention:** database snapshots keep `24h,7d,4w,3m`; file snapshots keep
+  `7d,4w,6m`. The monthly tails are intentional late-discovery protection.
+- **Restores:** replacement semantics are used throughout. Restoring a site
+  makes its post-restore state equal to the selected snapshot: files are
+  synchronized with deletion (`rsync --delete`) and the database is
+  drop-and-recreated before import. A restore is never an overlay that leaves
+  post-snapshot files or tables behind.
+
+There is one repository, not one repository per tenant. The snapshot tags are
+the tenant boundary: hourly database snapshots use `db` and `site:<domain>`;
+daily files use `files`; safety snapshots add `pre-restore`,
+`operation:<id>`, and (for fleet captures) `fleet`.
+
+### Backup setup
+
+1. Create the R2 bucket and its S3 API credentials. The R2 bucket MUST have
+   **no lifecycle or expiry rules**. R2 lifecycle deletion removes restic pack
+   files rather than applying a coherent snapshot policy and corrupts the
+   repository. Retention belongs to restic alone.
+2. Run the setup command as root:
+
+   ```bash
+   wo multitenancy backup init
+   ```
+
+   `backup init` installs the official restic `0.19.1` binary at
+   `/usr/local/bin/restic`, verifies the release SHA256 for the machine
+   architecture before installing it, and refuses an unverified binary. This
+   pinned release is new enough for `--stdin-from-command`,
+   `--retry-lock`, and the restore behavior used here.
+3. Answer the R2 prompts. The command writes the credentials and generated
+   repository password to `/etc/wo/backup.env` as root-owned mode `0600`:
+
+   ```sh
+   AWS_ACCESS_KEY_ID=…
+   AWS_SECRET_ACCESS_KEY=…
+   RESTIC_REPOSITORY=s3:https://<account_id>.r2.cloudflarestorage.com/<bucket>
+   RESTIC_PASSWORD=<generated>
+   RESTIC_CACHE_DIR=/var/cache/restic
+   ```
+
+   It then runs `restic init` against that repository, writes the schedules to
+   `/etc/cron.d/wo-backup`, and performs the first end-to-end database and
+   files run. Check that run and `/var/log/wo/backup.log` before considering
+   setup complete.
+4. `backup init` prints the repository password **once**. The exact warning is:
+
+   ```text
+   WARNING: This repository password is printed only once. It MUST be stored off-box — losing it loses every backup.
+   ```
+
+   Copy the password to an off-box password manager or other protected
+   storage immediately. R2 credentials without `RESTIC_PASSWORD` cannot
+   decrypt or restore this repository.
+
+The generated cron file runs the hourly database job at `:07`, the daily files
+job at `03:10` followed by the family retention pass, weekly
+`restic forget --prune` on Sunday at `04:00`, and the monthly metadata-only
+check on day 1 at `05:00`. All restic calls use `--retry-lock 5m`; a transient
+R2 failure or stale restic lock must not silently strand the next hourly slot.
+
+### Backup configuration
+
+Non-secret backup settings are optional keys in
+`/etc/wo/plugins.d/multitenancy.conf`. The complete section, including the
+defaults, is:
+
+```ini
+[backup]
+enable_backup = true
+db_schedule_minute = 7          ; hourly at :07
+files_schedule = 03:10          ; daily
+prune_schedule = Sun 04:00      ; weekly
+keep_db = 24h,7d,4w,3m
+keep_files = 7d,4w,6m
+deleted_tenant_grace = 30d      ; forget a deleted tenant's snapshots this long after deletion
+check_schedule = 1 05:00        ; monthly metadata-only restic check (day-of-month HH:MM)
+db_ping_url =                   ; optional dead-man URL for the hourly DB run (healthchecks.io style)
+files_ping_url =                ; optional dead-man URL for the daily files run
+prune_ping_url =                ; optional dead-man URL for the weekly prune
+check_ping_url =                ; optional dead-man URL for the monthly check
+```
+
+The `[backup]` values are non-secret; R2 keys and `RESTIC_PASSWORD` stay in
+`/etc/wo/backup.env`. Keep all `[backup]` scalar keys above the plugin/theme
+source sections (`[wordpress_plugins]`, `[wordpress_themes]`, `[github_*]`,
+and `[url_*]`). This is the same scalar-section ordering quirk as the rest of
+this file: source sections belong at the end so later scalar keys are not
+parsed into the wrong section.
+
+Configure one healthchecks.io-style dead-man check **per job**, not one URL for
+the whole fleet. The jobs have different periods and each URL receives
+`/start` at entry, the base URL on success, and `/fail` on failure. Set each
+check's grace to at least **2 times that job's period**: one legitimate
+lock-skip must not page, while two consecutive misses should. In particular,
+the hourly DB, daily files, weekly prune, and monthly check each need their own
+grace window.
+
+### Backup CLI
+
+Every command is under `wo multitenancy backup`:
+
+```text
+wo multitenancy backup init
+wo multitenancy backup run [--db|--files|--all]
+wo multitenancy backup list [<domain>] [--db|--files]
+wo multitenancy backup restore <domain> --db|--files|--all [--at=T] [--snapshot=ID] [--operation=ID] [--force]
+wo multitenancy backup restore --all-sites [--at=T] [--force]
+wo multitenancy backup status
+wo multitenancy backup prune
+wo multitenancy backup check
+wo multitenancy backup forget-site <domain> [--force]
+```
+
+`run` defaults to `--all`; use `--db` or `--files` to run exactly one family.
+`--snapshot=ID` is valid only with `--db` or `--files`, because one restic
+snapshot belongs to one family. `--all` resolves a database snapshot and a
+files snapshot independently, then prints both timestamps and their skew
+before confirmation. Use `--at=T` to resolve the newest snapshot at or before
+the supplied time. `--operation=ID` resolves the complete, shared
+`operation:<id>` safety set and is valid for a single-site `--all` restore.
+The command rejects a missing, duplicate, wrong-site, or incomplete operation
+set before writing anything.
+
+`list` filters by family and optionally by domain. `status` reports the last
+success and duration for each family and tenant, per-tenant `data_added`
+(restic's post-dedup upload bytes), repository statistics, snapshot counts,
+the last check age, stale tenants, orphan-tag anomalies, and pending
+tombstones. `prune` is the manual `forget --prune` operation. `forget-site`
+is the explicit operator action for an orphan `site:<domain>` tag when there
+is no live tenant and no tombstone; it is not an automatic substitute for the
+tombstone lifecycle, and fleet-tagged safety snapshots are not carved out of
+their fleet operation.
+
+`check` runs the scheduled monthly metadata-only restic check. Once per
+quarter, perform the deeper read check manually from a protected shell:
+
+```bash
+set -a
+. /etc/wo/backup.env
+set +a
+/usr/local/bin/restic --retry-lock 5m check --read-data-subset=5%
+```
+
+### Restore semantics
+
+#### Single site
+
+Use an explicit scope; a bare restore is rejected:
+
+```bash
+wo multitenancy backup restore <domain> --db
+wo multitenancy backup restore <domain> --files
+wo multitenancy backup restore <domain> --all
+```
+
+`--at=T` resolves the newest matching snapshot at or before `T`.
+`--snapshot=ID` names one snapshot and therefore works only with `--db` or
+`--files`. `--all` resolves the hourly database and daily files snapshots
+separately, prints their timestamps and skew, and asks for confirmation unless
+`--force` is supplied. To restore a safety capture, use
+`--operation=<id>`; the operation must contain exactly one valid snapshot per
+requested family for this site.
+
+The restore enables the existing per-site maintenance gate before taking its
+first safety snapshot. The safety capture covers exactly the write-set:
+current DB for `--db`, all site files for `--files`, or both for `--all`.
+Each safety snapshot is tagged `pre-restore`, `site:<domain>`, and
+`operation:<id>`, and the current DB dump is also retained locally as
+`/var/lib/wo-backup/restore/<domain>-<stamp>/pre-restore.sql`. That operation
+ID is the rollback handle.
+
+Restore order is files first, then DB. Files are staged and applied with
+`rsync -a --delete`; optional `force-ssl-<domain>.conf` is deleted when it is
+absent from the selected snapshot. The DB restore materializes the dump,
+checks it, drops and recreates the target database, and imports it. nginx must
+pass `nginx -t` before reload. Ownership and modes are verified per path
+(nginx configuration root-owned, `wp-config.php` `0640`, and site trees
+owned by `www-data`); a blanket recursive `chown` is not safe.
+
+The current `dbase.db` row is authoritative for a single-site restore. The
+staged `wp-config.php` has its `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and
+`DB_HOST` rewritten to the current row before it is installed, and the dump is
+imported into that current database/user. The site row and MySQL users/grants
+are not changed by a single-site restore.
+
+If the files phase fails, leave the gate up and use the printed rollback
+command:
+
+```bash
+wo multitenancy backup restore <domain> --files --operation=<id>
+```
+
+If DB import fails, the command immediately rolls back from the local
+`pre-restore.sql` without depending on R2, retains the staging files, and
+leaves the gate up. Only a second failure during that local rollback changes
+the result to printed manual recovery commands. Never blanket-ungate a failed
+site; investigate it and disable its gate only after validation.
+
+#### Fleet restore on a surviving box
+
+`restore --all-sites` is manifest-driven. It stages and verifies `dbase.db`
+from the selected snapshot, derives the tenant list and DB mapping from those
+restored rows (not from a potentially mangled current tracking database), and
+prints the snapshot/current manifest diff before confirmation. It creates one
+operation safety set before writing: per-site DB and files captures, a global
+paths capture, and a repository-resident `operation-manifest.json`.
+
+Current-only tenants are **quarantined before the cutover**. Quarantine means
+they are removed from nginx's served set as a batch, nginx is tested and
+reloaded immediately, and then each tenant's site tree, vhost,
+`force-ssl` configuration, cron entry, and DB dump are moved into a root-only
+0700 directory:
+
+```text
+/var/lib/wo-backup/quarantine/<domain>-<stamp>/
+```
+
+The current-only database and user are dropped and a normal tombstone is
+written. Nothing remains reachable, but the data exists both in that
+quarantine directory and in the remote `pre-restore` safety snapshots. A
+reload failure aborts before the quarantine/cutover proceeds. There is no
+preserve flag: leaving an unknown tenant served would violate replacement
+semantics.
+
+After the snapshot global metadata is activated, the fleet restore performs an
+ensure-DB pass from the snapshot rows and then applies the manifest tenant
+restore. It continues past individual failures and exits nonzero with a
+per-site summary if any site fails. To reinstate a legitimate current-only
+tenant during the deleted-tenant grace window, create a fresh registered site
+and restore its safety set:
+
+```bash
+wo multitenancy create <domain>
+wo multitenancy backup restore <domain> --all --operation=<id> --force
+```
+
+The fleet operation ID is printed in the quarantine summary and stored in its
+manifest. Reinstate within `deleted_tenant_grace`; otherwise use the
+quarantine data for deliberate manual recovery.
+
+#### Deleted-site restore
+
+`backup restore` never fabricates a missing site record. Recreate the site
+first, which registers new credentials, and then restore it:
+
+```bash
+wo multitenancy create deleted.example.com
+wo multitenancy backup restore deleted.example.com --all --force
+```
+
+The files restore rewrites historical `DB_*` values to the newly registered
+current row, so the recreated site and its imported dump agree.
+
+### Deleted tenants and tombstones
+
+`wo multitenancy delete <domain>` removes the tenant row and, after the
+successful removal, writes a durable root-only tombstone at
+`/var/lib/wo-backup/tombstones/<domain>.json` containing the domain and UTC
+deletion time. Delete does not need R2 to succeed and never forgets remote
+snapshots inline.
+
+The daily retention job processes tombstones only. After
+`deleted_tenant_grace` (default `30d`), it finds that domain's snapshots,
+excludes snapshots tagged `fleet`, forgets the remaining IDs, and removes the
+tombstone only after the remote forget succeeds. A failed forget is retried
+the next day. No `--keep-*` policy and no absence from `dbase.db` authorizes
+deletion: an untracked `site:` tag is an anomaly for `status`/`health` and
+requires explicit `backup forget-site`.
+
+If a site is recreated or an older `dbase.db` is restored while its tombstone
+exists, the live tracking row wins; the stale tombstone is dropped with a
+warning and the snapshots are retained. The supported recovery is always
+**recreate then restore within the grace window**.
+
+### Dead box — DR runbook
+
+Use this order on a replacement server. Do not run a restore against a blank
+box until the fork, the backup credentials, the stack, and the shared
+multi-tenancy scaffolding are ready. Pick the files snapshot timestamp/ID and
+the matching database restore point before starting.
+
+1. **Install the fork.** Run the fork installer, not the upstream/PyPI path:
+
+   ```bash
+   wget -qO wo https://raw.githubusercontent.com/alnaggar-dev/WordOps/main/install
+   sudo bash wo
+   ```
+
+2. **Restore the backup environment and repository password from off-box
+   storage.** Do not run `backup init` on the replacement box; it would be a
+   new repository setup. For example, after attaching protected off-box
+   recovery media:
+
+   ```bash
+   install -o root -g root -m 0600 /mnt/off-box/wo-backup.env /etc/wo/backup.env
+   test "$(stat -c '%a' /etc/wo/backup.env)" = 600
+   grep -q '^RESTIC_PASSWORD=.' /etc/wo/backup.env
+   ```
+
+   The file must contain the original R2 endpoint, access key, secret, and
+   `RESTIC_PASSWORD`; losing that password loses the encrypted repository.
+3. **Install the stack and every PHP version in use.** Install nginx, MariaDB,
+   WP-CLI, and the PHP-FPM versions recorded for the tenants:
+
+   ```bash
+   wo stack install
+   # Repeat the selectors for every version in the restored tenant rows.
+   wo stack install --php83 --php84
+   ```
+
+   Do not omit an older PHP-FPM version merely because the replacement's
+   default is newer; restored vhosts point at their recorded PHP sockets.
+4. **Initialize multi-tenancy FIRST, before any restore.** This plain init
+   repairs/writes shared directories, config, and git scaffolding even without
+   `--force`; running it after a restore could clobber restored global state:
+
+   ```bash
+   wo multitenancy init
+   ```
+
+5. **Restore the global paths from the selected files snapshot.** Restore
+   shared baseline/config/content, the multitenancy config, `/etc/letsencrypt`,
+   and the stable SQLite staging pathname. Restore to `/` so the recorded
+   absolute paths are materialized; do not restore `dbase.db` directly onto
+   the live path:
+
+   ```bash
+   SNAPSHOT_ID='<files-snapshot-id>'
+   /usr/local/bin/restic --retry-lock 5m restore "$SNAPSHOT_ID" --target / \
+     --include /var/www/shared/config \
+     --include /var/www/shared/.git \
+     --include /var/www/shared/wp-content \
+     --include /etc/wo/plugins.d/multitenancy.conf \
+     --include /var/lib/wo-backup/staging/dbase.db \
+     --include /etc/letsencrypt
+   ```
+
+   The database copy materializes at
+   `/var/lib/wo-backup/staging/dbase.db`. Verify it before activating it, then
+   atomically move it onto the live metadata path:
+
+   ```bash
+   python3 - <<'PY'
+   import os
+   import sqlite3
+
+   staged = '/var/lib/wo-backup/staging/dbase.db'
+   live = '/var/lib/wo/dbase.db'
+   with sqlite3.connect(staged) as conn:
+       result = conn.execute('PRAGMA integrity_check').fetchone()[0]
+   if result != 'ok':
+       raise SystemExit('dbase.db integrity check failed: ' + str(result))
+   os.replace(staged, live)
+   PY
+   chown root:root /var/lib/wo/dbase.db
+   chmod 0600 /var/lib/wo/dbase.db
+   ```
+
+6. **Run the ensure-DB pass from the restored rows.** A fresh box has no
+   tenant databases, users, or grants, and logical dumps do not carry them.
+   The fleet restore command performs this pass before importing sites: it
+   recreates **every MySQL database, user, and grant** described by the
+   restored `dbase.db` rows, using the historical fleet credentials as the
+   authority for this fleet/DR scope:
+
+   ```bash
+   wo multitenancy backup restore --all-sites --at='<restore-time>' --force
+   ```
+
+7. **Run the per-site restore loop / fleet restore.** The `--all-sites`
+   command in step 6 is the manifest-driven fleet loop: it gates affected
+   sites, restores global metadata and each tenant's files and DB with
+   replacement semantics, quarantines current-only tenants before cutover,
+   and reports every per-site result. Do not substitute a loop that enumerates
+   the pre-restore current database; the snapshot manifest is authoritative.
+
+   `apply` does not repair the per-site core links on existing sites. Before
+   applying the baseline, recreate the links and generated front controller
+   explicitly (the daily file set intentionally excludes re-downloadable
+   shared core releases):
+
+   ```bash
+   set -eu
+   for h in /var/www/*/htdocs; do
+       [ -d "$h" ] || continue
+       mkdir -p "$h/wp-content"
+       for name in wp wp-content/plugins wp-content/themes \
+           wp-content/mu-plugins wp-content/languages \
+           wp-login.php wp-admin wp-includes wp-cron.php \
+           xmlrpc.php wp-comments-post.php wp-settings.php; do
+           if [ -e "$h/$name" ] && [ ! -L "$h/$name" ]; then
+               echo "Refusing to replace real path: $h/$name" >&2
+               exit 1
+           fi
+           rm -f "$h/$name"
+       done
+       ln -s /var/www/shared/current "$h/wp"
+       for name in wp-login.php wp-admin wp-includes wp-cron.php \
+           xmlrpc.php wp-comments-post.php wp-settings.php; do
+           ln -s "wp/$name" "$h/$name"
+       done
+       for name in plugins themes mu-plugins languages; do
+           ln -s "/var/www/shared/wp-content/$name" "$h/wp-content/$name"
+       done
+       if [ ! -e "$h/index.php" ]; then
+           cat > "$h/index.php" <<'PHP'
+   <?php
+   define( 'WP_USE_THEMES', true );
+   require __DIR__ . '/wp/wp-blog-header.php';
+   PHP
+       fi
+   done
+   ```
+
+8. **Apply the restored baseline.** After the links above exist, apply the
+   restored baseline to every enabled tenant and validate nginx:
+
+   ```bash
+   wo multitenancy apply
+   nginx -t
+   systemctl reload nginx
+   ```
+
+   Keep failed tenants gated until their per-site restore is repaired and
+   validated.
+9. **Reinstate the acme.sh renewal cron.** `/etc/letsencrypt` contains the
+   account and certificate state, but a replacement box also needs the renewal
+   scheduler:
+
+   ```bash
+   /etc/letsencrypt/acme.sh \
+     --config-home /etc/letsencrypt/config --install-cronjob
+   ```
+
+   Confirm the installed root cron entry and run a non-destructive renewal
+   check before serving production traffic.
+10. **Cut DNS over last.** Confirm `nginx -t`, PHP-FPM sockets, HTTPS
+    certificates, and representative site responses on the replacement IP,
+    then update the authoritative A/AAAA records (and any proxy/origin
+    settings) to the replacement server. Keep the old DNS target available
+    until those checks pass.
+
+### DR code-verification note
+
+`BaselineApplicator.apply_baseline_to_site` starts at
+`wo/cli/plugins/multitenancy_functions.py:3889` and its body through line 4062
+only applies plugins, options, cache configuration, and the theme through
+WP-CLI. `apply_baseline_to_sites` calls it at lines 4346-4354. It does not call
+`create_shared_symlinks`; that helper is the create-time path at lines 448-515
+and only creates missing links/index files. Therefore `wo multitenancy apply`
+does **not** regenerate `wp`, `wp-login.php`, or the generated `index.php` for
+an existing restored tenant, which is why the explicit relink loop is required
+in step 7.
+
+### Backup threat model
+
+This design accepts that a root compromise can wipe the repository: the R2
+credentials live on the server and restic needs delete rights for its own
+locks and retention. R2 prefix-scoped append-only credentials do not make the
+normal backup flow safe from a root compromise. The escape hatch is a second
+restic repository copied with `restic copy`, initiated/pulled **from another
+machine** that holds independent credentials:
+
+```text
+restic -r <second-repository> copy --from-repo <primary-repository>
+```
+
+Keep the second repository and its credentials outside the first server's
+root trust boundary.

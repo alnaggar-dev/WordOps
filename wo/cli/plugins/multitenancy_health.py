@@ -12,7 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 from wo.core.logging import Log
 from wo.cli.plugins.multitenancy_db import MTDatabase
@@ -53,6 +53,7 @@ class HealthChecker:
             lambda: self._check_sites(site_filter=site_filter),
             critical=False,
         )
+        self.register('backup', self._check_backup, critical=False)
         return self
 
     def run_all(self):
@@ -227,6 +228,275 @@ class HealthChecker:
                 'per_site': per_site,
             },
         }
+
+
+    def _check_backup(self):
+        """Check backup freshness and local operator-attention state."""
+        try:
+            from wo.cli.plugins.multitenancy_backup_functions import (
+                QUARANTINE_ROOT,
+                backup_is_configured,
+                load_backup_config,
+                load_state,
+                read_tombstones,
+            )
+        except Exception as exc:
+            return {
+                'status': STATUS_ERROR,
+                'details': {'error': f'backup module unavailable: {exc}'},
+            }
+
+        try:
+            config = load_backup_config(self.app) or {}
+        except Exception as exc:
+            return {
+                'status': STATUS_ERROR,
+                'details': {'error': f'backup config unavailable: {exc}'},
+            }
+        if not _backup_config_enabled(config):
+            return {
+                'status': STATUS_OK,
+                'details': {'note': 'backup disabled/unconfigured'},
+            }
+        try:
+            configured = backup_is_configured()
+        except Exception as exc:
+            return {
+                'status': STATUS_ERROR,
+                'details': {'error': f'backup configuration check failed: {exc}'},
+            }
+        if not configured:
+            return {
+                'status': STATUS_OK,
+                'details': {'note': 'backup disabled/unconfigured'},
+            }
+
+        try:
+            state = load_state() or {}
+        except Exception as exc:
+            return {
+                'status': STATUS_ERROR,
+                'details': {'error': f'backup state unavailable: {exc}'},
+            }
+        runs = state.get('runs') if isinstance(state, dict) else {}
+        if not isinstance(runs, dict):
+            runs = {}
+        db_run = runs.get('db')
+        files_run = runs.get('files')
+        if not _backup_run_success(db_run) and not _backup_run_success(files_run):
+            return {
+                'status': STATUS_ERROR,
+                'details': {
+                    'error': 'backup configured but no successful run recorded',
+                },
+            }
+
+        reasons = []
+        now = datetime.now(timezone.utc)
+        db_age = _backup_success_age(db_run, now)
+        if db_age is None:
+            reasons.append('db family has no successful run recorded')
+        elif db_age > 7200:
+            reasons.append(
+                f'db family last successful run is {_backup_age_text(db_age)} old '
+                '(threshold 7200s)'
+            )
+
+        files_age = _backup_success_age(files_run, now)
+        if files_age is None:
+            reasons.append('files family has no successful run recorded')
+        elif files_age > 2 * 86400:
+            reasons.append(
+                f'files family last successful run is {_backup_age_text(files_age)} old '
+                '(threshold 172800s)'
+            )
+
+        db_duration = _backup_duration(db_run)
+        if db_duration is not None and db_duration > 1800:
+            reasons.append(
+                f'capacity warning: db run duration {_backup_age_text(db_duration)} '
+                'exceeds 50% of the hourly period (1800s)'
+            )
+
+        try:
+            tombstones = read_tombstones() or []
+        except Exception as exc:
+            reasons.append(f'pending tombstones unavailable: {exc}')
+            tombstones = []
+        grace_days = _backup_grace_days(config)
+        stuck_tombstones = []
+        for tombstone in tombstones:
+            if not isinstance(tombstone, dict):
+                continue
+            age = _backup_age_seconds(
+                tombstone.get('deleted_at') or tombstone.get('timestamp'),
+                now,
+            )
+            if age is not None and age > grace_days * 86400 + 7 * 86400:
+                stuck_tombstones.append(tombstone.get('domain') or 'unknown')
+        if stuck_tombstones:
+            reasons.append(
+                'tombstone sweep stuck past grace + 7d: '
+                + ', '.join(str(domain) for domain in stuck_tombstones)
+            )
+
+        quarantine = _backup_quarantine_dirs(QUARANTINE_ROOT)
+        if quarantine:
+            reasons.append(
+                'quarantine entries need operator attention: '
+                + ', '.join(quarantine)
+            )
+
+        anomalies = state.get('anomalies') if isinstance(state, dict) else {}
+        orphan_sites = anomalies.get('orphan_sites') if isinstance(anomalies, dict) else []
+        if orphan_sites:
+            domains = []
+            for item in orphan_sites:
+                if isinstance(item, dict):
+                    domains.append(item.get('domain') or item.get('site') or str(item))
+                else:
+                    domains.append(str(item))
+            reasons.append('orphan site tags: ' + ', '.join(str(domain) for domain in domains))
+
+        details = {
+            'db_age_seconds': db_age,
+            'files_age_seconds': files_age,
+            'db_duration_seconds': db_duration,
+        }
+        if reasons:
+            details['error'] = '; '.join(reasons)
+            return {'status': STATUS_ERROR, 'details': details}
+        details['note'] = 'backup freshness and local state healthy'
+        return {'status': STATUS_OK, 'details': details}
+
+def _backup_config_enabled(config):
+    value = (config or {}).get('enable_backup', True)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _backup_parse_time(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    else:
+        text = str(value).strip()
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            parsed = None
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _backup_age_seconds(value, now=None):
+    parsed = _backup_parse_time(value)
+    if parsed is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (now - parsed).total_seconds())
+
+
+def _backup_run_success(record):
+    if not isinstance(record, dict):
+        return False
+    value = record.get('ok')
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on', 'ok', 'success')
+    return bool(value)
+
+
+def _backup_success_age(record, now):
+    if not _backup_run_success(record):
+        return None
+    for key in ('finished', 'success_at', 'last_success', 'completed_at', 'timestamp'):
+        if isinstance(record, dict) and record.get(key):
+            age = _backup_age_seconds(record.get(key), now)
+            if age is not None:
+                return age
+    return None
+
+
+def _backup_duration(record):
+    if not isinstance(record, dict):
+        return None
+    if record.get('duration') is not None:
+        try:
+            return float(record.get('duration'))
+        except (TypeError, ValueError):
+            pass
+    started = _backup_parse_time(record.get('started'))
+    finished = _backup_parse_time(record.get('finished'))
+    if started is not None and finished is not None:
+        return max(0.0, (finished - started).total_seconds())
+    return None
+
+
+def _backup_age_text(seconds):
+    if seconds is None:
+        return 'unknown'
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f'{seconds:.1f}s'
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f'{int(minutes)}m {int(remainder)}s'
+    hours, remainder = divmod(minutes, 60)
+    if hours < 24:
+        return f'{int(hours)}h {int(remainder)}m'
+    days, remainder = divmod(hours, 24)
+    return f'{int(days)}d {int(remainder)}h'
+
+
+def _backup_grace_days(config):
+    raw = (config or {}).get('deleted_tenant_grace_days')
+    if raw is None:
+        raw = (config or {}).get('deleted_tenant_grace', 30)
+    if isinstance(raw, (int, float)):
+        return max(0.0, float(raw))
+    text = str(raw).strip().lower()
+    if text.endswith('d'):
+        text = text[:-1]
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _backup_quarantine_dirs(root):
+    try:
+        entries = os.scandir(root)
+    except OSError:
+        return []
+    names = []
+    try:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    names.append(entry.name)
+            except OSError:
+                continue
+    finally:
+        entries.close()
+    return sorted(names)
 
 
 # ---------------------------------------------------------------------------
