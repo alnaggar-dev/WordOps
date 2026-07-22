@@ -547,7 +547,7 @@ def post_pref(self, apt_packages, packages, upgrade=False):
                         listen='php{0}-fpm.sock'.format(php_short),
                         user='www-data',
                         group='www-data', listenuser='www-data',
-                        listengroup='www-data', openbasedir=True)
+                        listengroup='www-data')
             WOTemplate.deploy(self, '/etc/php/{0}/fpm/pool.d/www.conf'
                               .format(php_version[0]),
                               'php-pool.mustache', data)
@@ -555,7 +555,7 @@ def post_pref(self, apt_packages, packages, upgrade=False):
                         listen='php{0}-two-fpm.sock'.format(php_short),
                         user='www-data',
                         group='www-data', listenuser='www-data',
-                        listengroup='www-data', openbasedir=True)
+                        listengroup='www-data')
             WOTemplate.deploy(self,
                               '/etc/php/{0}/fpm/pool.d/www-two.conf'.format(
                                   php_version[0]),
@@ -576,6 +576,7 @@ def post_pref(self, apt_packages, packages, upgrade=False):
             config.read(
                 '/etc/php/{0}/fpm/pool.d/debug.conf'.format(php_version[0]))
             config['debug']['listen'] = '127.0.0.1:91{0}'.format(php_short)
+            config['debug']['pm'] = 'ondemand'
             config['debug']['rlimit_core'] = 'unlimited'
             config['debug']['slowlog'] = '/var/log/php/{0}/slow.log'.format(
                 php_version[0])
