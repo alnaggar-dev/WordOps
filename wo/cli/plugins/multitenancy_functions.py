@@ -308,6 +308,28 @@ class MTFunctions:
         return f"php{php_clean}-fpm"
 
     @staticmethod
+    def link_site_logs(app, domain, logs_dir):
+        """Point logs/{access,error}.log at /var/log/nginx/{domain}.*.log.
+
+        Logs live in /var/log/nginx like standard sites, so fail2ban and
+        logrotate cover them; logs/ only holds symlinks. Older tenants wrote
+        real files here: move them over once.
+        """
+        for kind in ('access', 'error'):
+            target = f"/var/log/nginx/{domain}.{kind}.log"
+            link = f"{logs_dir}/{kind}.log"
+            if os.path.islink(link):
+                if os.readlink(link) == target:
+                    continue
+                os.unlink(link)
+            elif os.path.exists(link):
+                if os.path.exists(target):
+                    Log.warn(app, f"Both {link} and {target} exist; leaving {link} in place")
+                    continue
+                shutil.move(link, target)
+            os.symlink(target, link)
+
+    @staticmethod
     def ensure_nginx_directories(app, domain, site_root):
         """Ensure all directories required by nginx config exist"""
         try:
@@ -316,6 +338,8 @@ class MTFunctions:
             if not os.path.exists(logs_dir):
                 os.makedirs(logs_dir, mode=0o755, exist_ok=True)
                 Log.debug(app, f"Created logs directory: {logs_dir}")
+
+            MTFunctions.link_site_logs(app, domain, logs_dir)
 
             # Ensure nginx sites-available directory exists
             sites_available = "/etc/nginx/sites-available"
@@ -878,8 +902,8 @@ if (!defined('WP_CLI')) {{
 server {{
     server_name {domain} www.{domain};
 
-    access_log {site_root}/logs/access.log rt_cache;
-    error_log {site_root}/logs/error.log;
+    access_log /var/log/nginx/{domain}.access.log rt_cache;
+    error_log /var/log/nginx/{domain}.error.log;
 
     root {site_root}/htdocs;
     index index.php index.html index.htm;

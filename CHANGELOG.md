@@ -27,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 -   Fix `wo site clone` PHP version resolution to support all current PHP versions; it was hardcoded to 7.2–7.4 and silently fell back to 7.3
 -   Fix `wo multitenancy apply` failing on every site with "Could not read current plugins"; it passed the DB site root to wp-cli `--path` instead of the `htdocs` WordPress install directory
 -   Fix slow wp-admin on multitenancy sites: all tenants shared Redis database 0 and Object Cache Pro flushes with `FLUSHDB`, so any tenant's flush wiped every other tenant's cache — including OCP's metadata key, whose absence triggers an "integrity protection" `FLUSHDB` on the next boot of each other tenant. With per-minute wp-cli cron per site this kept the fleet's object cache permanently cold, and WordPress ran core/plugin/theme update checks plus pro-plugin license pings inline in wp-admin on every page load (multi-second serial HTTP). Each tenant now gets a dedicated Redis database (allocated in `multitenancy_sites.redis_db`, database 0 reserved for standard sites); `wo multitenancy apply` backfills existing tenants, and the Redis `databases` limit is raised automatically when the fleet outgrows it
+-   Fix open XML-RPC on multitenancy sites: the `xmlrpc.php` deny rule matched only `/xmlrpc.php`, so `/wp/xmlrpc.php` reached PHP and was used for password guessing. `wpcommon` now applies the same Jetpack-only rule to `/wp/xmlrpc.php`
+-   Fix fail2ban nginx jails watching no files: Debian's `defaults-debian.conf` sets `backend = systemd`, which ignores `logpath`. The nginx jails and `recidive` now set `backend = auto`
+-   Fix multitenancy sites logging outside `/var/log/nginx`, so fail2ban and logrotate never saw them. Vhosts now log to `/var/log/nginx/<domain>.{access,error}.log` with `logs/` symlinks, like standard sites; existing log files move there when the vhost is regenerated
 
 ### v3.21.3 - 2024-06-14
 

@@ -37,6 +37,22 @@ location = /xmlrpc.php {
     include fastcgi_params;
     fastcgi_pass {{upstream}};
 }
+# Same protection for the multitenancy core path (/wp/xmlrpc.php)
+location = /wp/xmlrpc.php {
+    allow 122.248.245.244/32;
+    allow 54.217.201.243/32;
+    allow 54.232.116.4/32;
+    allow 192.0.80.0/20;
+    allow 192.0.96.0/20;
+    allow 192.0.112.0/20;
+    allow 195.234.108.0/22;
+    deny all;
+    access_log off;
+    log_not_found off;
+    limit_req zone=two burst=1 nodelay;
+    include fastcgi_params;
+    fastcgi_pass {{upstream}};
+}
 # Disable wp-config.txt
 location = /wp-config.txt {
     deny all;
