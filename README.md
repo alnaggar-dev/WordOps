@@ -2,7 +2,7 @@
 
 -   **Easy to install** : One step automated installer with migration from EasyEngine v3 support
 -   **Fast deployment** : Fast and automated WordPress, Nginx, PHP, MySQL & Redis installation
--   **Custom Nginx build** : Nginx 1.28.0 - TLS v1.3 HTTP/3 QUIC & Brotli support
+-   **Custom Nginx build** : Nginx 1.30.4 - TLS v1.3 HTTP/3 QUIC & Brotli support
 -   **Up-to-date** : PHP 7.4, 8.0, 8.1, 8.2, 8.3, 8.4 & 8.5 - MariaDB 11.4 LTS & Redis 7.0
 -   **Secured** : Hardened WordPress security with strict Nginx location directives
 -   **Powerful** : Optimized Nginx configurations with multiple cache backends support
@@ -22,12 +22,12 @@
 
 -   Ubuntu 24.04 LTS (Noble)
 -   Ubuntu 22.04 LTS (Jammy)
--   Ubuntu 20.04 LTS (Focal)
 
 #### Also compatible
 
 -   Debian 11 (Bullseye)
 -   Debian 12 (Bookworm)
+-   Debian 13 (Trixie)
 
 #### For testing purpose only
 

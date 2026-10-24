@@ -27,14 +27,17 @@ class WOAcme:
             WOGit.clone(
                 self, 'https://github.com/Neilpang/acme.sh.git',
                 '/opt/acme.sh', branch='master')
-            WOFileUtils.mkdir(self, '/etc/letsencrypt/config')
-            WOFileUtils.mkdir(self, '/etc/letsencrypt/renewal')
-            WOFileUtils.mkdir(self, '/etc/letsencrypt/live')
+            if not os.path.exists('/etc/letsencrypt/config'):
+                WOFileUtils.mkdir(self, '/etc/letsencrypt/config')
+            if not os.path.exists('/etc/letsencrypt/renewal'):
+                WOFileUtils.mkdir(self, '/etc/letsencrypt/renewal')
+            if not os.path.exists('/etc/letsencrypt/live'):
+                WOFileUtils.mkdir(self, '/etc/letsencrypt/live')
             try:
                 WOFileUtils.chdir(self, '/opt/acme.sh')
                 WOShellExec.cmd_exec(
-                    self, './acme.sh --install --home /etc/letsencrypt'
-                    '--config-home /etc/letsencrypt/config'
+                    self, './acme.sh --install --home /etc/letsencrypt '
+                    '--config-home /etc/letsencrypt/config '
                     '--cert-home /etc/letsencrypt/renewal'
                 )
                 WOShellExec.cmd_exec(
