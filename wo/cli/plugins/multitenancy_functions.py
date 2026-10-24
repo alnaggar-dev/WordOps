@@ -144,6 +144,21 @@ class MTFunctions:
         return True
 
     @staticmethod
+    def install_login_failure_logger(app, shared_root):
+        """Refresh the WordOps-managed login failure MU-plugin, best-effort."""
+        plugin_dir = os.path.join(shared_root, 'wp-content', 'mu-plugins')
+        plugin_path = os.path.join(plugin_dir, 'wo-login-log.php')
+        try:
+            os.makedirs(plugin_dir, exist_ok=True)
+            with open(plugin_path, 'w', encoding='utf-8') as plugin:
+                app.app.render({}, 'wo-login-log.mustache', out=plugin)
+            os.chmod(plugin_path, 0o644)
+        except (Exception, SystemExit) as exc:
+            Log.warn(app, f"Could not install WordPress login failure logger: {exc}")
+            return False
+        return True
+
+    @staticmethod
     def get_php_version(app, pargs):
         """Determine PHP version from arguments"""
         if pargs.php74:

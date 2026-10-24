@@ -28,4 +28,11 @@ enabled = true
 backend = auto
 filter = nginx-forbidden
 action = iptables-multiport[name="nginx-forbidden", port="http,https"]
-logpath = /var/log/nginx/*error*.log{{/nginx}}
+logpath = /var/log/nginx/*error*.log
+
+[wo-wordpress-auth]
+enabled = true
+backend = systemd
+filter = wo-wordpress-auth
+action = iptables-multiport[name="wo-wordpress-auth", port="http,https"]
+maxretry = 5{{/nginx}}

@@ -17,6 +17,10 @@ Operating model: this fork assumes a trust model of one — a solo operator runn
 | Mutable content | Not shared | `wp-content/uploads`, `wp-content/cache`, `wp-content/upgrade` real directories |
 | Web server | Not shared | nginx vhost and cache configuration |
 
+The shared `wo-login-log.php` MU-plugin is WordOps-managed: `wo multitenancy init` and `wo multitenancy apply` install it and overwrite any edits.
+It logs actual WordPress password failures to journald for the `wo-wordpress-auth` fail2ban jail.
+Submissions with empty username or password fields are excluded so OTP customers are not penalized.
+
 Multi-tenancy has three configuration layers:
 
 - `/etc/wo/plugins.d/multitenancy.conf` configures infrastructure and download sources only: shared root, release retention, WordPress/PHP defaults, health thresholds, and where plugin/theme zip files come from.

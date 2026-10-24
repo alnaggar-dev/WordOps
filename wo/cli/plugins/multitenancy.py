@@ -229,6 +229,7 @@ class WOMultitenancyController(CementBaseController):
             mu_path = f"{shared_root}/wp-content/mu-plugins/wo-baseline-enforcer.php"
             if os.path.exists(mu_path):
                 os.remove(mu_path)
+            MTFunctions.install_login_failure_logger(self, shared_root)
             
             # Phase 1: Create shared configuration file
             Log.info(self, "Creating shared configuration file...")
@@ -2711,6 +2712,7 @@ class WOMultitenancyController(CementBaseController):
         )
         cron_sync_ok = True
         if not dry_run:
+            MTFunctions.install_login_failure_logger(self, shared_root)
             cron_sync_ok = MTFunctions.sync_wp_cron_entries(self)
             try:
                 repair_backup_cron(self.app)

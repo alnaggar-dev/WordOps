@@ -1,0 +1,10 @@
+[INCLUDES]
+before = common.conf
+
+[Definition]
+_daemon = wordpress
+failregex = ^%(__prefix_line)sWordPress login failed for \S+ from <HOST>$
+ignoreregex =
+
+[Init]
+journalmatch = SYSLOG_IDENTIFIER=wordpress

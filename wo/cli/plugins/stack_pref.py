@@ -821,6 +821,11 @@ def post_pref(self, apt_packages, packages, upgrade=False):
                     '/etc/fail2ban/filter.d/nginx-forbidden.conf',
                     'fail2ban-forbidden.mustache',
                     data, overwrite=False)
+                WOTemplate.deploy(
+                    self,
+                    '/etc/fail2ban/filter.d/wo-wordpress-auth.conf',
+                    'fail2ban-wp-auth.mustache',
+                    data, overwrite=False)
 
                 if not WOShellExec.cmd_exec(self, 'fail2ban-client reload'):
                     WOGit.rollback(

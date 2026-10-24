@@ -1,0 +1,23 @@
+<?php
+/**
+ * Plugin Name: WordOps login failure log
+ * Description: Sends failed WordPress logins to syslog so the wo-wordpress-auth fail2ban jail can ban the IP. Managed by WordOps; changes are overwritten.
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+// wp_login_failed fires for every failed password check: wp-login.php, /wp/wp-login.php,
+// the WooCommerce My Account and checkout forms, and XML-RPC. Empty username or password
+// submissions do not fire it, so customers using OTP login are never counted.
+add_action(
+	'wp_login_failed',
+	function () {
+		$ip = isset( $_SERVER['REMOTE_ADDR'] ) ? filter_var( $_SERVER['REMOTE_ADDR'], FILTER_VALIDATE_IP ) : false;
+		if ( ! $ip ) {
+			return;
+		}
+		openlog( 'wordpress', LOG_NDELAY | LOG_PID, LOG_AUTH );
+		syslog( LOG_NOTICE, sprintf( 'WordPress login failed for %s from %s', wp_parse_url( home_url(), PHP_URL_HOST ), $ip ) );
+		closelog();
+	}
+);
