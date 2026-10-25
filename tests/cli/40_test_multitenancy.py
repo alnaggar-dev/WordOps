@@ -4534,35 +4534,177 @@ $wp_version = '6.9.1';
             self.assertEqual(run.call_count, 1)
             self.assertIn(location, warn.call_args.args[1])
 
-    def test_fpm_probe_excludes_its_real_admin_uri_and_reports_queue(self):
+    @staticmethod
+    def _fpm_status_result(pool='www', version='84', queue=0, processes=None):
+        if processes is None:
+            processes = [
+                {'state': 'Running', 'request uri': '/status?json&full',
+                 'script': '-'},
+                {'state': 'Idle', 'request uri': '/old-request/'},
+            ]
         payload = {
-            'listen queue': 2,
-            'processes': [
-                {
-                    'state': 'Running',
-                    'request uri': '/fpm/status/php84?json&full',
-                },
-                {
-                    'state': 'Running',
-                    'request uri': '/checkout/',
-                },
-                {'state': 'Idle', 'request uri': ''},
-            ],
+            'pool': f'{pool}-php{version}',
+            'listen queue': queue,
+            'total processes': len(processes),
+            'processes': processes,
         }
-        result = mock.Mock(
-            returncode=0, stdout=json.dumps(payload), stderr=''
+        return mock.Mock(
+            returncode=0,
+            stdout='Content-type: application/json\r\n\r\n' + json.dumps(payload),
+            stderr='',
         )
-        with mock.patch.object(
-                mtf.subprocess, 'run', return_value=result):
-            active, listen_queue, error = (
-                MTFunctions.probe_active_php_fpm_workers([
-                    {'php_version': '8.4'}
-                ])
-            )
 
-        self.assertEqual(active, 1)
-        self.assertEqual(listen_queue, 2)
-        self.assertIsNone(error)
+    def test_fpm_probe_reads_both_pools_directly_and_reports_active_work(self):
+        responses = [
+            self._fpm_status_result(queue=2),
+            self._fpm_status_result('www-two', queue=3, processes=[
+                {'state': 'Running', 'request uri': '/status?json&full',
+                 'script': '-'},
+                {'state': 'Running', 'request uri': '/checkout/'},
+                {'state': 'Finishing', 'request uri': '/status-of-order/'},
+                {'state': 'Running', 'request uri': '/fpm/status/tenant-page'},
+                {'state': 'Running', 'request uri': '/status?json&full',
+                 'script': '/var/www/store/htdocs/index.php'},
+                {'state': 'Running', 'request uri': '/status'},
+                {'state': 'Idle', 'request uri': '/old-request/'},
+            ]),
+        ]
+        with mock.patch.object(
+                mtf.subprocess, 'run', side_effect=responses) as run:
+            result = MTFunctions.probe_active_php_fpm_workers([
+                {'php_version': '8.4'}, {'php_version': '8.4'},
+            ])
+
+        self.assertEqual(result, (5, 5, None))
+        self.assertEqual(run.call_count, 2)
+        for call, suffix in zip(run.call_args_list, ('', '-two')):
+            self.assertEqual(call.args[0], [
+                '/usr/bin/cgi-fcgi', '-bind', '-connect',
+                f'/var/run/php/php84{suffix}-fpm.sock',
+            ])
+            self.assertEqual(call.kwargs['env'], {
+                'REQUEST_METHOD': 'GET',
+                'SCRIPT_NAME': '/status',
+                'SCRIPT_FILENAME': '/status',
+                'REQUEST_URI': '/status?json&full',
+                'QUERY_STRING': 'json&full',
+                'SERVER_PROTOCOL': 'HTTP/1.1',
+                'GATEWAY_INTERFACE': 'CGI/1.1',
+            })
+            self.assertEqual(call.kwargs['stdin'], subprocess.DEVNULL)
+            self.assertEqual(call.kwargs['timeout'], 5)
+
+    def test_php_stack_includes_fastcgi_status_client(self):
+        from wo.core.variables import WOVar
+
+        self.assertIn('libfcgi-bin', WOVar.wo_php_extra)
+
+    def test_fpm_probe_requires_all_pools_for_all_tracked_versions(self):
+        responses = [
+            self._fpm_status_result(pool, version)
+            for version in ('82', '84')
+            for pool in ('www', 'www-two')
+        ]
+        with mock.patch.object(
+                mtf.subprocess, 'run', side_effect=responses) as run:
+            self.assertEqual(MTFunctions.probe_active_php_fpm_workers([
+                {'php_version': '8.4'}, {'php_version': '8.2'},
+                {'php_version': '8.4'},
+            ]), (0, 0, None))
+        self.assertEqual(
+            [call.args[0][-1] for call in run.call_args_list],
+            [
+                '/var/run/php/php82-fpm.sock',
+                '/var/run/php/php82-two-fpm.sock',
+                '/var/run/php/php84-fpm.sock',
+                '/var/run/php/php84-two-fpm.sock',
+            ],
+        )
+
+    def test_fpm_probe_rejects_unknown_versions_without_requesting_status(self):
+        for sites in ([], [{}], [{'php_version': '../../8.4'}]):
+            with self.subTest(sites=sites), mock.patch.object(
+                    mtf.subprocess, 'run') as run:
+                self.assertEqual(
+                    MTFunctions.probe_active_php_fpm_workers(sites),
+                    (None, None, 'php_fpm_status=unavailable'),
+                )
+                run.assert_not_called()
+
+    def test_fpm_probe_fails_closed_when_either_pool_is_unavailable(self):
+        for pool_index, pool in enumerate(('www', 'www-two')):
+            for failure in (
+                    FileNotFoundError(),
+                    subprocess.TimeoutExpired('cgi-fcgi', 5),
+                    mock.Mock(returncode=1, stdout='', stderr='unavailable')):
+                with self.subTest(pool=pool, failure=type(failure).__name__):
+                    responses = [self._fpm_status_result()] * pool_index
+                    responses.append(failure)
+                    with mock.patch.object(
+                            mtf.subprocess, 'run', side_effect=responses):
+                        self.assertEqual(
+                            MTFunctions.probe_active_php_fpm_workers([
+                                {'php_version': '8.4'},
+                            ]),
+                            (None, None,
+                             f'php_fpm_status_8.4_{pool}=unavailable'),
+                        )
+
+    def test_fpm_probe_rejects_incomplete_or_wrong_pool_status(self):
+        valid = json.loads(self._fpm_status_result().stdout.split('\r\n\r\n')[1])
+        invalid = [
+            {**valid, 'pool': 'www-two-php84'},
+            {**valid, 'listen queue': -1},
+            {**valid, 'listen queue': '0'},
+            {**valid, 'listen queue': False},
+            {key: value for key, value in valid.items() if key != 'listen queue'},
+            {key: value for key, value in valid.items() if key != 'processes'},
+            {key: value for key, value in valid.items() if key != 'total processes'},
+            {**valid, 'total processes': 3},
+            {**valid, 'total processes': 0, 'processes': []},
+            {**valid, 'total processes': 1, 'processes': [{}]},
+            {**valid, 'total processes': 1, 'processes': [None]},
+            {**valid, 'total processes': 1, 'processes': [
+                {'state': '', 'request uri': '/checkout/'},
+            ]},
+            {**valid, 'total processes': 1, 'processes': [
+                {'state': 'Running'},
+            ]},
+            [],
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                response = mock.Mock(
+                    returncode=0,
+                    stdout='Content-type: application/json\n\n' + json.dumps(payload),
+                )
+                with mock.patch.object(
+                        mtf.subprocess, 'run', return_value=response):
+                    self.assertEqual(
+                        MTFunctions.probe_active_php_fpm_workers([
+                            {'php_version': '8.4'},
+                        ]),
+                        (None, None, 'php_fpm_status_8.4_www=unparseable'),
+                    )
+
+    def test_fpm_probe_rejects_cgi_errors_and_non_json_bodies(self):
+        valid_body = self._fpm_status_result().stdout.split('\r\n\r\n')[1]
+        for output in (
+                valid_body,
+                'Status: 404 Not Found\n\n' + valid_body,
+                'Status:\n\n' + valid_body,
+                'Content-type: text/html\n\n<html>Not found</html>',
+                'Content-type: application/json\n\n'):
+            with self.subTest(output=output):
+                with mock.patch.object(
+                        mtf.subprocess, 'run',
+                        return_value=mock.Mock(returncode=0, stdout=output)):
+                    self.assertEqual(
+                        MTFunctions.probe_active_php_fpm_workers([
+                            {'php_version': '8.4'},
+                        ]),
+                        (None, None, 'php_fpm_status_8.4_www=unparseable'),
+                    )
 
 
     def test_guarded_cron_healthy_path_reaches_flock_command(self):

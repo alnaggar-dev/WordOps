@@ -100,6 +100,23 @@ It moves existing content and baseline into a `pre-cutover` release, writes `REL
 It resets caches, reloads PHP-FPM, removes maintenance, and checks the fleet. Failure attempts to restore the old layout.
 It refuses a fleet that already uses the fixed content link.
 
+The drain reads `/status?json&full` directly over FastCGI from **both** WordOps
+tenant pools for each tracked PHP version: `/var/run/php/php84-fpm.sock` and
+`/var/run/php/php84-two-fpm.sock` for PHP 8.4. It requires `/usr/bin/cgi-fcgi`
+(`libfcgi-bin`, included with new PHP stack installs and stack upgrades), the
+managed pool names `www-php84` / `www-two-php84`, and `pm.status_path = /status`.
+On an existing installation without the client, install `libfcgi-bin` before
+cutover. Missing sockets, failed requests, or incomplete status responses block
+the drain; queued requests and all non-idle workers except the status request
+must disappear before cutover.
+
+The admin `/fpm/status/php84` page is not a drain prerequisite: port 22222 uses
+HTTPS, its route requires a matching file under `/var/www/22222/htdocs/fpm/status/`,
+and it load-balances the two pools rather than reporting both. Stack setup
+creates these files only for the first installed PHP version, so a later PHP
+version can return 404 even with healthy pools. Changing HTTPS settings or
+adding that page's marker file does not establish a safe drain.
+
 For a fresh server, use this order:
 
 1. Run `wo multitenancy init` on the server.

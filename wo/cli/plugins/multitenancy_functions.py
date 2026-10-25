@@ -1524,7 +1524,7 @@ server {{
 
     @staticmethod
     def probe_active_php_fpm_workers(shared_sites):
-        """Return active tenant-serving FPM workers, or a fail-closed error."""
+        """Read full status from both WordOps pools without the admin vhost."""
         versions = sorted({
             str(site.get('php_version') or '').strip()
             for site in shared_sites
@@ -1538,41 +1538,68 @@ server {{
         listen_queue = 0
         for version in versions:
             short = version.replace('.', '')
-            url = (
-                "http://127.0.0.1:22222/fpm/status/"
-                f"php{short}?json&full"
-            )
-            try:
-                result = subprocess.run(
-                    ['curl', '--silent', '--show-error', '--fail',
-                     '--max-time', '5', url],
-                    capture_output=True, text=True, check=False, timeout=10,
-                )
-                if result.returncode:
-                    return (
-                        None, None,
-                        f'php_fpm_status_{version}=unavailable'
+            # The admin HTTPS route load-balances these pools and depends on
+            # status marker files. It cannot establish that BOTH have drained.
+            for pool, socket_suffix in (('www', ''), ('www-two', '-two')):
+                status_error = f'php_fpm_status_{version}_{pool}'
+                try:
+                    result = subprocess.run(
+                        ['/usr/bin/cgi-fcgi', '-bind', '-connect',
+                         f'/var/run/php/php{short}{socket_suffix}-fpm.sock'],
+                        env={
+                            'REQUEST_METHOD': 'GET',
+                            'SCRIPT_NAME': '/status',
+                            'SCRIPT_FILENAME': '/status',
+                            'REQUEST_URI': '/status?json&full',
+                            'QUERY_STRING': 'json&full',
+                            'SERVER_PROTOCOL': 'HTTP/1.1',
+                            'GATEWAY_INTERFACE': 'CGI/1.1',
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, check=False, timeout=5,
                     )
-                payload = json.loads(result.stdout)
-                processes = payload.get('processes')
-                if not isinstance(processes, list):
-                    return (
-                        None, None,
-                        f'php_fpm_status_{version}=unparseable'
-                    )
-                active += sum(
-                    1 for process in processes
-                    if str(process.get('state', '')).lower() != 'idle'
-                    and not str(
-                        process.get('request uri', '')
-                    ).startswith(('/status', '/fpm/status/'))
-                )
-                listen_queue += int(payload.get('listen queue', 0))
-            except Exception:
-                return (
-                    None, None,
-                    f'php_fpm_status_{version}=unavailable'
-                )
+                    if result.returncode:
+                        return (None, None, f'{status_error}=unavailable')
+                    headers, separator, body = result.stdout.replace(
+                        '\r\n', '\n'
+                    ).partition('\n\n')
+                    if not separator or any(
+                            line.lower().startswith('status:')
+                            and line.split()[1] != '200'
+                            for line in headers.splitlines()):
+                        return (None, None, f'{status_error}=unparseable')
+                    payload = json.loads(body)
+                    processes = payload.get('processes')
+                    queue = payload.get('listen queue')
+                    total = payload.get('total processes')
+                    if (
+                            payload.get('pool') != f'{pool}-php{short}'
+                            or not isinstance(processes, list)
+                            or type(total) is not int
+                            or total < 1 or total != len(processes)
+                            or type(queue) is not int or queue < 0):
+                        return (None, None, f'{status_error}=unparseable')
+                    for process in processes:
+                        if (
+                                not isinstance(process, dict)
+                                or not isinstance(process.get('state'), str)
+                                or not process['state'].strip()
+                                or not isinstance(
+                                    process.get('request uri'), str)):
+                            return (None, None, f'{status_error}=unparseable')
+                        # A tenant route with a status-like URI is still work.
+                        # FPM's internal status handler has no PHP script.
+                        is_status = (
+                            process['request uri'] == '/status?json&full'
+                            and process.get('script') == '-'
+                        )
+                        if process['state'].lower() != 'idle' and not is_status:
+                            active += 1
+                    listen_queue += queue
+                except (OSError, subprocess.TimeoutExpired):
+                    return (None, None, f'{status_error}=unavailable')
+                except (ValueError, TypeError, AttributeError, IndexError):
+                    return (None, None, f'{status_error}=unparseable')
         return (active, listen_queue, None)
 
     @staticmethod

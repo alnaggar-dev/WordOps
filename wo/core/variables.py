@@ -189,7 +189,7 @@ class WOVar():
     wo_php84 = generate_php_modules('php84', '8.4')
     wo_php85 = generate_php_modules('php85', '8.5')
 
-    wo_php_extra = ["graphviz"]
+    wo_php_extra = ["graphviz", "libfcgi-bin"]
 
     wo_mysql = [
         "mariadb-server", "percona-toolkit",
