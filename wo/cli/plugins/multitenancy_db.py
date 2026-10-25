@@ -2,8 +2,6 @@
 Handles database operations for multi-tenancy infrastructure.
 """
 
-import os
-import json
 from datetime import datetime
 from wo.core.logging import Log
 from wo.core.database import db_session, Base
@@ -43,7 +41,6 @@ class MultitenancySite(Base):
     site_path = Column(String(255))
     php_version = Column(String(10))
     shared_release = Column(String(255))
-    baseline_version = Column(Integer, default=0)
     is_enabled = Column(Boolean, default=True)
     is_ssl = Column(Boolean, default=False)
     # Phase 1: Redis Object Cache prefix (unique per site for cache isolation)
@@ -270,16 +267,6 @@ class MTDatabase:
             return False
     
     @staticmethod
-    def get_baseline_version(app):
-        """Get current baseline version"""
-        try:
-            version = MTDatabase.get_config(app, 'baseline_version')
-            return int(version) if version else 1
-        except:
-            return 1
-    
-    
-    @staticmethod
     def add_shared_site(app, domain, site_data):
         """Add a site to shared sites tracking"""
         try:
@@ -332,7 +319,6 @@ class MTDatabase:
                     'site_path': site.site_path,
                     'php_version': site.php_version,
                     'shared_release': site.shared_release,
-                    'baseline_version': site.baseline_version,
                     'is_enabled': site.is_enabled,
                     'is_ssl': site.is_ssl,
                     'redis_prefix': getattr(site, 'redis_prefix', None),
@@ -379,28 +365,6 @@ class MTDatabase:
                 
         except Exception as e:
             Log.error(app, f"Failed to remove shared site: {e}")
-            return False
-    
-    @staticmethod
-    def update_site_baseline(app, domain, version):
-        """Update baseline version for a site"""
-        try:
-            session = db_session
-            site = session.query(MultitenancySite).filter_by(
-                domain=domain
-            ).first()
-            
-            if site:
-                site.baseline_version = version
-                site.updated_at = datetime.now()
-                session.commit()
-                Log.debug(app, f"Updated baseline version for {domain} to {version}")
-                return True
-            
-            return False
-                
-        except Exception as e:
-            Log.error(app, f"Failed to update site baseline: {e}")
             return False
     
     @staticmethod

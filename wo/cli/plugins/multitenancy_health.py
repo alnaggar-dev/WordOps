@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from wo.core.logging import Log
+from wo.cli.plugins.multitenancy_content import current_release, read_release_info
 from wo.cli.plugins.multitenancy_db import MTDatabase
 from wo.cli.plugins.multitenancy_functions import MTFunctions
 
@@ -88,10 +88,16 @@ class HealthChecker:
     def _check_shared_infra(self):
         current_link = os.path.join(self.shared_root, 'current')
         releases_dir = os.path.join(self.shared_root, 'releases')
+        content_release = current_release(self.shared_root)
+        deployed_commit = (
+            read_release_info(content_release).get('commit') or 'unknown'
+            if content_release else 'old layout, not cut over'
+        )
         details = {
             'shared_root': self.shared_root,
             'current_symlink': current_link,
             'releases_dir_exists': os.path.isdir(releases_dir),
+            'deployed_commit': deployed_commit,
         }
         if not os.path.islink(current_link):
             return {
@@ -601,6 +607,8 @@ def render_text(result):
         dur_part = f" ({dur} ms)" if dur is not None else ''
         lines.append(f"{ico} {name}: {status}{dur_part}")
         details = check.get('details') or {}
+        if name == 'shared_infrastructure' and details.get('deployed_commit'):
+            lines.append(f"     deployed_commit: {details['deployed_commit']}")
         if status != STATUS_OK:
             # Show the keys that matter most
             for key in ('error', 'config_test_output'):
