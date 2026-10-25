@@ -1984,7 +1984,7 @@ server {{
         # Clear nginx cache
         if cache_type in ['wpfc', 'wpredis']:
             try:
-                WOShellExec.cmd_exec(app, "wo clean --fastcgi")
+                WOShellExec.cmd_exec(app, "wo clean --fastcgi --reload")
             except:
                 pass
 
@@ -2001,25 +2001,17 @@ server {{
 
     @staticmethod
     def clear_all_caches(app):
-        """Clear all caches globally using WordOps (FastCGI + Redis + OpCache)
-        
-        This is fast and efficient because:
-        - All sites share the same WordPress core
-        - One command clears cache for all sites simultaneously
-        - Takes ~2 seconds regardless of site count (1 site or 1000 sites)
-        - Clears FastCGI cache, Redis cache, and OpCache
-        
-        This replaces per-site cache clearing which would take:
-        - 24 sites: 23 seconds
-        - 50 sites: 48 seconds
-        - 100 sites: 96 seconds
-        
-        With this global approach:
-        - Any number of sites: ~2 seconds
+        """Clear FastCGI, Redis and OpCache without stopping nginx listeners.
+
+        Keep the ordinary clean command's cache operations, but opt into its
+        configuration-checked graceful reload instead of an nginx restart.
+        Cache failures remain best-effort here and are reported to callers.
         """
         try:
             Log.info(app, "Clearing all caches (FastCGI + Redis + OpCache)...")
-            WOShellExec.cmd_exec(app, "wo clean --all")
+            if not WOShellExec.cmd_exec(app, "wo clean --all --reload"):
+                Log.debug(app, "Cache clear command failed")
+                return False
             Log.debug(app, "All caches cleared successfully")
             return True
         except Exception as e:

@@ -56,6 +56,124 @@ finally:
 
 
 
+class MultitenancyCacheClearTests(unittest.TestCase):
+    """Exercise the real clean dispatch without touching services or caches."""
+
+    def setUp(self):
+        from wo.cli.plugins import clean
+        self.clean = clean
+        self.controller = clean.WOCleanController.__new__(
+            clean.WOCleanController)
+        self.controller.app = mock.Mock()
+        self.controller.app.pargs = _types.SimpleNamespace(
+            all=True, fastcgi=False, opcache=False, redis=False, reload=True)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for method in ('info', 'debug', 'warn'):
+            stack.enter_context(mock.patch.object(clean.Log, method))
+        self.error = stack.enter_context(mock.patch.object(
+            clean.Log, 'error', side_effect=SystemExit(1)))
+        self.isdir = stack.enter_context(mock.patch.object(
+            clean.os.path, 'isdir', return_value=True))
+        stack.enter_context(mock.patch.object(
+            clean.os.path, 'exists', return_value=True))
+        stack.enter_context(mock.patch.object(
+            clean.WOAptGet, 'is_installed', return_value=True, create=True))
+        stack.enter_context(mock.patch.object(
+            clean.WOVar, 'wo_php_versions', {'php84': '8.4'}))
+        self.shell = stack.enter_context(mock.patch.object(
+            clean.WOShellExec, 'cmd_exec', return_value=True))
+        self.restart = stack.enter_context(mock.patch.object(
+            clean.WOService, 'restart_service'))
+        self.stop = stack.enter_context(mock.patch.object(
+            clean.WOService, 'stop_service'))
+        self.request = stack.enter_context(mock.patch.object(
+            clean.requests, 'get', return_value=mock.Mock(status_code=200)))
+
+    def test_all_caches_purged_with_checked_reload_not_restart(self):
+        self.controller.default()
+        self.assertEqual(self.shell.call_args_list, [
+            mock.call(self.controller, 'rm -rf /var/run/nginx-cache/*'),
+            mock.call(self.controller, 'nginx -t && service nginx reload'),
+            mock.call(self.controller, 'redis-cli flushall'),
+        ])
+        self.request.assert_called_once_with(
+            'http://127.0.0.1/cache/opcache/php84.php', timeout=5)
+        self.restart.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_ordinary_fastcgi_clean_keeps_restart_policy(self):
+        self.controller.app.pargs.reload = False
+        self.controller.clean_fastcgi()
+        self.shell.assert_called_once_with(
+            self.controller, 'rm -rf /var/run/nginx-cache/*')
+        self.restart.assert_called_once_with(self.controller, 'nginx')
+
+    def test_failed_purge_does_not_reload_or_restart(self):
+        self.shell.return_value = False
+        with self.assertRaises(SystemExit):
+            self.controller.clean_fastcgi()
+        self.shell.assert_called_once_with(
+            self.controller, 'rm -rf /var/run/nginx-cache/*')
+        self.restart.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_failed_nginx_check_or_reload_has_no_restart_fallback(self):
+        self.shell.side_effect = [True, False]
+        with self.assertRaises(SystemExit):
+            self.controller.clean_fastcgi()
+        self.assertEqual(self.shell.call_count, 2)
+        self.error.assert_called_once_with(
+            self.controller, 'Unable to reload NGINX after cache purge')
+        self.restart.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_missing_fastcgi_cache_reports_failure_without_service_change(self):
+        self.isdir.return_value = False
+        with self.assertRaises(SystemExit):
+            self.controller.clean_fastcgi()
+        self.shell.assert_not_called()
+        self.restart.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_shared_cache_helper_opts_into_reload_and_returns_command_result(self):
+        for result in (True, False):
+            with self.subTest(result=result):
+                self.shell.reset_mock()
+                self.shell.return_value = result
+                self.assertIs(
+                    MTFunctions.clear_all_caches(self.controller), result)
+                self.shell.assert_called_once_with(
+                    self.controller, 'wo clean --all --reload')
+
+    def test_shared_cache_helper_reports_exception_without_retry(self):
+        self.shell.side_effect = RuntimeError('cache command failed')
+        self.assertFalse(MTFunctions.clear_all_caches(self.controller))
+        self.shell.assert_called_once_with(
+            self.controller, 'wo clean --all --reload')
+
+    def test_site_cache_helper_opts_into_reload(self):
+        with mock.patch.object(mtf.subprocess, 'run') as run:
+            MTFunctions.clear_cache(self.controller, 'example.com', 'wpfc')
+        self.shell.assert_called_once_with(
+            self.controller, 'wo clean --fastcgi --reload')
+        run.assert_called_once_with(
+            ['wp', 'cache', 'flush', '--allow-root'],
+            cwd='/var/www/example.com/htdocs',
+            capture_output=True, check=False)
+
+    def test_restore_cache_helper_opts_into_reload_and_warns_on_failure(self):
+        from wo.cli.plugins import multitenancy_backup_restore as restore
+        self.shell.return_value = False
+        with mock.patch.object(restore.Log, 'warn') as warn:
+            restore.flush_site_caches(
+                self.controller, 'example.com', {'cache_type': 'wpfc'})
+        self.shell.assert_called_once_with(
+            self.controller, 'wo clean --fastcgi --reload')
+        warn.assert_called_once_with(
+            self.controller, 'FastCGI cache purge for example.com failed')
+
+
 class MultitenancyTests(unittest.TestCase):
 
     def setUp(self):

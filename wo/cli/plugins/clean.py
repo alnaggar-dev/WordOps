@@ -32,6 +32,9 @@ class WOCleanController(CementBaseController):
                 dict(help='Clean OpCache', action='store_true')),
             (['--redis'],
                 dict(help='Clean Redis Cache', action='store_true')),
+            (['--reload'],
+                dict(help='Gracefully reload NGINX after FastCGI purge '
+                          'instead of restarting it', action='store_true')),
         ]
         usage = "wo clean [options]"
 
@@ -63,13 +66,24 @@ class WOCleanController(CementBaseController):
 
     @expose(hide=True)
     def clean_fastcgi(self):
+        graceful = self.app.pargs.reload
         if (os.path.isdir("/var/run/nginx-cache") and
            os.path.exists('/usr/sbin/nginx')):
             Log.info(self, "Cleaning NGINX FastCGI cache")
-            WOShellExec.cmd_exec(self, "rm -rf /var/run/nginx-cache/*")
-            WOService.restart_service(self, 'nginx')
+            purged = WOShellExec.cmd_exec(self, "rm -rf /var/run/nginx-cache/*")
+            if graceful:
+                if not purged:
+                    Log.error(self, "Unable to clean FastCGI cache")
+                    return
+                # Check the exit status before signalling nginx; a reload
+                # keeps listeners open while old workers finish requests.
+                if not WOShellExec.cmd_exec(
+                        self, "nginx -t && service nginx reload"):
+                    Log.error(self, "Unable to reload NGINX after cache purge")
+            else:
+                WOService.restart_service(self, 'nginx')
         else:
-            Log.error(self, "Unable to clean FastCGI cache", False)
+            Log.error(self, "Unable to clean FastCGI cache", graceful)
 
     @expose(hide=True)
     def clean_opcache(self):

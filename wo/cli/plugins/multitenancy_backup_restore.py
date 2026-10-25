@@ -463,7 +463,8 @@ def flush_site_caches(app, domain, site_row_or_tenant):
             Log.warn(app, f'Redis cache flush for {domain} failed: {exc}')
     if cache_type == 'wpfc':
         try:
-            purge_result = WOShellExec.cmd_exec(app, 'wo clean --fastcgi')
+            purge_result = WOShellExec.cmd_exec(
+                app, 'wo clean --fastcgi --reload')
             if purge_result is False:
                 Log.warn(app, f'FastCGI cache purge for {domain} failed')
         except Exception as exc:

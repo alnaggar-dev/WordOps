@@ -163,9 +163,10 @@ if used with --all=off argument.
 .br
 Update security settings.
 .TP
-.B clean [ --fastcgi | --opcache | --redis | --all ]
+.B clean [ --fastcgi | --opcache | --redis | --all ] [ --reload ]
 .br
 Clean NGINX fastCGI cache, Opcache, Redis cache.
+Use --reload to purge FastCGI cache files and gracefully reload NGINX after a successful configuration test, instead of restarting it.
 .br
 Clean NGINX fastCGI cache if no option specified.
 .SH ARGUMENTS

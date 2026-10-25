@@ -181,6 +181,15 @@ It still prepares the release, switches content, resets caches, and checks store
 A failure after the switch automatically selects the previous release and checks it again.
 Restoring these dumps would lose data written after the restore point.
 
+Multitenancy cache clearing uses `wo clean --all --reload`: it still deletes
+FastCGI cache files, flushes Redis, and resets OpCache, but runs `nginx -t`
+before gracefully reloading nginx instead of restarting it. FastCGI-only
+multitenancy purges use the same `--reload` mode. A failed purge or nginx
+configuration test/reload reports failure without attempting a restart.
+This keeps listeners open during core updates, core rollbacks, and content
+switches; it does not change maintenance gates or the ordinary `wo clean`
+restart policy.
+
 Every content switch, including automatic and explicit rollback, gracefully reloads nginx after PHP-FPM and before checking pages.
 Reloading FPM alone leaves nginx's per-worker upstream health and cached FastCGI connections untouched.
 The standard two-socket upstream has no shared `zone` or explicit failure overrides, so nginx defaults to `max_fails=1` and `fail_timeout=10s`.
@@ -190,6 +199,7 @@ It uses the existing configuration-checked reload path and fails the operation i
 The safe path still drains before switching, and its maintenance gates stay closed until the normal checked resume.
 Code-only rollback retains all seven public page checks and the failed deployment history result; switching the link back alone is not a successful health check.
 Rollback keeps its log marker **before** the switch and service reloads, so restored-release startup failures remain visible.
+
 Only recovery checks exclude a late fatal whose PHP header gives a source file inside the exact release being switched away from.
 Message mentions and stack frames do not establish the origin; unattributed, core, restored-release, and `content/current` failures still fail recovery.
 Normal deployment checks exclude nothing. Recovery still checks all seven pages, WooCommerce database versions, and fleet health.

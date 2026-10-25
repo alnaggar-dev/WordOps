@@ -38,6 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 -   Fix fail2ban nginx jails watching no files: Debian's `defaults-debian.conf` sets `backend = systemd`, which ignores `logpath`. The nginx jails and `recidive` now set `backend = auto`
 -   Fix multitenancy sites logging outside `/var/log/nginx`, so fail2ban and logrotate never saw them. Vhosts now log to `/var/log/nginx/<domain>.{access,error}.log` with `logs/` symlinks, like standard sites; existing log files move there when the vhost is regenerated
 -   Fix multitenancy cron draining with Linux `protected_regular`: open existing `www-data` lock files read-only without `O_CREAT`, create missing locks exclusively, and safely reopen after a creation race while retaining symlink protection and exclusive flock behavior.
+-   Fix brief nginx listener downtime during multitenancy core updates, rollbacks, content deployments, baseline apply, and cache-clearing restores: purge FastCGI files and use a configuration-checked graceful reload instead of restarting nginx. Redis and OpCache clearing remain unchanged; ordinary `wo clean` retains its restart policy unless `--reload` is supplied.
 
 ### v3.21.3 - 2024-06-14
 
