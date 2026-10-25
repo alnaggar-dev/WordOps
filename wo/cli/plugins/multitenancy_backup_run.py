@@ -19,6 +19,9 @@ from wo.core.logging import Log
 from wo.cli.plugins.multitenancy_db import MultitenancySite
 from wo.core.database import db_session
 from wo.cli.plugins.multitenancy_functions import MTFunctions
+from wo.cli.plugins.multitenancy_content import (
+    content_root, current_link, current_release, is_cut_over,
+)
 from wo.cli.plugins.multitenancy_backup_functions import (
     BACKUP_ENV_FILE,
     CACHE_DIR,
@@ -583,8 +586,14 @@ def _files_paths(controller, tenants):
                 add(path)
 
     add_existing_global(os.path.join(shared_root, "config"))
-    add_existing_global(os.path.join(shared_root, ".git"))
-    add_existing_global(os.path.join(shared_root, "wp-content"))
+    if is_cut_over(shared_root):
+        release = current_release(shared_root)
+        if release is None:
+            raise BackupError("The current content release is missing")
+        add(release)
+        add(current_link(shared_root))
+    else:
+        add_existing_global(os.path.join(shared_root, "wp-content"))
     add_existing_global("/etc/wo/plugins.d/multitenancy.conf")
     staged = stage_sqlite_copy()
     if not staged:
@@ -608,6 +617,10 @@ def _files_paths(controller, tenants):
         os.path.join(shared_root, "backups"),
         os.path.join(shared_root, "backups/**"),
     ])
+    if is_cut_over(shared_root):
+        for directory in ("cache", "upgrade"):
+            path = os.path.join(release, "wp-content", directory)
+            excludes.extend([path, path + "/**"])
     return paths, excludes
 
 
@@ -628,7 +641,17 @@ def _run_files(controller, config, cron=False):
     try:
         tenants = enumerate_enabled_tenants(controller)
         paths, excludes = _files_paths(controller, tenants)
-        summary = restic_backup_paths(paths, ["files"], excludes) or {}
+        mt_config = MTFunctions.load_config(controller) or {}
+        shared_root = mt_config.get("shared_root", "/var/www/shared")
+        tags = ["files"]
+        release_root = os.path.realpath(content_root(shared_root))
+        for path in paths:
+            if os.path.dirname(path) == release_root and \
+                    path != current_link(shared_root):
+                payload["content_release"] = os.path.basename(path)
+                tags.append("content-release:" + payload["content_release"])
+                break
+        summary = restic_backup_paths(paths, tags, excludes) or {}
         payload["data_added"] = summary.get("data_added", 0)
         payload["snapshot_id"] = summary.get("snapshot_id")
         retention = _run_retention(controller, config)
