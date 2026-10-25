@@ -39,6 +39,7 @@ except Exception:
 try:
     from wo.cli.plugins import multitenancy_backup_functions as backup_functions
     from wo.cli.plugins import multitenancy_backup_run as backup_run
+    from wo.cli.plugins import multitenancy_backup_fleet as backup_fleet
 finally:
     shutil.copy2 = _copy2
     _distro.id = _distro_id
@@ -284,6 +285,164 @@ class MultitenancyBackupTests(unittest.TestCase):
                 "force_ssl": "/etc/nginx/conf.d/force-ssl-example.com.conf",
             },
         )
+
+
+class ContentBackupTests(unittest.TestCase):
+    release_name = "20261025-120000-abcdef0"
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.shared = os.path.join(self.tmp, "shared")
+        os.makedirs(os.path.join(self.shared, "config"))
+        self.sqlite = os.path.join(self.tmp, "dbase.db")
+        self._write(self.sqlite, "sqlite")
+
+    @staticmethod
+    def _write(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def _layout(self, root, released):
+        if released:
+            release = os.path.join(root, "content", self.release_name)
+            self._write(os.path.join(release, "wp-content", "plugin.php"), "snapshot")
+            self._write(os.path.join(release, "baseline.json"), "{}")
+            self._write(os.path.join(release, "RELEASE"), "{}")
+            os.symlink(self.release_name, os.path.join(root, "content", "current"))
+            os.symlink("content/current/wp-content", os.path.join(root, "wp-content"))
+            os.makedirs(os.path.join(root, "config"), exist_ok=True)
+            os.symlink("../content/current/baseline.json",
+                       os.path.join(root, "config", "baseline.json"))
+            return release
+        self._write(os.path.join(root, "wp-content", "plugin.php"), "snapshot")
+        self._write(os.path.join(root, "config", "baseline.json"), "{}")
+        return os.path.join(root, "wp-content")
+
+    def _files_paths(self):
+        with mock.patch.object(backup_run.MTFunctions, "load_config",
+                               return_value={"shared_root": self.shared}), \
+                mock.patch.object(backup_run, "stage_sqlite_copy", return_value=self.sqlite):
+            return backup_run._files_paths(mock.Mock(), [])
+
+    def test_files_paths_include_resolved_release_and_identity(self):
+        release = self._layout(self.shared, True)
+        paths, excludes = self._files_paths()
+        self.assertIn(release, paths)
+        self.assertIn(os.path.join(self.shared, "content", "current"), paths)
+        self.assertNotIn(os.path.join(self.shared, "wp-content"), paths)
+        self.assertNotIn(os.path.join(self.shared, ".git"), paths)
+        self.assertIn(os.path.join(release, "wp-content", "cache", "**"), excludes)
+
+    def test_files_paths_keep_old_real_folder_without_git(self):
+        folder = self._layout(self.shared, False)
+        os.makedirs(os.path.join(self.shared, ".git"))
+        paths, _ = self._files_paths()
+        self.assertIn(folder, paths)
+        self.assertNotIn(os.path.join(self.shared, ".git"), paths)
+
+    def test_files_paths_reject_missing_live_release(self):
+        self._layout(self.shared, True)
+        shutil.rmtree(os.path.join(self.shared, "content", self.release_name))
+        with self.assertRaises(backup_functions.BackupError):
+            self._files_paths()
+
+    def test_files_snapshot_records_release_tag_and_state(self):
+        release = self._layout(self.shared, True)
+        with mock.patch.object(backup_run.MTFunctions, "load_config",
+                               return_value={"shared_root": self.shared}), \
+                mock.patch.object(backup_run, "enumerate_enabled_tenants", return_value=[]), \
+                mock.patch.object(backup_run, "_files_paths", return_value=([release], [])), \
+                mock.patch.object(backup_run, "restic_backup_paths",
+                                  return_value={"snapshot_id": "snapshot"}) as backup, \
+                mock.patch.object(backup_run, "_run_retention", return_value={"ok": True}), \
+                mock.patch.object(backup_run, "record_run"):
+            result = backup_run._run_files(mock.Mock(), {})
+        self.assertTrue(result["ok"])
+        self.assertIn("content-release:" + self.release_name, backup.call_args.args[1])
+        self.assertEqual(result["payload"]["content_release"], self.release_name)
+
+    def test_fleet_safety_captures_release_not_git(self):
+        release = self._layout(self.shared, True)
+        os.makedirs(os.path.join(self.shared, ".git"))
+        with mock.patch.object(backup_fleet, "stage_sqlite_copy", return_value=self.sqlite), \
+                mock.patch.object(backup_fleet, "restic_backup_paths",
+                                  return_value={"snapshot_id": "global"}) as backup, \
+                mock.patch.object(backup_fleet, "restic_backup_stdin_command",
+                                  return_value={"snapshot_id": "manifest"}):
+            backup_fleet._capture_safety(
+                mock.Mock(), {}, "operation", self.tmp, {"shared_root": self.shared})
+        self.assertIn(release, backup.call_args.args[0])
+        self.assertIn(os.path.join(self.shared, "content", "current"), backup.call_args.args[0])
+        self.assertNotIn(os.path.join(self.shared, ".git"), backup.call_args.args[0])
+        self.assertIn("content-release:" + self.release_name, backup.call_args.args[1])
+
+    def test_fleet_restore_rejects_missing_content_without_removing_live_folder(self):
+        self._layout(self.shared, False)
+        staged = tempfile.mkdtemp(dir=self.tmp)
+        with mock.patch.object(backup_fleet, "run_restic"):
+            with self.assertRaises(backup_functions.BackupError):
+                backup_fleet._restore_global_paths(
+                    "snapshot", staged, {"shared_root": self.shared})
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.shared, "wp-content", "plugin.php")))
+
+    def test_directory_replacement_recovers_original_after_install_failure(self):
+        destination = self._layout(self.shared, False)
+        prepared = os.path.join(self.tmp, "prepared")
+        self._write(os.path.join(prepared, "replacement.php"), "replacement")
+        replace = os.replace
+
+        def fail_install(source, target):
+            if source == prepared:
+                raise OSError("install failed")
+            replace(source, target)
+
+        with mock.patch.object(backup_fleet.os, "replace", side_effect=fail_install):
+            with self.assertRaisesRegex(OSError, "install failed"):
+                backup_fleet._replace_global_entry(prepared, destination)
+        self.assertTrue(os.path.isfile(os.path.join(destination, "plugin.php")))
+        self.assertTrue(os.path.isdir(prepared))
+
+    @staticmethod
+    def _copy_directory(source, destination, **kwargs):
+        shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
+
+    def test_fleet_restore_recreates_each_snapshot_layout(self):
+        for live_released in (False, True):
+            for snapshot_released in (False, True):
+                with self.subTest(live=live_released, snapshot=snapshot_released):
+                    if os.path.exists(self.shared):
+                        shutil.rmtree(self.shared)
+                    self._layout(self.shared, live_released)
+                    staged = tempfile.mkdtemp(dir=self.tmp)
+                    snapshot_root = os.path.join(staged, self.shared.lstrip("/"))
+                    self._layout(snapshot_root, snapshot_released)
+                    # Shared files are real temporary files. Other globals are absent.
+                    with mock.patch.object(backup_fleet, "run_restic") as restore, \
+                            mock.patch.object(backup_fleet, "_rsync_directory",
+                                              side_effect=self._copy_directory), \
+                            mock.patch.object(backup_fleet, "_lexists",
+                                              side_effect=lambda path: path.startswith(self.tmp)
+                                              and os.path.lexists(path)), \
+                            mock.patch.object(backup_fleet, "_remove_path",
+                                              wraps=backup_fleet._remove_path) as remove:
+                        backup_fleet._restore_global_paths(
+                            "snapshot", staged, {"shared_root": self.shared})
+                    self.assertTrue(os.path.isfile(
+                        os.path.join(self.shared, "wp-content", "plugin.php")))
+                    self.assertEqual(os.path.islink(
+                        os.path.join(self.shared, "wp-content")), snapshot_released)
+                    self.assertEqual(os.path.islink(
+                        os.path.join(self.shared, "config", "baseline.json")), snapshot_released)
+                    if snapshot_released:
+                        self.assertEqual(os.readlink(
+                            os.path.join(self.shared, "content", "current")), self.release_name)
+                    self.assertNotIn(os.path.join(self.shared, ".git"),
+                                     restore.call_args.args[0])
+                    for call in remove.call_args_list:
+                        self.assertTrue(call.args[0].startswith(self.tmp))
 
 
 def stat_mode(path):

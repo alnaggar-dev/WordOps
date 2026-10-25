@@ -23,6 +23,12 @@ from wo.core.database import db_session
 from wo.cli.plugins.sitedb import getSiteInfo
 from wo.cli.plugins.multitenancy_db import MultitenancySite
 from wo.cli.plugins.multitenancy_functions import MTFunctions
+from wo.cli.plugins.multitenancy_content import (
+    content_root,
+    current_link,
+    current_release,
+    is_cut_over,
+)
 
 from wo.cli.plugins.multitenancy_backup_functions import (
     BackupError,
@@ -420,26 +426,32 @@ def _capture_safety(controller, current_manifest, operation_id, operation_root, 
     current_sqlite = stage_sqlite_copy()
     if not current_sqlite or not os.path.isfile(current_sqlite):
         raise _FleetAbort('could not stage the current dbase.db for safety capture')
+    release = current_release(shared_root) if is_cut_over(shared_root) else None
+    if is_cut_over(shared_root) and release is None:
+        raise _FleetAbort('current content release is missing for fleet safety capture')
     global_paths = [
         os.path.join(shared_root, 'config'),
-        os.path.join(shared_root, '.git'),
-        os.path.join(shared_root, 'wp-content'),
+        release or os.path.join(shared_root, 'wp-content'),
         '/etc/wo/plugins.d/multitenancy.conf',
         current_sqlite,
         '/etc/letsencrypt',
     ]
+    global_tags = [
+        'pre-restore',
+        'files',
+        'fleet',
+        'global',
+        'operation:%s' % operation_id,
+    ]
+    if release:
+        global_paths.append(current_link(shared_root))
+        global_tags.append('content-release:%s' % os.path.basename(release))
     global_paths = [path for path in global_paths if _lexists(path)]
     if not global_paths:
         raise _FleetAbort('no global paths exist for fleet safety capture')
     global_summary = restic_backup_paths(
         global_paths,
-        [
-            'pre-restore',
-            'files',
-            'fleet',
-            'global',
-            'operation:%s' % operation_id,
-        ],
+        global_tags,
         excludes=GATE_EXCLUDES,
     )
     global_id = _summary_snapshot_id_or_abort(global_summary, 'global safety capture')
@@ -958,30 +970,120 @@ def _apply_site_files_from_staged(controller, domain, staged_root, row):
     _verify_site_ownership(domain, live_paths)
 
 
+def _replace_global_entry(source, destination):
+    """Install a prepared entry, retaining a directory's original on failure."""
+    if not _lexists(destination) or not (
+            (os.path.isdir(source) and not os.path.islink(source)) or
+            (os.path.isdir(destination) and not os.path.islink(destination))):
+        os.replace(source, destination)
+        return
+    # POSIX cannot replace a nonempty directory or exchange a directory and a
+    # symlink. Keep the original next to the destination until installation wins.
+    holding = tempfile.mkdtemp(prefix='.wo-restore-old-', dir=os.path.dirname(destination))
+    previous = os.path.join(holding, 'previous')
+    try:
+        os.replace(destination, previous)
+        try:
+            os.replace(source, destination)
+        except BaseException:
+            os.rename(previous, destination)
+            raise
+    except BaseException:
+        if not _lexists(previous):
+            os.rmdir(holding)
+        # If recovery itself failed, retain the original for manual recovery.
+        raise
+    else:
+        shutil.rmtree(holding)
+
+
+def _replace_global_directory(source, destination):
+    """Copy before cutover, never rsync through a live content symlink."""
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix='.wo-restore-new-', dir=parent)
+    prepared = os.path.join(staging, 'directory')
+    try:
+        _rsync_directory(source, prepared)
+        _replace_global_entry(prepared, destination)
+    finally:
+        shutil.rmtree(staging)
+
+
+def _replace_global_link(target, destination):
+    """Replace symlinks atomically, recovering a displaced legacy directory."""
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix='.wo-restore-link-', dir=parent)
+    prepared = os.path.join(staging, 'link')
+    try:
+        os.symlink(target, prepared)
+        _replace_global_entry(prepared, destination)
+    finally:
+        shutil.rmtree(staging)
+
+
 def _restore_global_paths(files_snapshot_id, staged_global, global_config):
+    shared_root = global_config.get('shared_root', '/var/www/shared')
+    wp_content = os.path.join(shared_root, 'wp-content')
+    config_path = os.path.join(shared_root, 'config')
     global_paths = [
-        global_config.get('shared_root', '/var/www/shared') + '/config',
-        global_config.get('shared_root', '/var/www/shared') + '/.git',
-        global_config.get('shared_root', '/var/www/shared') + '/wp-content',
+        config_path,
+        wp_content,
+        content_root(shared_root),
         '/etc/wo/plugins.d/multitenancy.conf',
         '/etc/letsencrypt',
     ]
-    includes = [path for path in global_paths if _lexists(path)]
-    # The source may not exist in a selected snapshot; include all known paths
-    # so replacement semantics can remove a stale live optional path.
     args = ['restore', files_snapshot_id, '--target', staged_global]
     for path in global_paths:
         args.extend(['--include', path])
     run_restic(args)
-    for live_path in global_paths:
+
+    staged_current = _staged_path(staged_global, current_link(shared_root))
+    staged_content = _staged_path(staged_global, wp_content)
+    staged_config = _staged_path(staged_global, config_path)
+    release_name = None
+    if staged_current and os.path.islink(staged_current):
+        # Never realpath a staged absolute link: it could resolve into live data.
+        release_path = os.path.normpath(os.path.join(
+            content_root(shared_root), os.readlink(staged_current)))
+        if (os.path.dirname(release_path) != os.path.normpath(content_root(shared_root)) or
+                os.path.basename(release_path) == 'current'):
+            raise _FleetAbort('snapshot content/current does not name a content release')
+        release_name = os.path.basename(release_path)
+        staged_release = _staged_path(staged_global, release_path)
+        if staged_release is None or os.path.islink(staged_release) or not os.path.isdir(staged_release):
+            raise _FleetAbort('snapshot content release is missing')
+        staged_content = os.path.join(staged_release, 'wp-content')
+        baseline = os.path.join(staged_release, 'baseline.json')
+        if os.path.islink(baseline) or not os.path.isfile(baseline):
+            raise _FleetAbort('snapshot content release baseline is missing')
+        if staged_config is None or os.path.islink(staged_config) or not os.path.isdir(staged_config):
+            raise _FleetAbort('snapshot shared configuration is missing')
+    if staged_content is None or os.path.islink(staged_content) or not os.path.isdir(staged_content):
+        raise _FleetAbort('fleet files snapshot has no shared wp-content directory')
+
+    if release_name:
+        _replace_global_directory(staged_release, release_path)
+        _replace_global_link(release_name, current_link(shared_root))
+        _replace_global_link('content/current/wp-content', wp_content)
+        # Normalize the baseline link in staging, so config restore cannot copy
+        # an absolute link into the live tree or read a live baseline through it.
+        _replace_global_link('../content/current/baseline.json',
+                             os.path.join(staged_config, 'baseline.json'))
+    else:
+        _replace_global_directory(staged_content, wp_content)
+        if os.path.islink(current_link(shared_root)):
+            os.unlink(current_link(shared_root))
+
+    for live_path in (config_path, '/etc/wo/plugins.d/multitenancy.conf', '/etc/letsencrypt'):
         source = _staged_path(staged_global, live_path)
         if source is not None and os.path.isdir(source) and not os.path.islink(source):
-            _rsync_directory(source, live_path)
-        elif source is not None and os.path.isfile(source):
+            _replace_global_directory(source, live_path)
+        elif source is not None and os.path.isfile(source) and not os.path.islink(source):
             _copy_file_atomic(source, live_path)
-        elif live_path in includes and _lexists(live_path):
-            # A path known to be part of the live set but absent from the
-            # selected snapshot is removed for exact replacement semantics.
+        elif _lexists(live_path):
+            # Optional globals absent from the selected snapshot are removed.
             _remove_path(live_path)
 
 
