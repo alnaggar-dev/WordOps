@@ -354,7 +354,14 @@ class ContentDeployment:
         if result.get('status') == 'unhealthy':
             raise DeployError('Fleet health is unhealthy.')
 
-    def _recovery_message(self):
+    def _recovery_message(self, switched_back=False):
+        if switched_back:
+            Log.warn(self.controller, 'Previous files are live. Maintenance remains on for database recovery.')
+            if self.restore:
+                Log.warn(self.controller, self.restore['command'])
+            Log.warn(self.controller, 'After recovery and checks, run '
+                     'wo multitenancy maintenance --all --disable.')
+            return
         Log.warn(self.controller, 'Stores remain in maintenance. Choose one recovery path:')
         Log.warn(self.controller, '1. Fix forward with a new safe content deploy.')
         Log.warn(self.controller, '2. Run wo multitenancy deploy --back --force, then restore the database dumps:')
@@ -486,7 +493,7 @@ class ContentDeployment:
             result = 'fail' if switched else 'aborted'
             if safe and switched:
                 self._bypass(False)
-                self._recovery_message()
+                self._recovery_message(switched_back=True)
             elif safe:
                 self.gates = [domain for domain in self.gates if domain not in self.preexisting_gates]
                 self._release_maintenance()

@@ -245,7 +245,7 @@ class ContentDeploymentTests(unittest.TestCase):
             self.operation.back(force=True)
         self.assert_live(self.old)
         self.operation._release_maintenance.assert_not_called()
-        self.operation._recovery_message.assert_called_once_with()
+        self.operation._recovery_message.assert_called_once_with(switched_back=True)
         self.assertEqual(self.records()[-1]['result'], 'fail')
 
     def test_prepare_breaks_logger_hardlink_before_rendering(self):
