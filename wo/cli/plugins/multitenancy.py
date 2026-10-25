@@ -3,7 +3,6 @@ Enables WordPress multi-tenancy with shared core files for efficient management.
 """
 
 import os
-import sys
 import json
 import shutil
 import subprocess
@@ -11,21 +10,16 @@ from datetime import datetime
 from cement.core.controller import CementBaseController, expose
 from wo.cli.plugins.site_functions import (
     check_domain_exists, setupdatabase, setwebrootpermissions,
-    site_package_check, sitebackup, pre_run_checks
+    site_package_check
 )
 from wo.cli.plugins.sitedb import (
-    addNewSite, deleteSiteInfo, getAllsites, getSiteInfo, renameSiteInfo,
+    addNewSite, getSiteInfo, renameSiteInfo,
     updateSiteInfo
 )
 from wo.core.domainvalidate import WODomain
 from wo.core.fileutils import WOFileUtils
 from wo.core.git import WOGit
 from wo.core.logging import Log
-from wo.core.services import WOService
-from wo.core.shellexec import WOShellExec, CommandExecutionError
-from wo.core.sslutils import SSL
-from wo.core.variables import WOVar
-from wo.core.acme import WOAcme
 from wo.cli.plugins.multitenancy_functions import (
     MTFunctions, SharedInfrastructure, ReleaseManager, BaselineApplicator,
     create_shared_config_file, edit_shared_config,
@@ -34,6 +28,9 @@ from wo.cli.plugins.multitenancy_db import MTDatabase
 from wo.cli.plugins.multitenancy_health import HealthChecker, render_text as render_health_text
 from wo.cli.plugins.multitenancy_backup_functions import (
     fleet_operation, write_tombstone, repair_backup_cron
+)
+from wo.cli.plugins.multitenancy_content import (
+    current_release as current_content_release, is_cut_over, read_release_info,
 )
 
 
@@ -85,9 +82,7 @@ def _remove_pending_upgrade_domain(app, shared_root, domain):
         Log.warn(app, f"Could not update pending-db-upgrades ledger: {e}")
 
 
-def _reject_extra_positionals(controller, pargs,
-                              fields=('newsite_name', 'plugin_slug',
-                                      'theme_slug')):
+def _reject_extra_positionals(controller, pargs, fields=('newsite_name',)):
     """Reject stray positional tokens swallowed by optional positionals.
 
     `create foo.com —le` (em dash) parks '—le' in newsite_name and silently
@@ -107,7 +102,7 @@ def _reject_extra_positionals(controller, pargs,
 
 
 class _UpdateAbort(Exception):
-    """Abort an update before release mutation without generic rollback advice."""
+    """Stop an update when a safety check fails."""
 
 
 class WOMultitenancyController(CementBaseController):
@@ -146,18 +141,6 @@ class WOMultitenancyController(CementBaseController):
                 dict(help='WordPress admin email', default='')),
             (['--admin-user'],
                 dict(help='WordPress admin username', default='SuperDuper')),
-            (['plugin_slug'], dict(help='Plugin or theme slug', nargs='?')),
-            (['theme_slug'], dict(help='Theme slug', nargs='?')),
-            (['--apply-now'], dict(help='Apply changes immediately', action='store_true')),
-            (['--set-default'], dict(help='Set as default theme', action='store_true')),
-            # Phase 3: GitHub and URL download support
-            (['--github'], dict(help='GitHub repository (user/repo)', dest='github')),
-            (['--branch'], dict(help='GitHub branch name', dest='branch')),
-            (['--tag'], dict(help='GitHub tag/release name', dest='tag')),
-            (['--url'], dict(help='Direct download URL', dest='url')),
-            # Phase 3: Rollback support
-            (['--to-version'], dict(help='Baseline version to rollback to', type=int, dest='to_version')),
-            # Phase 3: Shared configuration management
             (['--action'], dict(help="Shared-config action (only 'edit' supported)", dest='config_action')),
             (['--dry-run'], dict(help='Preview changes without applying', action='store_true', dest='dry_run')),
             (['--prune'], dict(help='Deactivate plugins not listed in baseline during apply', action='store_true', dest='prune')),
@@ -216,34 +199,12 @@ class WOMultitenancyController(CementBaseController):
             Log.info(self, "Downloading WordPress core...")
             release_name = infra.download_wordpress_core(config.get('wp_version'))
             
-            # Seed plugins and themes. On --force (reinitialize) this refreshes
-            # assets already on disk from their configured sources.
-            Log.info(self, "Seeding plugins and themes...")
-            seed_failures = infra.seed_plugins_and_themes(config, force=pargs.force)
-            
-            # Create baseline configuration
-            Log.info(self, "Creating baseline configuration...")
-            infra.create_baseline_config(config)
-            
-            # Remove legacy baseline-enforcer MU-plugin if present (init --force)
-            mu_path = f"{shared_root}/wp-content/mu-plugins/wo-baseline-enforcer.php"
-            if os.path.exists(mu_path):
-                os.remove(mu_path)
-            MTFunctions.install_login_failure_logger(self, shared_root)
-            
             # Phase 1: Create shared configuration file
             Log.info(self, "Creating shared configuration file...")
             if create_shared_config_file(self, shared_root):
                 Log.info(self, "   ✅ Shared config file created")
             else:
                 Log.warn(self, "   ⚠️  Could not create shared config file")
-            
-            # Initialize git tracking
-            Log.info(self, "Setting up git tracking for baseline...")
-            if infra.initialize_git_tracking():
-                Log.info(self, "   ✅ Git tracking initialized")
-            else:
-                Log.warn(self, "   Git tracking not available (git not installed)")
             
             # Make release current
             Log.info(self, "Activating release...")
@@ -260,25 +221,16 @@ class WOMultitenancyController(CementBaseController):
             release_manager = ReleaseManager(self, shared_root)
             keep_releases = int(config.get('keep_releases', 3))
             release_manager.cleanup_old_releases(keep_releases)
-            if not seed_failures:
-                infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
 
             # Update database
             if not MTDatabase.save_config(self, {
                 'shared_root': shared_root,
                 'current_release': release_name,
-                'baseline_version': 1
             }):
                 Log.error(self, "Failed to persist multitenancy "
                                 "configuration to the tracking database")
             
-            if seed_failures:
-                Log.warn(self, "⚠️  Multi-tenancy initialized, but some assets failed to download:")
-                for item in seed_failures:
-                    Log.warn(self, f"     - {item}")
-                Log.warn(self, "   Fix access (make private repos reachable or export GH_TOKEN) then re-run: wo multitenancy init --force")
-            else:
-                Log.info(self, "✅ Multi-tenancy infrastructure initialized successfully!")
+            Log.info(self, "Multi-tenancy infrastructure initialized successfully!")
             Log.info(self, f"   Shared root: {shared_root}")
             Log.info(self, f"   Current release: {release_name}")
             
@@ -318,6 +270,14 @@ class WOMultitenancyController(CementBaseController):
         
         config = MTFunctions.load_config(self)
         shared_root = config.get('shared_root', '/var/www/shared')
+        old_content = (
+            not is_cut_over(shared_root)
+            and os.path.isdir(os.path.join(shared_root, 'wp-content'))
+        )
+        if not current_content_release(shared_root) and not old_content:
+            Log.error(self, "No content release is live. "
+                            "Run tools/deploy from the site repo first.")
+            return
         if not MTFunctions.preflight_shared_config(self, shared_root):
             Log.error(self, "Aborted: wp-config-shared.php failed preflight")
 
@@ -444,7 +404,6 @@ class WOMultitenancyController(CementBaseController):
             # Apply baseline configuration
             baseline_path = f"{shared_root}/config/baseline.json"
             baseline = None
-            current_version = MTDatabase.get_baseline_version(self)
             baseline_complete = True
             if os.path.exists(baseline_path):
                 try:
@@ -453,8 +412,7 @@ class WOMultitenancyController(CementBaseController):
                     if not baseline.get('theme'):
                         Log.warn(
                             self,
-                            "Site has no baseline theme; set one with "
-                            "'wo multitenancy set-theme'"
+                            "Site has no baseline theme. Set it in the site repo."
                         )
                     Log.info(self, "Applying baseline configuration...")
                     baseline_result = BaselineApplicator.apply_baseline_to_site(
@@ -476,8 +434,6 @@ class WOMultitenancyController(CementBaseController):
                             f"{', '.join(baseline_result['skipped_plugins'])}"
                         )
                         baseline_complete = False
-                    else:
-                        current_version = baseline.get('version', current_version)
                 except Exception as e:
                     baseline = None
                     baseline_complete = False
@@ -585,15 +541,6 @@ class WOMultitenancyController(CementBaseController):
                 else:
                     Log.warn(self, f"SSL setup failed; {wo_domain} "
                                    "stays on HTTP")
-            
-
-            # Record the baseline version so validate does not flag a fully
-            # applied site; a partial or failed baseline records 0 so validate
-            # flags it and `wo multitenancy apply` re-attempts later.
-            MTDatabase.update_site_baseline(
-                self, wo_domain, current_version if baseline_complete else 0
-            )
-
 
             # Git commit
             WOGit.add(self, ["/etc/nginx"], 
@@ -725,7 +672,7 @@ class WOMultitenancyController(CementBaseController):
                             f"Run manually: {cmds}")
         Log.info(self, "Recovered all pending tenant DB migrations")
 
-    @expose(help="Update WordPress core and plugins for all shared sites")
+    @expose(help="Update WordPress core for all shared sites")
     @fleet_operation('update')
     def update(self):
         """Update shared WordPress infrastructure"""
@@ -759,8 +706,6 @@ class WOMultitenancyController(CementBaseController):
         infra = SharedInfrastructure(self, shared_root)
         release_manager = ReleaseManager(self, shared_root)
 
-        asset_backups = []
-        asset_restore_ok = True
         core_switched = False
         core_db_bump = False
         db_backup_dir = None
@@ -772,11 +717,6 @@ class WOMultitenancyController(CementBaseController):
         loopback_bypass_may_be_active = False
         new_release = None
 
-
-
-
-
-
         try:
             # Create new release
             Log.info(self, "Creating new WordPress release...")
@@ -787,7 +727,7 @@ class WOMultitenancyController(CementBaseController):
             if schema_transition == 'unknown':
                 raise _UpdateAbort(
                     "Cannot read $wp_db_version from both active and staged "
-                    "WordPress cores; update aborted before asset promotion"
+                    "WordPress cores; update aborted before the core switch"
                 )
             if schema_transition == 'downgrade':
                 raise _UpdateAbort(
@@ -808,51 +748,6 @@ class WOMultitenancyController(CementBaseController):
                         "Unsafe tracked tenant domain; update aborted before "
                         f"path construction: {unsafe_domains!r}"
                     )
-
-
-            if not core_db_bump:
-                # Preserve the committed fast path for equal-schema updates.
-                Log.info(self, "Updating plugins and themes...")
-                assets_ok, asset_backups, asset_restore_ok = (
-                    infra.update_plugins_and_themes(config)
-                )
-                if not assets_ok:
-                    if asset_restore_ok:
-                        Log.error(
-                            self,
-                            "Plugin/theme update failed; shared assets "
-                            "were restored"
-                        )
-                    else:
-                        Log.error(
-                            self,
-                            "Plugin/theme update failed AND asset restore "
-                            "was incomplete; restore manually from "
-                            f"{shared_root}/backups/assets/<newest stamp>"
-                        )
-                    return
-
-                if shared_sites and not pargs.force:
-                    canary = shared_sites[0]
-                    Log.info(
-                        self,
-                        f"Testing with canary site: {canary['domain']}"
-                    )
-                    if not MTFunctions.test_site_locally(self, canary):
-                        if not infra.restore_asset_backups(asset_backups):
-                            Log.error(
-                                self,
-                                "Canary test failed AND asset restore was "
-                                "incomplete; restore manually from "
-                                f"{shared_root}/backups/assets/"
-                                "<newest stamp>"
-                            )
-                        Log.warn(
-                            self,
-                            "Canary test failed; shared assets restored. "
-                            "Use --force to proceed anyway."
-                        )
-                        return
 
             # Backup current state
             Log.info(self, "Backing up current release...")
@@ -888,6 +783,11 @@ class WOMultitenancyController(CementBaseController):
                         raise _UpdateAbort(
                             f"Could not enable maintenance gate for {domain}"
                         )
+                if not gated_domains and not pargs.force:
+                    raise _UpdateAbort(
+                        "No update-owned gate is available for the loopback "
+                        "canary. Existing maintenance gates remain unchanged."
+                    )
                 if not MTFunctions.safe_nginx_reload(
                         self, shared_sites[-1]['domain']):
                     raise _UpdateAbort(
@@ -921,31 +821,91 @@ class WOMultitenancyController(CementBaseController):
                         "Could not drain active tenant work before promotion: "
                         + ', '.join(drain_blockers)
                     )
-                Log.info(self, "Updating plugins and themes...")
-                assets_ok, asset_backups, asset_restore_ok = (
-                    infra.update_plugins_and_themes(config)
+                Log.info(
+                    self,
+                    "Tenant traffic and WP-Cron are quiesced; backing up "
+                    "tenant databases..."
                 )
-                if not assets_ok:
-                    # The failed updater already attempted its own restore;
-                    # its records are consumed (backups renamed back), so
-                    # cleanup must not restore them again.
-                    asset_backups = []
+                backups_ok, backup_failures, db_backup_dir = (
+                    MTFunctions.backup_tenant_databases(
+                        self,
+                        shared_sites,
+                        shared_root,
+                    )
+                )
+                Log.info(self, f"Tenant DB backup directory: {db_backup_dir}")
+                if not backups_ok:
+                    for failure in backup_failures:
+                        Log.error(
+                            self,
+                            f"DB backup failed for {failure['domain']}: "
+                            f"{failure['error']}",
+                            exit=False,
+                        )
                     raise _UpdateAbort(
-                        "Plugin/theme update failed inside maintenance window"
+                        "Quiesced tenant database backup incomplete; "
+                        "update aborted"
                     )
 
-                if shared_sites and not pargs.force:
-                    if not gated_domains:
-                        raise _UpdateAbort(
-                            "No update-owned gate is available for the "
-                            "loopback canary"
-                        )
-                    canary_domain = gated_domains[0]
+            if core_db_bump:
+                # Durable per-tenant migration ledger: SQLite failing is the
+                # failure mode, so persist which tenants still need
+                # `wp core update-db` on the filesystem before the flip.
+                try:
+                    _write_pending_upgrades(shared_root, {
+                        'release': new_release,
+                        'created': datetime.now().isoformat(),
+                        'domains': [s['domain'] for s in shared_sites],
+                    })
+                except OSError as e:
+                    raise _UpdateAbort(
+                        f"Could not write pending-db-upgrades ledger: {e}"
+                    )
+
+            # Switch to new release
+            Log.info(self, "Switching to new release...")
+            infra.switch_release(new_release)
+            core_switched = True
+
+            # Clear all caches globally (fast - ~2 seconds for any number of sites)
+            MTFunctions.clear_all_caches(self)
+            if not MTFunctions.reset_opcache(self):
+                Log.warn(self, "Opcache reset incomplete after release flip")
+
+            # Update database
+            if not MTDatabase.update_release(self, new_release):
+                Log.warn(self, "Could not record new release in tracking DB")
+            if not core_db_bump and not pargs.force:
+                canary = shared_sites[0]
+                Log.info(self, f"Testing new core with canary: {canary['domain']}")
+                if not MTFunctions.test_site_locally(self, canary):
+                    raise _UpdateAbort(
+                        "New core canary failed. Run wo multitenancy rollback "
+                        "to restore the previous core."
+                    )
+            if core_db_bump:
+                for site in shared_sites:
+                    failures = MTFunctions.run_core_db_upgrades(self, [site])
+                    if failures:
+                        db_upgrade_failures.extend(failures)
+                    else:
+                        _remove_pending_upgrade_domain(
+                            self, shared_root, site['domain'])
+
+                failed_domains = {
+                    failure['domain'] for failure in db_upgrade_failures
+                }
+                canary_domains = [
+                    domain for domain in gated_domains
+                    if domain not in failed_domains
+                ]
+                if not pargs.force and canary_domains:
+                    canary_domain = canary_domains[0]
                     canary = next(
                         site for site in shared_sites
                         if site['domain'] == canary_domain
                     )
-                    for domain in gated_domains:
+                    for domain in canary_domains:
                         loopback_bypass_may_be_active = True
                         if not _maintenance_enable(
                                 self, domain, maintenance_message, config,
@@ -955,7 +915,7 @@ class WOMultitenancyController(CementBaseController):
                                 f"{domain}"
                             )
                     if not MTFunctions.safe_nginx_reload(
-                            self, gated_domains[-1]):
+                            self, canary_domain):
                         raise _UpdateAbort(
                             "Could not reload nginx with loopback bypass"
                         )
@@ -1003,90 +963,16 @@ class WOMultitenancyController(CementBaseController):
                     if not drained:
                         raise _UpdateAbort(
                             "Could not drain loopback canary work before "
-                            "tenant dumps: " + ', '.join(drain_blockers)
+                            "maintenance removal: " + ', '.join(drain_blockers)
                         )
-                Log.info(
-                    self,
-                    "Tenant traffic and WP-Cron are quiesced; backing up "
-                    "tenant databases..."
-                )
-                backups_ok, backup_failures, db_backup_dir = (
-                    MTFunctions.backup_tenant_databases(
-                        self,
-                        shared_sites,
-                        shared_root,
-                    )
-                )
-                Log.info(self, f"Tenant DB backup directory: {db_backup_dir}")
-                if not backups_ok:
-                    for failure in backup_failures:
-                        Log.error(
-                            self,
-                            f"DB backup failed for {failure['domain']}: "
-                            f"{failure['error']}",
-                            exit=False,
-                        )
-                    raise _UpdateAbort(
-                        "Quiesced tenant database backup incomplete; "
-                        "update aborted"
-                    )
-
-
-
-            if core_db_bump:
-                # Durable per-tenant migration ledger: SQLite failing is the
-                # failure mode, so persist which tenants still need
-                # `wp core update-db` on the filesystem before the flip.
-                try:
-                    _write_pending_upgrades(shared_root, {
-                        'release': new_release,
-                        'created': datetime.now().isoformat(),
-                        'domains': [s['domain'] for s in shared_sites],
-                    })
-                except OSError as e:
-                    raise _UpdateAbort(
-                        f"Could not write pending-db-upgrades ledger: {e}"
-                    )
-
-            # Switch to new release
-            Log.info(self, "Switching to new release...")
-            infra.switch_release(new_release)
-            core_switched = True
-
-            # Clear all caches globally (fast - ~2 seconds for any number of sites)
-            MTFunctions.clear_all_caches(self)
-            if not MTFunctions.reset_opcache(self):
-                Log.warn(self, "Opcache reset incomplete after release flip")
-
-            # Update database
-            if not MTDatabase.update_release(self, new_release):
-                Log.warn(self, "Could not record new release in tracking DB")
-            if core_db_bump:
                 pending_ungate_domains = []
                 sites_by_domain = {
                     site['domain']: site for site in shared_sites
                 }
                 for site in shared_sites:
                     domain = site['domain']
-                    if domain in preexisting_gated_domains:
-                        failures = MTFunctions.run_core_db_upgrades(
-                            self, [site]
-                        )
-                        if failures:
-                            db_upgrade_failures.extend(failures)
-                        else:
-                            _remove_pending_upgrade_domain(
-                                self, shared_root, domain)
-                        MTFunctions.release_tenant_cron_locks({
-                            domain: cron_locks.pop(domain)
-                        })
-                        continue
-                    failures = MTFunctions.run_core_db_upgrades(self, [site])
-                    if not failures:
-                        _remove_pending_upgrade_domain(
-                            self, shared_root, domain)
-                    if failures:
-                        db_upgrade_failures.extend(failures)
+                    if (domain in preexisting_gated_domains
+                            or domain in failed_domains):
                         MTFunctions.release_tenant_cron_locks({
                             domain: cron_locks.pop(domain)
                         })
@@ -1160,13 +1046,9 @@ class WOMultitenancyController(CementBaseController):
                     f"backup_dir={db_backup_dir}"
                 )
 
-
-
             # Cleanup old releases
             Log.info(self, "Cleaning up old releases...")
             release_manager.cleanup_old_releases(int(config.get('keep_releases', 3)))
-            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
-
 
             for domain in preexisting_gated_domains:
                 Log.warn(
@@ -1181,149 +1063,31 @@ class WOMultitenancyController(CementBaseController):
                 Log.info(self, f"   Updated {len(shared_sites)} sites")
                 Log.info(
                     self,
-                    f"update_completed target=baseline result=success "
+                    f"update_completed target=core result=success "
                     f"release={new_release}"
                 )
 
-        except _UpdateAbort as e:
+        except Exception as e:
             cleanup_failures = []
             bypass_closed = True
             if loopback_bypass_may_be_active and gated_domains:
-                bypass_failures = _close_update_loopback_bypass(
-                    self,
-                    gated_domains,
-                    maintenance_message,
-                    config,
-                )
-                cleanup_failures.extend(bypass_failures)
-                bypass_closed = not bypass_failures
-                if bypass_closed:
-                    loopback_bypass_may_be_active = False
-                else:
-                    cleanup_failures.append(
-                        "loopback bypass may still be active; keep maintenance "
-                        "gates in place. For each affected site run "
-                        "`wo multitenancy maintenance --enable --site=<domain>`, "
-                        "verify nginx reload, restore shared assets from "
-                        "shared_root/backups/assets, then disable maintenance"
-                    )
+                cleanup_failures = _close_update_loopback_bypass(
+                    self, gated_domains, maintenance_message, config)
+                bypass_closed = not cleanup_failures
             if cron_locks:
                 MTFunctions.release_tenant_cron_locks(cron_locks)
-            assets_restored = bypass_closed and asset_restore_ok
-            if bypass_closed and asset_backups and not core_switched:
-                try:
-                    assets_restored = infra.restore_asset_backups(
-                        asset_backups
-                    )
-                except Exception:
-                    assets_restored = False
-            if (gated_domains and not core_switched
-                    and bypass_closed and assets_restored):
+            if gated_domains and not core_switched and bypass_closed:
                 cleanup_failures.extend(
-                    _release_update_maintenance(self, gated_domains)
-                )
-                gated_domains = []
-            elif (gated_domains and not core_switched
-                  and bypass_closed and not assets_restored):
-                cleanup_failures.append(
-                    "asset restore failed; maintenance gates retained"
-                )
+                    _release_update_maintenance(self, gated_domains))
+            if core_switched and core_db_bump:
+                Log.warn(self, "The new core remains active. Maintenance gates "
+                               "remain closed. Check the pending migration "
+                               "list and tenant database dumps before recovery.")
             message = str(e)
             if cleanup_failures:
-                message += (
-                    "; maintenance cleanup incomplete: "
-                    + "; ".join(cleanup_failures)
-                )
+                message += "; maintenance cleanup incomplete: " + "; ".join(cleanup_failures)
+            Log.info(self, "update_failed target=core result=failure")
             Log.error(self, message)
-            return
-
-        except Exception as e:
-            if not core_db_bump:
-                if asset_backups and not core_switched:
-                    if not infra.restore_asset_backups(asset_backups):
-                        Log.warn(self, "Asset restore incomplete; restore "
-                                       "manually from "
-                                       f"{shared_root}/backups/assets/")
-                Log.info(self, "update_failed target=baseline result=failure")
-                Log.error(self, f"Update failed: {str(e)}")
-                Log.info(self, "Run 'wo multitenancy rollback' to revert")
-                return
-
-            if cron_locks:
-                MTFunctions.release_tenant_cron_locks(cron_locks)
-            if not core_switched:
-                cleanup_failures = []
-                bypass_closed = True
-                if loopback_bypass_may_be_active and gated_domains:
-                    bypass_failures = _close_update_loopback_bypass(
-                        self,
-                        gated_domains,
-                        maintenance_message,
-                        config,
-                    )
-                    cleanup_failures.extend(bypass_failures)
-                    bypass_closed = not bypass_failures
-                    if bypass_closed:
-                        loopback_bypass_may_be_active = False
-                    else:
-                        cleanup_failures.append(
-                            "loopback bypass may still be active; keep "
-                            "maintenance gates in place. For each affected "
-                            "site run `wo multitenancy maintenance --enable "
-                            "--site=<domain>`, verify nginx reload, restore "
-                            "shared assets from shared_root/backups/assets, "
-                            "then disable maintenance"
-                        )
-                assets_restored = bypass_closed and asset_restore_ok
-                if bypass_closed and asset_backups:
-                    try:
-                        assets_restored = infra.restore_asset_backups(
-                            asset_backups
-                        )
-                    except Exception:
-                        assets_restored = False
-                if gated_domains and bypass_closed and assets_restored:
-                    cleanup_failures.extend(
-                        _release_update_maintenance(self, gated_domains)
-                    )
-                    gated_domains = []
-                elif gated_domains and bypass_closed and not assets_restored:
-                    cleanup_failures.append(
-                        "asset restore failed; maintenance gates retained"
-                    )
-                message = f"Update failed: {str(e)}"
-                if cleanup_failures:
-                    message += (
-                        "; maintenance cleanup incomplete: "
-                        + "; ".join(cleanup_failures)
-                    )
-                Log.info(self, "update_failed target=baseline result=failure")
-                Log.error(self, message)
-                Log.info(self, "Run 'wo multitenancy rollback' to revert")
-                return
-
-            Log.info(
-                self,
-                "update_completed target=baseline result=partial "
-                "post_flip_exception=1"
-            )
-            for domain in gated_domains:
-                Log.warn(
-                    self,
-                    "Site remains maintenance-gated: "
-                    f"{domain}. Manual ungate: wo multitenancy maintenance "
-                    f"--disable --site={domain}"
-                )
-            for domain in preexisting_gated_domains:
-                Log.warn(
-                    self,
-                    f"Pre-existing maintenance gate remains active for "
-                    f"{domain}"
-                )
-            Log.error(
-                self,
-                f"Post-flip update failed: {e}; new core remains active"
-            )
             return
 
         finally:
@@ -1340,7 +1104,7 @@ class WOMultitenancyController(CementBaseController):
             )
             Log.info(
                 self,
-                "update_completed target=baseline result=partial "
+                "update_completed target=core result=partial "
                 f"failed_db_upgrades={len(db_upgrade_failures)}"
             )
             for domain in gated_domains:
@@ -1405,7 +1169,7 @@ class WOMultitenancyController(CementBaseController):
 
             Log.info(self, "✅ Rollback completed successfully!")
             Log.info(self, f"   Now running: {previous_release}")
-            Log.info(self, f"rollback_triggered target=baseline result=success to={previous_release}")
+            Log.info(self, f"rollback_triggered target=core result=success to={previous_release}")
             Log.info(
                 self,
                 "WordPress DB migrations are forward-only. If `wp core "
@@ -1417,13 +1181,8 @@ class WOMultitenancyController(CementBaseController):
 
 
         except Exception as e:
-            Log.info(self, f"rollback_failed target=baseline result=failure")
+            Log.info(self, "rollback_failed target=core result=failure")
             Log.error(self, f"Rollback failed: {str(e)}")
-
-    def _persist_baseline_version(self, version):
-        """Mirror the baseline.json version into the tracking DB."""
-        if not MTDatabase.save_config(self, {'baseline_version': version}):
-            Log.warn(self, "Could not sync baseline version to tracking DB")
 
     @expose(help="Show status of multi-tenancy infrastructure")
     def status(self):
@@ -1440,18 +1199,17 @@ class WOMultitenancyController(CementBaseController):
         # Get current state
         current_release = MTDatabase.get_current_release(self)
         shared_sites = MTDatabase.get_shared_sites(self)
-        # baseline.json is the source of truth for the baseline version;
-        # the DB key is a mirror kept for the file-missing case.
         baseline = None
         try:
             with open(f"{shared_root}/config/baseline.json") as fh:
                 baseline = json.load(fh)
         except (OSError, ValueError):
             baseline = None
-        if isinstance(baseline, dict) and 'version' in baseline:
-            baseline_version = baseline['version']
-        else:
-            baseline_version = MTDatabase.get_baseline_version(self)
+        content_release = current_content_release(shared_root)
+        deployed_commit = (
+            read_release_info(content_release).get('commit', 'unknown')
+            if content_release else 'old layout, not cut over'
+        )
 
         Log.info(self, "")
         Log.info(self, "=== WordPress Multi-tenancy Status ===")
@@ -1461,7 +1219,7 @@ class WOMultitenancyController(CementBaseController):
         Log.info(self, "INFRASTRUCTURE:")
         Log.info(self, f"  Shared root: {shared_root}")
         Log.info(self, f"  Current release: {current_release}")
-        Log.info(self, f"  Baseline version: {baseline_version}")
+        Log.info(self, f"  Deployed commit: {deployed_commit}")
         
         # Check infrastructure health
         health_checks = MTFunctions.perform_health_check(self, shared_root)
@@ -1559,17 +1317,7 @@ class WOMultitenancyController(CementBaseController):
         with open(baseline_file, 'r') as f:
             baseline = json.load(f)
 
-        Log.info(self, "Current Baseline Configuration:")
-        Log.info(self, f"  Version: {baseline.get('version', 1)}")
-        Log.info(self, f"  Plugins: {', '.join(baseline.get('plugins', []))}")
-        Log.info(self, f"  Theme: {baseline.get('theme', 'unknown')}")
-        Log.info(self, "")
-        Log.info(self, "To change the baseline, use:")
-        Log.info(self, "  wo multitenancy add-plugin <slug> [--apply-now]")
-        Log.info(self, "  wo multitenancy add-theme <slug> [--set-default] [--apply-now]")
-        Log.info(self, "  wo multitenancy remove-plugin <slug>")
-        Log.info(self, "  wo multitenancy set-theme <slug> [--apply-now]")
-        Log.info(self, "Then roll out to all sites: wo multitenancy apply")
+        Log.info(self, json.dumps(baseline, indent=2))
 
     @expose(help="Validate baseline configuration and site status")
     def validate(self):
@@ -1615,9 +1363,12 @@ class WOMultitenancyController(CementBaseController):
             Log.error(self, f"❌ Baseline JSON invalid: {e}")
             return
         
-        baseline_version = baseline.get('version', 0)
-        Log.info(self, f"   Current version: {baseline_version}")
-        Log.info(self, "")
+        content_release = current_content_release(shared_root)
+        deployed_commit = (
+            read_release_info(content_release).get('commit', 'unknown')
+            if content_release else 'old layout, not cut over'
+        )
+        Log.info(self, f"Deployed commit: {deployed_commit}")
         
         # 2. Check plugins exist on disk
         plugins = baseline.get('plugins', [])
@@ -1640,6 +1391,7 @@ class WOMultitenancyController(CementBaseController):
         
         # 3. Check theme exists
         theme_slug = baseline.get('theme')
+        missing_theme = False
         if theme_slug:
             Log.info(self, "Theme Validation:")
             theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
@@ -1648,46 +1400,16 @@ class WOMultitenancyController(CementBaseController):
                 Log.info(self, f"   ✅ {theme_slug}")
             else:
                 Log.warn(self, f"   ❌ {theme_slug} - NOT FOUND ON DISK")
+                missing_theme = True
             
-            Log.info(self, "")
-        
-        # 4. Check site baseline versions
-        from wo.core.database import db_session
-        from wo.cli.plugins.multitenancy_db import MultitenancySite
-        
-        session = db_session
-        sites = session.query(MultitenancySite).filter_by(is_enabled=True).all()
-        production_sites = sites
-        
-        outdated_sites = []
-        for site in production_sites:
-            site_version = getattr(site, 'baseline_version', 0)
-            if site_version < baseline_version:
-                outdated_sites.append((site.domain, site_version))
-        
-        if outdated_sites:
-            Log.warn(self, f"⚠️  {len(outdated_sites)} site(s) behind baseline:")
-            for domain, version in outdated_sites[:10]:  # Show first 10
-                Log.warn(self, f"   - {domain} (version {version}, should be {baseline_version})")
-            
-            if len(outdated_sites) > 10:
-                Log.warn(self, f"   ... and {len(outdated_sites) - 10} more")
-            
-            Log.info(self, "")
-            Log.info(self, "   Run: wo multitenancy apply")
-        else:
-            Log.info(self, f"✅ All {len(production_sites)} production sites up to date")
             Log.info(self, "")
         
         # 6. Summary
         Log.info(self, "=" * 60)
         
-        if missing_plugins:
-            Log.error(self, f"❌ VALIDATION FAILED: {len(missing_plugins)} plugin(s) missing from disk")
-            Log.error(self, "   This will cause activation failures!")
-            Log.error(self, "   Fix: Install missing plugins or remove from baseline")
-        elif outdated_sites:
-            Log.warn(self, "⚠️  ATTENTION NEEDED: Some sites require updates")
+        if missing_plugins or missing_theme:
+            Log.error(self, "VALIDATION FAILED: baseline plugins or theme "
+                            "are missing from disk. Deploy the site repo.")
         else:
             Log.info(self, "✅ VALIDATION PASSED: Baseline is healthy")
         
@@ -1761,7 +1483,6 @@ class WOMultitenancyController(CementBaseController):
 
         # Delete the site using regular WO command
         try:
-            import subprocess
             result = subprocess.run(
                 ['wo', 'site', 'delete', domain, '--no-prompt'],
                 capture_output=True,
@@ -2160,501 +1881,6 @@ class WOMultitenancyController(CementBaseController):
 
             return False
 
-    @expose(help="Add plugin to baseline")
-    @fleet_operation('add_plugin')
-    def add_plugin(self):
-        """
-        Add a plugin to the baseline configuration
-        
-        This command downloads a plugin from WordPress.org, GitHub, or a direct URL,
-        adds it to the baseline configuration, and optionally applies it to all sites.
-        
-        Usage:
-            wo multitenancy add-plugin <slug>                    # From WordPress.org
-            wo multitenancy add-plugin <slug> --github=user/repo # From GitHub
-            wo multitenancy add-plugin <slug> --url=https://...  # From direct URL
-            wo multitenancy add-plugin <slug> --apply-now        # Apply immediately
-        """
-        pargs = self.app.pargs
-        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
-        apply_now = pargs.apply_now
-        
-        # Phase 3: Get source-specific arguments
-        github_repo = pargs.github
-        branch = pargs.branch
-        tag = pargs.tag
-        url = pargs.url
-        
-        # Validate arguments
-        if not plugin_slug:
-            Log.error(self, "Plugin slug is required")
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
-        
-        # Validate: only one source method allowed
-        source_count = sum([bool(github_repo), bool(url)])
-        if source_count > 1:
-            Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
-        
-        if branch and tag:
-            Log.error(self, "Specify only one GitHub ref: --branch OR --tag")
-        
-        # Validate: branch/tag only valid with GitHub
-        if (branch or tag) and not github_repo:
-            Log.error(self, "--branch and --tag can only be used with --github")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        # Determine and display source
-        if github_repo:
-            source_info = f"from GitHub: {github_repo}"
-            if tag:
-                source_info += f" (tag: {tag})"
-            elif branch:
-                source_info += f" (branch: {branch})"
-        elif url:
-            source_info = f"from URL: {url}"
-        else:
-            source_info = "from WordPress.org"
-        
-        Log.info(self, f"Adding plugin: {plugin_slug} {source_info}")
-        
-        # Download plugin using appropriate method
-        infra = SharedInfrastructure(self, shared_root)
-        
-        if github_repo:
-            # Download from GitHub
-            success = infra.download_plugin_from_github(
-                github_repo, 
-                plugin_slug, 
-                branch=branch, 
-                tag=tag
-            )
-        elif url:
-            # Download from direct URL
-            success = infra.download_plugin_from_url(url, plugin_slug)
-        else:
-            # Download from WordPress.org (default)
-            infra.download_plugin(plugin_slug)
-            success = True  # download_plugin doesn't return bool, check directory instead
-        
-        # Verify plugin was downloaded
-        plugin_dir = f"{shared_root}/wp-content/plugins/{plugin_slug}"
-        if not os.path.exists(plugin_dir):
-            Log.error(self, f"Failed to download plugin: {plugin_slug}")
-            Log.error(self, "")
-            Log.error(self, "Possible causes:")
-            Log.error(self, "  - Plugin doesn't exist at the source")
-            Log.error(self, "  - Network connectivity issue")
-            Log.error(self, "  - Invalid GitHub repo or URL")
-            Log.error(self, "  - Disk space full")
-            return
-        
-        Log.info(self, f"✅ Downloaded {plugin_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if already in baseline
-        if plugin_slug in baseline.get('plugins', []):
-            Log.error(self, f"Plugin {plugin_slug} already in baseline")
-        
-        # Increment version and add plugin
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        baseline['plugins'].append(plugin_slug)
-        
-        plugin_sources = baseline.setdefault('sources', {}).setdefault('plugins', {})
-        if github_repo:
-            if branch:
-                plugin_sources[plugin_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'branch',
-                    'ref': branch,
-                }
-            elif tag:
-                plugin_sources[plugin_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'tag',
-                    'ref': tag,
-                }
-            else:
-                plugin_sources[plugin_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'default',
-                    'ref': None,
-                }
-        elif url:
-            plugin_sources[plugin_slug] = {
-                'type': 'url',
-                'url': url,
-            }
-        else:
-            plugin_sources[plugin_slug] = {
-                'type': 'wordpress',
-                'version': 'latest',
-            }
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        commit_msg = f"Baseline v{new_version}: Added plugin {plugin_slug}"
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-            self._persist_baseline_version(new_version)
-        else:
-            Log.error(self, "Baseline git commit failed; baseline.json is "
-                            "written but NOT committed. Fix git state in "
-                            f"{shared_root} and re-run.")
-        
-        # Apply to sites if requested
-        if apply_now:
-            Log.info(self, "")
-            Log.info(self, "Applying to all sites...")
-            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
-        else:
-            Log.info(self, "")
-            Log.info(self, "Plugin added to baseline.")
-            Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
-
-
-    @expose(help="Add theme to baseline")
-    @fleet_operation('add_theme')
-    def add_theme(self):
-        """
-        Add a theme to the baseline configuration
-        
-        This command downloads a theme from WordPress.org, GitHub, or a direct URL,
-        adds it to the baseline configuration, and optionally sets it as the default theme.
-        
-        Usage:
-            wo multitenancy add-theme <slug>                    # From WordPress.org
-            wo multitenancy add-theme <slug> --github=user/repo # From GitHub
-            wo multitenancy add-theme <slug> --url=https://...  # From direct URL
-            wo multitenancy add-theme <slug> --set-default      # Set as default
-            wo multitenancy add-theme <slug> --apply-now        # Apply immediately
-        """
-        pargs = self.app.pargs
-        theme_slug = pargs.theme_slug or pargs.site_name  # Use site_name as positional arg
-        set_default = pargs.set_default
-        apply_now = pargs.apply_now
-        
-        # Phase 3: Get source-specific arguments
-        github_repo = pargs.github
-        branch = pargs.branch
-        tag = pargs.tag
-        url = pargs.url
-        
-        # Validate arguments
-        if not theme_slug:
-            Log.error(self, "Theme slug is required")
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        # Validate: only one source method allowed
-        source_count = sum([bool(github_repo), bool(url)])
-        if source_count > 1:
-            Log.error(self, "Specify only one source: --github OR --url (default is WordPress.org)")
-        
-        if branch and tag:
-            Log.error(self, "Specify only one GitHub ref: --branch OR --tag")
-        
-        # Validate: branch/tag only valid with GitHub
-        if (branch or tag) and not github_repo:
-            Log.error(self, "--branch and --tag can only be used with --github")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        # Determine and display source
-        if github_repo:
-            source_info = f"from GitHub: {github_repo}"
-            if tag:
-                source_info += f" (tag: {tag})"
-            elif branch:
-                source_info += f" (branch: {branch})"
-        elif url:
-            source_info = f"from URL: {url}"
-        else:
-            source_info = "from WordPress.org"
-        
-        Log.info(self, f"Adding theme: {theme_slug} {source_info}")
-        
-        # Download theme using appropriate method
-        infra = SharedInfrastructure(self, shared_root)
-        
-        if github_repo:
-            # Download from GitHub
-            success = infra.download_theme_from_github(
-                github_repo, 
-                theme_slug, 
-                branch=branch, 
-                tag=tag
-            )
-        elif url:
-            # Download from direct URL
-            success = infra.download_theme_from_url(url, theme_slug)
-        else:
-            # Download from WordPress.org (default)
-            infra.download_theme(theme_slug)
-            success = True  # download_theme doesn't return bool, check directory instead
-        
-        # Verify theme was downloaded
-        theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
-        if not os.path.exists(theme_dir):
-            Log.error(self, f"Failed to download theme: {theme_slug}")
-            Log.error(self, "")
-            Log.error(self, "Possible causes:")
-            Log.error(self, "  - Theme doesn't exist at the source")
-            Log.error(self, "  - Network connectivity issue")
-            Log.error(self, "  - Invalid GitHub repo or URL")
-            Log.error(self, "  - Disk space full")
-            return
-        
-        Log.info(self, f"✅ Downloaded {theme_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        
-        theme_sources = baseline.setdefault('sources', {}).setdefault('themes', {})
-        if github_repo:
-            if branch:
-                theme_sources[theme_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'branch',
-                    'ref': branch,
-                }
-            elif tag:
-                theme_sources[theme_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'tag',
-                    'ref': tag,
-                }
-            else:
-                theme_sources[theme_slug] = {
-                    'type': 'github',
-                    'repo': github_repo,
-                    'ref_type': 'default',
-                    'ref': None,
-                }
-        elif url:
-            theme_sources[theme_slug] = {
-                'type': 'url',
-                'url': url,
-            }
-        else:
-            theme_sources[theme_slug] = {
-                'type': 'wordpress',
-                'version': 'latest',
-            }
-        
-        if set_default:
-            old_theme = baseline.get('theme', 'none')
-            baseline['theme'] = theme_slug
-            Log.info(self, f"✅ Set as default theme (was: {old_theme})")
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        if set_default:
-            commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
-        else:
-            commit_msg = f"Baseline v{new_version}: Added theme {theme_slug}"
-        
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-            self._persist_baseline_version(new_version)
-        else:
-            Log.error(self, "Baseline git commit failed; baseline.json is "
-                            "written but NOT committed. Fix git state in "
-                            f"{shared_root} and re-run.")
-        
-        # Apply to sites if requested
-        if apply_now and set_default:
-            Log.info(self, "")
-            Log.info(self, "Applying to all sites...")
-            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
-        else:
-            Log.info(self, "")
-            Log.info(self, "Theme added to baseline.")
-            if set_default:
-                Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
-
-
-    @expose(help="Remove plugin from baseline")
-    @fleet_operation('remove_plugin')
-    def remove_plugin(self):
-        """Remove a plugin from the baseline"""
-        pargs = self.app.pargs
-        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
-        apply_now = pargs.apply_now
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        Log.info(self, f"Removing plugin: {plugin_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        # Check if plugin is in baseline
-        if plugin_slug not in baseline.get('plugins', []):
-            Log.error(self, f"Plugin {plugin_slug} not in baseline")
-        
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        baseline['version'] = new_version
-        baseline['generated'] = datetime.now().isoformat()
-        baseline['plugins'].remove(plugin_slug)
-        plugin_sources = (baseline.get('sources') or {}).get('plugins') or {}
-        plugin_sources.pop(plugin_slug, None)
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        
-        # Git commit
-        infra = SharedInfrastructure(self, shared_root)
-        commit_msg = f"Baseline v{new_version}: Removed plugin {plugin_slug}"
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-            self._persist_baseline_version(new_version)
-        else:
-            Log.error(self, "Baseline git commit failed; baseline.json is "
-                            "written but NOT committed. Fix git state in "
-                            f"{shared_root} and re-run.")
-        
-        Log.info(self, "")
-        Log.info(self, f"Plugin {plugin_slug} removed from baseline.")
-        Log.info(self, "Note: Plugin files kept for potential rollback.")
-        
-        if apply_now:
-            Log.warn(self, "remove-plugin edits the baseline only; it does not deactivate the plugin on live sites.")
-            Log.info(self, "Deactivate it per site with wp-cli if needed.")
-
-    @expose(help="Update plugin from its original source")
-    @fleet_operation('update_plugin')
-    def update_plugin(self):
-        """
-        Update a plugin from its original source (WordPress.org, GitHub, or URL)
-        
-        This command re-downloads a plugin from baseline ``sources`` metadata first,
-        then from /etc/wo/plugins.d/multitenancy.conf fallback.
-        
-        Usage:
-            wo multitenancy update-plugin <slug>
-        """
-        pargs = self.app.pargs
-        plugin_slug = pargs.plugin_slug or pargs.site_name  # Use site_name as positional arg
-        
-        if not plugin_slug:
-            Log.error(self, "Plugin slug is required")
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        Log.info(self, f"Updating plugin: {plugin_slug}")
-        
-        # Update plugin using SharedInfrastructure method
-        infra = SharedInfrastructure(self, shared_root)
-        success = infra.update_plugin(plugin_slug, config=config)
-        
-        if success:
-            Log.info(self, "")
-            Log.info(self, f"✅ Plugin {plugin_slug} updated successfully")
-            Log.info(self, "")
-            Log.info(self, "Shared plugin files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
-            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
-        else:
-            Log.error(self, f"Failed to update plugin {plugin_slug}")
-            Log.error(self, "Check the error messages above for details")
-
-    @expose(help="Update theme from its original source")
-    @fleet_operation('update_theme')
-    def update_theme(self):
-        """
-        Update the theme from its original source (WordPress.org, GitHub, or URL)
-        
-        This command re-downloads the theme from baseline ``sources`` metadata first, then from /etc/wo/plugins.d/multitenancy.conf fallback.
-        
-        Usage:
-            wo multitenancy update-theme
-        """
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized. Run: wo multitenancy init")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        # Get theme name from baseline
-        baseline_file = f"{shared_root}/config/baseline.json"
-        try:
-            with open(baseline_file, 'r') as f:
-                baseline = json.load(f)
-            theme_name = baseline.get('theme')
-            if not theme_name:
-                Log.error(self, "No theme configured in baseline")
-        except FileNotFoundError:
-            Log.error(self, "Baseline configuration not found")
-        except json.JSONDecodeError:
-            Log.error(self, "Failed to parse baseline.json")
-        
-        Log.info(self, f"Updating theme: {theme_name}")
-        
-        # Update theme using SharedInfrastructure method
-        infra = SharedInfrastructure(self, shared_root)
-        success = infra.update_theme(theme_name, config=config)
-        
-        if success:
-            Log.info(self, "")
-            Log.info(self, f"✅ Theme {theme_name} updated successfully")
-            Log.info(self, "")
-            Log.info(self, "Shared theme files are live for all sites immediately; run 'wo multitenancy apply' only if baseline activation changed.")
-            infra.prune_asset_backups(int(config.get('keep_asset_backups', 3)))
-        else:
-            Log.error(self, f"Failed to update theme {theme_name}")
-            Log.error(self, "Check the error messages above for details")
-
     @expose(help="Apply current baseline to all sites")
     @fleet_operation('apply')
     def apply(self):
@@ -2670,18 +1896,12 @@ class WOMultitenancyController(CementBaseController):
         shared_root = config.get('shared_root', '/var/www/shared')
         if not MTFunctions.preflight_shared_config(self, shared_root):
             Log.error(self, "Aborted: wp-config-shared.php failed preflight")
-        baseline_file = f"{shared_root}/config/baseline.json"
-
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-
-        baseline_version = baseline.get('version', 1)
 
         dry_run = bool(getattr(pargs, 'dry_run', False))
         verbose = bool(getattr(pargs, 'verbose', False))
         prune = bool(getattr(pargs, 'prune', False))
 
-        header = f"Applying baseline v{baseline_version} to all sites"
+        header = "Applying baseline to all sites"
         if dry_run:
             header += ' [DRY RUN]'
         Log.info(self, header + '...')
@@ -2707,12 +1927,11 @@ class WOMultitenancyController(CementBaseController):
                 Log.info(self, f"Assigned Redis database {site_redis_db} to {site_domain}")
 
         result = BaselineApplicator.apply_baseline_to_sites(
-            self, config, baseline_version,
+            self, config,
             dry_run=dry_run, verbose=verbose, prune=prune,
         )
         cron_sync_ok = True
         if not dry_run:
-            MTFunctions.install_login_failure_logger(self, shared_root)
             cron_sync_ok = MTFunctions.sync_wp_cron_entries(self)
             try:
                 repair_backup_cron(self.app)
@@ -2720,7 +1939,6 @@ class WOMultitenancyController(CementBaseController):
                 Log.warn(self, f"Could not repair backup cron: {exc}")
 
         summary = result if isinstance(result, dict) else {}
-        summary.setdefault('baseline_version', baseline_version)
         summary.setdefault('dry_run', dry_run)
         summary_failed = summary.get('failed', 0)
         if not cron_sync_ok:
@@ -2780,312 +1998,6 @@ class WOMultitenancyController(CementBaseController):
             
         except Exception as e:
             Log.error(self, f"Removal failed: {str(e)}")
-
-
-    # ==========================================
-    # PHASE 3: Additional Baseline Commands
-    # ==========================================
-    
-    @expose(help="Set default theme for all sites")
-    @fleet_operation('set_theme')
-    def set_theme(self):
-        """
-        Set the default theme in baseline configuration
-        
-        This standalone command sets a theme as the default for all sites.
-        The theme must already exist in the shared themes directory.
-        
-        Usage:
-            wo multitenancy set-theme <slug>
-            wo multitenancy set-theme <slug> --apply-now
-        """
-        pargs = self.app.pargs
-        theme_slug = pargs.theme_slug or pargs.site_name
-        apply_now = pargs.apply_now
-        
-        if not theme_slug:
-            Log.error(self, "Theme slug is required")
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        # Validate theme exists on disk
-        theme_dir = f"{shared_root}/wp-content/themes/{theme_slug}"
-        if not os.path.exists(theme_dir):
-            Log.error(self, f"Theme not found: {theme_slug}")
-            Log.error(self, f"Add it first with: wo multitenancy add-theme {theme_slug}")
-        
-        Log.info(self, f"Setting default theme: {theme_slug}")
-        
-        # Update baseline.json
-        baseline_file = f"{shared_root}/config/baseline.json"
-        with open(baseline_file, 'r') as f:
-            baseline = json.load(f)
-        
-        old_theme = baseline.get('theme', 'none')
-        old_version = baseline.get('version', 1)
-        new_version = old_version + 1
-        
-        # Update baseline with new theme
-        baseline['version'] = new_version
-        baseline['theme'] = theme_slug
-        baseline['generated'] = datetime.now().isoformat()
-        infra = SharedInfrastructure(self, shared_root)
-        theme_sources = baseline.setdefault('sources', {}).setdefault('themes', {})
-        if theme_slug not in theme_sources:
-            source = infra._resolve_source('theme', theme_slug, config=config, baseline=baseline)
-            if source:
-                theme_sources[theme_slug] = source.copy()
-            else:
-                Log.warn(self, f"No download source configured for theme {theme_slug}; future update-theme will fail until a source is added")
-        
-        # Write updated baseline
-        with open(baseline_file, 'w') as f:
-            json.dump(baseline, f, indent=2)
-        
-        Log.info(self, f"✅ Updated baseline.json (v{old_version} → v{new_version})")
-        Log.info(self, f"   Theme: {old_theme} → {theme_slug}")
-        
-        # Git commit
-        commit_msg = f"Baseline v{new_version}: Set default theme to {theme_slug}"
-        if infra.git_commit_baseline(commit_msg):
-            Log.info(self, f"✅ Git: {commit_msg}")
-            self._persist_baseline_version(new_version)
-        else:
-            Log.error(self, "Baseline git commit failed; baseline.json is "
-                            "written but NOT committed. Fix git state in "
-                            f"{shared_root} and re-run.")
-        
-        # Apply to sites if requested
-        if apply_now:
-            Log.info(self, "")
-            Log.info(self, "Applying to all sites...")
-            BaselineApplicator.apply_baseline_to_sites(self, config, new_version)
-        else:
-            Log.info(self, "")
-            Log.info(self, "Theme set in baseline.")
-            Log.info(self, "Run to roll out to all sites: wo multitenancy apply")
-    
-    @expose(help="Show baseline change history")
-    def history(self):
-        """
-        Display git log of baseline configuration changes
-        
-        This command shows the version history of baseline.json,
-        including what was changed and when.
-        
-        Usage:
-            wo multitenancy history
-        """
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        
-        git_dir = f"{shared_root}/.git"
-        if not os.path.exists(git_dir):
-            Log.error(self, "Git tracking not initialized")
-            Log.error(self, "History is only available for systems initialized with git support")
-        
-        Log.info(self, "Baseline Change History:")
-        Log.info(self, "=" * 60)
-        
-        try:
-            # Get git log for baseline.json (last 20 commits)
-            result = subprocess.run(
-                ['git', 'log', '--oneline', '--decorate', '-20', 
-                 'config/baseline.json'],
-                cwd=shared_root,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            if result.stdout:
-                # Display the git log output
-                Log.info(self, result.stdout.strip())
-            else:
-                Log.info(self, "No history yet")
-            
-            Log.info(self, "=" * 60)
-            Log.info(self, "")
-            Log.info(self, "View full history: cd /var/www/shared && git log config/baseline.json")
-            Log.info(self, "View specific commit: git show <commit-hash>")
-            Log.info(self, "Compare versions: git diff <commit1> <commit2> config/baseline.json")
-            
-        except subprocess.CalledProcessError as e:
-            Log.error(self, f"Failed to get history: {e}")
-        except Exception as e:
-            Log.error(self, f"Error accessing git history: {e}")
-    
-    @expose(help="Rollback baseline to previous version")
-    @fleet_operation('baseline_rollback')
-    def baseline_rollback(self):
-        """
-        Rollback baseline configuration to a previous version
-        
-        This command reverts baseline.json to a previous version using git.
-        You can rollback by version number.
-        
-        IMPORTANT: This is different from 'wo multitenancy rollback' which 
-        rolls back WordPress core files.
-        
-        Usage:
-            wo multitenancy baseline-rollback --to-version=5
-            wo multitenancy baseline-rollback --to-version=5 --apply-now
-        """
-        pargs = self.app.pargs
-        to_version = pargs.to_version
-        apply_now = pargs.apply_now
-        
-        # Validate arguments
-        if not to_version:
-            Log.error(self, "Specify --to-version=N")
-            Log.error(self, "")
-            Log.error(self, "Example:")
-            Log.error(self, "  wo multitenancy baseline-rollback --to-version=5")
-        
-        if not MTDatabase.is_initialized(self):
-            Log.error(self, "Multi-tenancy not initialized")
-        
-        config = MTFunctions.load_config(self)
-        shared_root = config.get('shared_root', '/var/www/shared')
-        baseline_file = f"{shared_root}/config/baseline.json"
-        
-        # Check git exists
-        git_dir = f"{shared_root}/.git"
-        if not os.path.exists(git_dir):
-            Log.error(self, "Git tracking not initialized")
-            Log.error(self, "Cannot rollback without git history")
-        
-        # Read current baseline
-        with open(baseline_file, 'r') as f:
-            current = json.load(f)
-        
-        current_version = current.get('version', 0)
-        
-        Log.warn(self, "Baseline Rollback")
-        Log.warn(self, f"Current version: {current_version}")
-        Log.warn(self, "")
-        
-        try:
-            # If version specified, find the corresponding commit
-            if to_version:
-                # Search git log for the version
-                result = subprocess.run(
-                    ['git', 'log', '--all', '--grep', f'Baseline v{to_version}:', 
-                     '--format=%H', '-1', 'config/baseline.json'],
-                    cwd=shared_root,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                
-                to_commit = result.stdout.strip()
-                
-                if not to_commit:
-                    Log.error(self, f"Version {to_version} not found in git history")
-                    Log.error(self, "")
-                    Log.error(self, "View available versions:")
-                    Log.error(self, "  wo multitenancy history")
-            
-            # Show what we're rolling back to
-            result = subprocess.run(
-                ['git', 'show', '--stat', '--oneline', to_commit, '--', 'config/baseline.json'],
-                cwd=shared_root,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            Log.info(self, "Rolling back to:")
-            # Show first few lines of git show output
-            output_lines = result.stdout.split('\n')[:10]
-            for line in output_lines:
-                Log.info(self, f"  {line}")
-            
-            if len(result.stdout.split('\n')) > 10:
-                Log.info(self, "  ...")
-            
-            Log.info(self, "")
-            
-            # Confirm with user (unless forced)
-            if not pargs.force:
-                confirm = input("Proceed with rollback? [y/N]: ").strip().lower()
-                if confirm != 'y':
-                    Log.info(self, "Rollback cancelled")
-                    return
-            
-            # Perform rollback by checking out the specific file from that commit
-            subprocess.run(
-                ['git', 'checkout', to_commit, '--', 'config/baseline.json'],
-                cwd=shared_root,
-                capture_output=True,
-                check=True
-            )
-            
-            # Read the rolled-back baseline
-            with open(baseline_file, 'r') as f:
-                rolled_back = json.load(f)
-
-            # Mint a NEW version for the rolled-back content: versions only
-            # move forward, so `validate` flags every site as outdated and
-            # `apply` re-converges the fleet.
-            new_version = current_version + 1
-            rolled_back['version'] = new_version
-            rolled_back['generated'] = datetime.now().isoformat()
-            with open(baseline_file, 'w') as f:
-                json.dump(rolled_back, f, indent=2)
-
-            # Commit documenting the rollback. The `Baseline v{N}:` prefix is
-            # load-bearing: the rollback finder above greps for it.
-            commit_msg = (
-                f"Baseline v{new_version}: Rollback to v{to_version} content"
-            )
-            add = subprocess.run(
-                ['git', 'add', 'config/baseline.json'],
-                cwd=shared_root,
-                capture_output=True,
-                text=True,
-            )
-            if add.returncode != 0:
-                Log.error(self, f"git add failed: {add.stderr}")
-            commit = subprocess.run(
-                ['git', 'commit', '-m', commit_msg],
-                cwd=shared_root,
-                capture_output=True,
-                text=True,
-            )
-            if commit.returncode != 0:
-                Log.error(self, "git commit failed: "
-                                f"{commit.stdout}\n{commit.stderr}")
-            self._persist_baseline_version(new_version)
-
-            Log.info(self, f"✅ Baseline v{new_version} created with "
-                           f"v{to_version} content")
-
-            # Apply if requested
-            if apply_now:
-                Log.info(self, "")
-                Log.info(self, "Applying rollback to all sites...")
-                BaselineApplicator.apply_baseline_to_sites(
-                    self, config, new_version)
-            else:
-                Log.info(self, "")
-                Log.info(self, "Baseline rolled back in configuration.")
-                Log.info(self, f"Sites are still on v{current_version}.")
-                Log.info(self, "Run: wo multitenancy apply")
-            
-        except subprocess.CalledProcessError as e:
-            Log.error(self, f"Rollback failed: {e}")
-            Log.error(self, "The baseline.json may be in an inconsistent state")
-            Log.error(self, "You can restore it with: cd /var/www/shared && git checkout HEAD config/baseline.json")
-        except Exception as e:
-            Log.error(self, f"Error during rollback: {e}")
-    
 
     @expose(help="Manage shared WordPress configuration")
     @fleet_operation('shared_config')
