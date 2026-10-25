@@ -189,6 +189,10 @@ The nginx reload starts fresh workers while old workers finish existing requests
 It uses the existing configuration-checked reload path and fails the operation if reload fails, rather than waiting out the failure timeout or accepting a cached home page.
 The safe path still drains before switching, and its maintenance gates stay closed until the normal checked resume.
 Code-only rollback retains all seven public page checks and the failed deployment history result; switching the link back alone is not a successful health check.
+Rollback keeps its log marker **before** the switch and service reloads, so restored-release startup failures remain visible.
+Only recovery checks exclude a late fatal whose PHP header gives a source file inside the exact release being switched away from.
+Message mentions and stack frames do not establish the origin; unattributed, core, restored-release, and `content/current` failures still fail recovery.
+Normal deployment checks exclude nothing. Recovery still checks all seven pages, WooCommerce database versions, and fleet health.
 
 ### Switch content back
 

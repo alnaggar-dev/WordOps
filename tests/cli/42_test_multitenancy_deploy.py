@@ -187,14 +187,23 @@ class ContentDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, 'new release unhealthy'):
             self.operation.deploy(self.new, code_only=True)
         self.assert_live(self.old)
-        self.assertEqual(checked, [(self.new, {'loopback': False}), (self.old, {})])
+        self.assertEqual(checked, [
+            (self.new, {'loopback': False}),
+            (self.old, {'rejected_release': os.path.join(self.root, 'content', self.new)}),
+        ])
         self.assertEqual(self.operation._reset_caches.call_count, 2)
         self.operation._maintenance.assert_not_called()
         self.operation._unlock.assert_called_once_with()
         self.assertEqual(self.records()[-1]['result'], 'fail')
 
     def test_code_only_rollback_refreshes_nginx_before_all_seven_checks(self):
-        self.layout()
+        _, new = self.layout()
+        log = os.path.join(self.root, 'php-fpm.log')
+        with open(log, 'w') as handle:
+            handle.write('')
+        self.patch(self.operation, '_log_paths', return_value=[log])
+        self.operation._log_mark.side_effect = (
+            lambda: deploy.ContentDeployment._log_mark(self.operation))
         self.patch(deploy.MTFunctions, 'clear_all_caches', return_value=True)
         self.patch(deploy.MTFunctions, 'reset_opcache', return_value=True)
         failed_peer = False
@@ -203,6 +212,13 @@ class ContentDeploymentTests(unittest.TestCase):
 
         def reload_fpm(controller, service):
             reloads.append((os.readlink(deploy.current_link(self.root)), service))
+            if os.readlink(deploy.current_link(self.root)) == self.old:
+                # A rejected request finishes during rollback's graceful
+                # reload, after the pre-switch log marker was captured.
+                with open(log, 'a') as handle:
+                    handle.write('WARNING: child 10 said into stderr: "PHP Fatal error: '
+                                 'Uncaught RuntimeException: rejected code in '
+                                 + new + '/wp-content/plugins/sample.php:20"\n')
             return True  # FPM cannot clear nginx's failed-peer state.
 
         def reload_nginx(controller, domain):
@@ -221,7 +237,8 @@ class ContentDeploymentTests(unittest.TestCase):
             'post list': '1', 'post url': 'http://example.test/product/sample/',
             'option get': '10.0',
         }[' '.join(args[:2])])
-        fatal_errors = self.patch(self.operation, '_fatal_errors')
+        fatal_errors = self.patch(self.operation, '_fatal_errors',
+                                  wraps=self.operation._fatal_errors)
         health = self.patch(deploy, 'HealthChecker')
         health.return_value.register_defaults.return_value.run_all.return_value = {'status': 'healthy'}
 
@@ -252,11 +269,144 @@ class ContentDeploymentTests(unittest.TestCase):
             for path in ('/', '/product/sample/', '/cart/', '/checkout/',
                          '/my-account/', '/wp-login.php', '/wp-json/')
         ])
-        fatal_errors.assert_called_once_with()
+        fatal_errors.assert_called_once_with(rejected_release=new)
         health.return_value.register_defaults.return_value.run_all.assert_called_once_with()
         for method in ('_maintenance', '_drain', '_bypass', '_release_maintenance'):
             getattr(self.operation, method).assert_not_called()
         self.assertEqual(self.records()[-1]['result'], 'fail')
+
+    def test_recovery_fatal_attribution_is_exact_and_fail_closed(self):
+        old, new = self.layout()
+        log = os.path.join(self.root, 'php-fpm.log')
+        with open(log, 'w') as handle:
+            handle.write('')
+        self.patch(self.operation, '_log_paths', return_value=[log])
+        deploy.ContentDeployment._log_mark(self.operation)
+        check_site = self.patch(self.operation, '_check_site')
+        health = self.patch(deploy, 'HealthChecker')
+        health.return_value.register_defaults.return_value.run_all.return_value = {'status': 'healthy'}
+        rejected_file = new + '/wp-content/plugins/sample.php'
+        restored_file = old + '/wp-content/plugins/sample.php'
+        symlink = new + '/wp-content/plugins/restored.php'
+        os.symlink(restored_file, symlink)
+        cases = [
+            ('fpm', 'WARNING: child 10 said into stderr: "PHP Fatal error: '
+             'Uncaught Error: failure in ' + rejected_file + ':20"\n', True),
+            ('nginx', 'FastCGI sent in stderr: "PHP message: PHP Fatal error: '
+             'Uncaught Error: failure in ' + rejected_file + ':20\nStack trace:\n', True),
+            ('plain', 'PHP Fatal error: failure in ' + rejected_file + ' on line 20\n', True),
+            ('restored', 'PHP Fatal error: failure in ' + restored_file + ':20\n', False),
+            ('core', 'PHP Fatal error: failure in ' + self.root +
+             '/releases/wp/wp-includes/load.php on line 20\n', False),
+            ('unattributed', 'PHP Fatal error: failure\n', False),
+            ('message_only', 'PHP Fatal error: cannot read ' + rejected_file + '\n', False),
+            ('stack_only', 'PHP Fatal error: failure\nStack trace:\n#0 ' +
+             rejected_file + '(20): run()\n', False),
+            ('message_and_restored_origin', 'PHP Fatal error: failure in ' +
+             rejected_file + ':20 reported in ' + restored_file + ':30\n', False),
+            ('sibling_prefix', 'PHP Fatal error: failure in ' +
+             new + '-other/sample.php:20\n', False),
+            ('parent_traversal', 'PHP Fatal error: failure in ' +
+             new + '/../' + self.old + '/sample.php:20\n', False),
+            ('current_alias', 'PHP Fatal error: failure in ' +
+             deploy.current_link(self.root) + '/sample.php:20\n', False),
+            ('symlink_to_restored', 'PHP Fatal error: failure in ' + symlink + ':20\n', False),
+            ('two_headers', 'PHP Fatal error: unattributed; PHP Fatal error: failure in ' +
+             rejected_file + ':20\n', False),
+            ('mixed_records', 'PHP Fatal error: failure in ' + rejected_file +
+             ':20\nPHP Fatal error: failure in ' + restored_file + ':20\n', False),
+        ]
+        for label, text, accepted in cases:
+            with self.subTest(label=label):
+                with open(log, 'w') as handle:
+                    handle.write(text)
+                health.reset_mock()
+                check_site.reset_mock()
+                if accepted:
+                    deploy.ContentDeployment._checks(self.operation, rejected_release=new)
+                    health.return_value.register_defaults.return_value.run_all.assert_called_once_with()
+                else:
+                    with self.assertRaisesRegex(deploy.DeployError, 'New PHP Fatal error'):
+                        deploy.ContentDeployment._checks(self.operation, rejected_release=new)
+                    health.assert_not_called()
+                check_site.assert_called_once_with(self.operation.sites[0], False, '10.0')
+
+    def test_normal_checks_and_live_release_never_exclude_fatals(self):
+        old, new = self.layout()
+        log = os.path.join(self.root, 'php-fpm.log')
+        self.patch(self.operation, '_log_paths', return_value=[log])
+        self.patch(self.operation, '_check_site')
+        health = self.patch(deploy, 'HealthChecker')
+        for source, rejected in ((new, None), (old, old)):
+            with self.subTest(source=source, rejected=rejected):
+                with open(log, 'w') as handle:
+                    handle.write('PHP Fatal error: failure in ' + source + '/sample.php:20\n')
+                with self.assertRaisesRegex(deploy.DeployError, 'New PHP Fatal error'):
+                    deploy.ContentDeployment._checks(self.operation, rejected_release=rejected)
+        health.assert_not_called()
+
+    def test_rollback_checks_reject_restored_startup_fatal_before_reload_finishes(self):
+        old, _ = self.layout()
+        log = os.path.join(self.root, 'php-fpm.log')
+        with open(log, 'w') as handle:
+            handle.write('')
+        self.patch(self.operation, '_log_paths', return_value=[log])
+        self.operation._log_mark.side_effect = (
+            lambda: deploy.ContentDeployment._log_mark(self.operation))
+        self.patch(self.operation, '_check_site')
+        health = self.patch(deploy, 'HealthChecker')
+
+        def reset_caches():
+            if os.readlink(deploy.current_link(self.root)) == self.new:
+                raise deploy.DeployError('Rejected release startup failed')
+            with open(log, 'a') as handle:
+                handle.write('PHP Fatal error: restored startup failed in ' +
+                             old + '/wp-content/plugins/sample.php:20\n')
+
+        self.operation._reset_caches.side_effect = reset_caches
+        self.operation._checks.side_effect = (
+            lambda **kwargs: deploy.ContentDeployment._checks(self.operation, **kwargs))
+        with self.assertRaisesRegex(deploy.DeployError, 'New PHP Fatal error'):
+            self.operation.deploy(self.new, code_only=True)
+        self.assert_live(self.old)
+        self.assertEqual(self.operation._log_mark.call_count, 2)
+        health.assert_not_called()
+        self.assertEqual(self.records()[-1]['result'], 'fail')
+
+    def test_explicit_back_attributes_late_departed_release_fatal(self):
+        _, new = self.layout()
+        log = os.path.join(self.root, 'php-fpm.log')
+        with open(log, 'w') as handle:
+            handle.write('')
+        self.patch(self.operation, '_log_paths', return_value=[log])
+        self.operation._log_mark.side_effect = (
+            lambda: deploy.ContentDeployment._log_mark(self.operation))
+        check_site = self.patch(self.operation, '_check_site')
+        health = self.patch(deploy, 'HealthChecker')
+        health.return_value.register_defaults.return_value.run_all.return_value = {'status': 'healthy'}
+
+        def reset_caches():
+            self.assert_live(self.old)
+            with open(log, 'a') as handle:
+                handle.write('PHP Fatal error: departed request failed in ' +
+                             new + '/wp-content/plugins/sample.php:20\n')
+
+        self.operation._reset_caches.side_effect = reset_caches
+        self.operation._checks.side_effect = (
+            lambda **kwargs: deploy.ContentDeployment._checks(self.operation, **kwargs))
+        for safe in (False, True):
+            with self.subTest(safe=safe):
+                deploy.switch_current(self.root, self.new)
+                self.operation._history(self.new, self.old, 'safe' if safe else 'code-only', 'pass')
+                health.reset_mock()
+                check_site.reset_mock()
+                self.operation.back(force=safe)
+                self.assert_live(self.old)
+                check_site.assert_called_once_with(self.operation.sites[0], safe, '10.0')
+                health.return_value.register_defaults.return_value.run_all.assert_called_once_with()
+                self.assertEqual(self.records()[-1]['result'], 'pass')
+        self.assertEqual(self.operation._log_mark.call_count, 2)
+        self.operation._release_maintenance.assert_not_called()
 
     def test_home_200_cannot_hide_product_502_in_either_check_path(self):
         self.patch(self.operation, '_wp', side_effect=lambda site, args:
@@ -383,7 +533,8 @@ class ContentDeploymentTests(unittest.TestCase):
         self.assert_live(self.old)
         self.operation._maintenance.assert_called_once_with()
         self.operation._drain.assert_called_once_with()
-        self.operation._checks.assert_called_once_with(loopback=True)
+        self.operation._checks.assert_called_once_with(
+            loopback=True, rejected_release=os.path.join(self.root, 'content', self.new))
         self.assertEqual(self.operation._bypass.call_args_list,
                          [mock.call(True), mock.call(False)])
         self.operation._release_maintenance.assert_not_called()
@@ -397,7 +548,8 @@ class ContentDeploymentTests(unittest.TestCase):
         self.assert_live(self.old)
         self.operation._maintenance.assert_not_called()
         self.operation._drain.assert_not_called()
-        self.operation._checks.assert_called_once_with(loopback=False)
+        self.operation._checks.assert_called_once_with(
+            loopback=False, rejected_release=os.path.join(self.root, 'content', self.new))
 
     def test_failed_forced_safe_back_retains_maintenance(self):
         self.seed_back('safe')

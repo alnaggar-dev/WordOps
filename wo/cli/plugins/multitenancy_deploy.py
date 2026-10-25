@@ -292,14 +292,31 @@ class ContentDeployment:
             for path in self._log_paths()
         }
 
-    def _fatal_errors(self):
+    def _fatal_errors(self, rejected_release=None):
+        rejected = os.path.realpath(rejected_release) if rejected_release else None
+        if rejected and rejected == current_release(self.root):
+            rejected = None
+        rejected_prefix = rejected + os.sep if rejected else None
         for path in self._log_paths():
             inode, offset = self.log_offsets.get(path, (None, 0))
             stat = os.stat(path)
             with open(path, errors='replace') as handle:
                 handle.seek(offset if stat.st_ino == inode and stat.st_size >= offset else 0)
-                if 'PHP Fatal error' in handle.read():
-                    raise DeployError('New PHP Fatal error in ' + path)
+                for line in handle:
+                    for entry in line.split('PHP Fatal error')[1:]:
+                        # PHP appends the origin to the fatal header. Match
+                        # only that terminal location, not paths mentioned in
+                        # the message or a later stack frame. FPM may quote it.
+                        origin = re.fullmatch(
+                            r': .* in (/[^\s:"]+)(?::[1-9]\d*| on line [1-9]\d*)"?\s*',
+                            entry,
+                        ) if rejected_prefix else None
+                        if origin:
+                            source = origin.group(1)
+                            if (source.startswith(rejected_prefix) and
+                                    os.path.realpath(source).startswith(rejected_prefix)):
+                                continue
+                        raise DeployError('New PHP Fatal error in ' + path)
 
     def _page(self, site, url, loopback):
         domain = site['domain']
@@ -346,12 +363,12 @@ class ContentDeployment:
         if version and self._wp(site, ['option', 'get', 'woocommerce_db_version']) != version:
             raise DeployError('WooCommerce database version differs for ' + site['domain'])
 
-    def _checks(self, loopback=False):
+    def _checks(self, loopback=False, rejected_release=None):
         release = current_release(self.root)
         version = read_release_info(release).get('plugins', {}).get('woocommerce')
         for site in self.sites:
             self._check_site(site, loopback, version)
-        self._fatal_errors()
+        self._fatal_errors(rejected_release=rejected_release)
         result = HealthChecker(self.controller).register_defaults().run_all()
         if result.get('status') == 'unhealthy':
             raise DeployError('Fleet health is unhealthy.')
@@ -454,7 +471,7 @@ class ContentDeployment:
                         self._log_mark()
                         switch_current(self.root, old_name)
                         self._reset_caches()
-                        self._checks()
+                        self._checks(rejected_release=release)
                 else:
                     self._bypass(False)
                     self._recovery_message()
@@ -498,6 +515,7 @@ class ContentDeployment:
                     self._maintenance()
                     self._drain()
             with self.step('Switch back and caches'):
+                rejected_release = current_release(self.root)
                 self._log_mark()
                 switch_current(self.root, name)
                 switched = True
@@ -505,7 +523,7 @@ class ContentDeployment:
             with self.step('Checks'):
                 if safe:
                     self._bypass(True)
-                self._checks(loopback=safe)
+                self._checks(loopback=safe, rejected_release=rejected_release)
             if safe:
                 self._bypass(False)
                 Log.warn(self.controller, 'Files switched back. Maintenance remains on for database recovery.')
