@@ -100,10 +100,19 @@ It moves existing content and baseline into a `pre-cutover` release, writes `REL
 It resets caches, reloads PHP-FPM, removes maintenance, and checks the fleet. Failure attempts to restore the old layout.
 It refuses a fleet that already uses the fixed content link.
 
-A fresh init alone is not a complete content bootstrap.
-On the new layout, create requires live content. Deploy requires a previous live release and tracked sites.
-These server commands do not establish the first content release on an empty fleet.
-Provision initial live content before creating tenants.
+For a fresh server, use this order:
+
+1. Run `wo multitenancy init` on the server.
+2. On the Mac, run `DEPLOY_HOST=<host> tools/deploy` from the site repository.
+3. Run `wo multitenancy create <domain>` on the server with the required site options.
+
+The first deploy creates `content/current`. It does not require tracked sites or a previous release.
+The upload omits `--link-dest` because there is no live release to share files with.
+Dry-run reports the first release and shows that code-only deployment is not possible.
+With no tenants, deploy prepares the release and switches the link without maintenance, database work, or store checks.
+History records the first deploy as `safe`, with no previous release. Back is unavailable until a previous release exists.
+If tracked sites exist but live content is missing, deploy refuses. Restore `content/current` before another deploy.
+This refusal prevents an incomplete existing fleet from being treated as an empty server.
 Existing pre-cutover fleets can still create tenants from their real shared content folder.
 
 ## Content deploys

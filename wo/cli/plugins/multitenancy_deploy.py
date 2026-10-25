@@ -116,8 +116,6 @@ class ContentDeployment:
         self.config = MTFunctions.load_config(controller)
         self.root = self.config.get('shared_root', '/var/www/shared')
         self.sites = MTDatabase.get_shared_sites(controller)
-        if not self.sites:
-            raise DeployError('No shared sites found. Check fleet tracking before changing content.')
         self.gates = []
         self.preexisting_gates = set()
         self.cron_locks = {}
@@ -377,19 +375,38 @@ class ContentDeployment:
         old_name = os.path.basename(previous) if previous else None
         path = 'code-only' if code_only else 'safe'
         switched = False
+        maintenance_started = False
         result = 'aborted'
         try:
             if not is_cut_over(self.root):
                 raise DeployError('Run wo multitenancy cutover before deploying content.')
             release = validate_release(self.root, name)
-            if not previous or name == old_name:
-                raise DeployError('The release is already live or the current release is missing.')
+            if not previous:
+                if self.sites:
+                    raise DeployError('Tracked sites have no live content release. '
+                                      'Restore content/current before deploying.')
+                if os.path.lexists(current_link(self.root)):
+                    raise DeployError('content/current is broken. Restore its release before deploying.')
+                if code_only:
+                    raise DeployError('The first release requires the safe path, not --code-only.')
+            if name == old_name:
+                raise DeployError('The release is already live.')
             if code_only:
                 old, new = read_release_info(previous), read_release_info(release)
                 versions_changed = any(old.get(k) != new.get(k) for k in ('plugins', 'themes'))
                 if versions_changed or self._baseline(previous) != self._baseline(release):
                     raise DeployError('Version or baseline changes require the safe path.')
-            else:
+            if not self.sites:
+                with self.step('Prepare empty-fleet release'):
+                    self._prepare(release)
+                with self.step('Switch empty-fleet content'):
+                    switch_current(self.root, name)
+                    switched = True
+                prune_releases(self.root, old_name)
+                result = 'pass'
+                return
+            if not code_only:
+                maintenance_started = True
                 with self.step('1. Maintenance'):
                     self._maintenance()
                 with self.step('2. Drain'):
@@ -423,7 +440,12 @@ class ContentDeployment:
         except (Exception, SystemExit):
             if switched:
                 result = 'fail'
-                if code_only:
+                if not self.sites:
+                    if previous:
+                        switch_current(self.root, old_name)
+                    else:
+                        os.unlink(current_link(self.root))
+                elif code_only:
                     with self.step('Automatic switch back'):
                         self._log_mark()
                         switch_current(self.root, old_name)
@@ -432,7 +454,7 @@ class ContentDeployment:
                 else:
                     self._bypass(False)
                     self._recovery_message()
-            elif not code_only:
+            elif maintenance_started:
                 self.gates = [domain for domain in self.gates if domain not in self.preexisting_gates]
                 self._release_maintenance()
             raise
@@ -503,6 +525,8 @@ class ContentDeployment:
             self._history(name, previous, 'back', result)
 
     def cutover(self):
+        if not self.sites:
+            raise DeployError('Cutover requires tracked shared sites.')
         if is_cut_over(self.root):
             raise DeployError('Content is already cut over.')
         name = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-pre-cutover')

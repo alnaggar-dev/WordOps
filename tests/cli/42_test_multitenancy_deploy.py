@@ -85,6 +85,34 @@ class ContentDeploymentTests(unittest.TestCase):
         os.symlink('../content/current/baseline.json', os.path.join(self.root, 'config', 'baseline.json'))
         return old, new
 
+    def fresh_layout(self, tracked_sites=False):
+        os.makedirs(os.path.join(self.root, 'content'))
+        os.makedirs(os.path.join(self.root, 'config'))
+        os.symlink('content/current/wp-content', os.path.join(self.root, 'wp-content'))
+        os.symlink('../content/current/baseline.json',
+                   os.path.join(self.root, 'config', 'baseline.json'))
+        if not tracked_sites:
+            deploy.MTDatabase.get_shared_sites.return_value = []
+            self.operation.sites = []
+        self.assert_fresh_links()
+        return self.release(self.new)
+
+    def assert_fresh_links(self):
+        self.assertTrue(os.path.isdir(deploy.content_root(self.root)))
+        self.assertFalse(os.path.lexists(deploy.current_link(self.root)))
+        for relative, target in (
+                ('wp-content', 'content/current/wp-content'),
+                ('config/baseline.json', '../content/current/baseline.json')):
+            link = os.path.join(self.root, relative)
+            self.assertEqual(os.readlink(link), target)
+            self.assertFalse(os.path.exists(link))
+
+    def assert_no_fleet_operations(self):
+        for method in ('_maintenance', '_drain', '_restore_point',
+                       '_database_updates', '_apply', '_checks', '_reset_caches',
+                       '_bypass', '_release_maintenance', '_recovery_message'):
+            getattr(self.operation, method).assert_not_called()
+
     def records(self):
         with open(os.path.join(self.root, 'content', deploy.HISTORY_FILE)) as handle:
             return [json.loads(line) for line in handle]
@@ -466,12 +494,109 @@ class ContentDeploymentTests(unittest.TestCase):
         self.operation._maintenance.assert_not_called()
         self.assertEqual(self.records()[-1]['result'], 'pass')
 
-    def test_initialization_refuses_empty_fleet_before_any_operation(self):
+    def test_initialization_accepts_empty_fleet_without_changing_layout(self):
         deploy.MTDatabase.get_shared_sites.return_value = []
-        with self.assertRaises(deploy.DeployError):
-            deploy.ContentDeployment(self.controller)
+        operation = deploy.ContentDeployment(self.controller)
+        self.assertEqual(operation.sites, [])
+        self.assertEqual(operation.root, self.root)
         self.assertEqual(self.events.mock_calls, [])
+        self.run.assert_not_called()
         self.assertFalse(os.path.exists(deploy.content_root(self.root)))
+
+    def test_first_empty_fleet_deploy_prepares_logger_switches_and_records_safe_pass(self):
+        release = self.fresh_layout()
+        logger = os.path.join(release, 'wp-content', 'mu-plugins', 'wo-login-log.php')
+
+        def install(controller, path):
+            self.assertFalse(os.path.lexists(deploy.current_link(self.root)))
+            with open(os.path.join(path, 'wp-content', 'mu-plugins', 'wo-login-log.php'),
+                      'w') as handle:
+                handle.write('<?php // login failure logger')
+            return True
+
+        installer = self.patch(deploy.MTFunctions, 'install_login_failure_logger',
+                               side_effect=install)
+        self.operation._prepare.side_effect = (
+            lambda path: deploy.ContentDeployment._prepare(self.operation, path))
+        self.operation.deploy(self.new)
+
+        self.assert_live(self.new)
+        self.operation._prepare.assert_called_once_with(release)
+        installer.assert_called_once_with(self.controller, release)
+        with open(logger) as handle:
+            self.assertEqual(handle.read(), '<?php // login failure logger')
+        self.run.assert_called_once_with(
+            ['chown', '-R', 'www-data:www-data', release], check=True)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, 'wp-content')))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'config', 'baseline.json')))
+        self.assert_no_fleet_operations()
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            (records[0]['release'], records[0]['previous'],
+             records[0]['path'], records[0]['result'], records[0]['restore_point']),
+            (self.new, None, 'safe', 'pass', None),
+        )
+
+    def test_first_deploy_refuses_code_only_without_changing_fresh_links(self):
+        self.fresh_layout()
+        with self.assertRaisesRegex(deploy.DeployError, '(?i)first|initial'):
+            self.operation.deploy(self.new, code_only=True)
+        self.assert_fresh_links()
+        self.operation._prepare.assert_not_called()
+        self.assert_no_fleet_operations()
+        self.run.assert_not_called()
+
+    def test_tracked_sites_without_live_release_refuse_and_preserve_dangling_links(self):
+        self.fresh_layout(tracked_sites=True)
+        links = [os.path.join(self.root, 'wp-content'),
+                 os.path.join(self.root, 'config', 'baseline.json')]
+        inodes = [os.lstat(link).st_ino for link in links]
+        with self.assertRaisesRegex(deploy.DeployError, '(?i)live|current'):
+            self.operation.deploy(self.new)
+        self.assert_fresh_links()
+        self.assertEqual([os.lstat(link).st_ino for link in links], inodes)
+        self.operation._prepare.assert_not_called()
+        self.assert_no_fleet_operations()
+        self.run.assert_not_called()
+
+    def test_empty_fleet_with_dangling_current_is_not_a_first_deploy(self):
+        self.fresh_layout()
+        os.symlink(self.old, deploy.current_link(self.root))
+        with self.assertRaisesRegex(deploy.DeployError, '(?i)current|release'):
+            self.operation.deploy(self.new)
+        self.assert_live(self.old)
+        self.assertFalse(os.path.exists(deploy.current_link(self.root)))
+        self.assertEqual(os.readlink(os.path.join(self.root, 'wp-content')),
+                         'content/current/wp-content')
+        self.assertEqual(os.readlink(os.path.join(self.root, 'config', 'baseline.json')),
+                         '../content/current/baseline.json')
+        self.operation._prepare.assert_not_called()
+        self.assert_no_fleet_operations()
+        self.run.assert_not_called()
+
+    def test_back_before_first_deploy_refuses_without_changing_fresh_links(self):
+        self.fresh_layout()
+        for force in (False, True):
+            with self.subTest(force=force):
+                with self.assertRaisesRegex(deploy.DeployError, 'No previous'):
+                    self.operation.back(force=force)
+                self.assert_fresh_links()
+        self.assertEqual(self.events.mock_calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'content', deploy.HISTORY_FILE)))
+
+    def test_back_after_first_deploy_refuses_without_switching_or_changing_history(self):
+        self.fresh_layout()
+        self.operation.deploy(self.new)
+        records = self.records()
+        self.events.reset_mock()
+        for force in (False, True):
+            with self.subTest(force=force):
+                with self.assertRaisesRegex(deploy.DeployError, 'No previous'):
+                    self.operation.back(force=force)
+                self.assert_live(self.new)
+                self.assertEqual(self.records(), records)
+        self.assertEqual(self.events.mock_calls, [])
 
     def test_cutover_drain_timeout_preserves_original_layout(self):
         content = self.legacy_layout()
