@@ -5,6 +5,7 @@ Enables WordPress multi-tenancy with shared core files for efficient management.
 import os
 import json
 import shutil
+import subprocess
 from datetime import datetime
 from cement.core.controller import CementBaseController, expose
 from wo.cli.plugins.site_functions import (
@@ -1482,7 +1483,6 @@ class WOMultitenancyController(CementBaseController):
 
         # Delete the site using regular WO command
         try:
-            import subprocess
             result = subprocess.run(
                 ['wo', 'site', 'delete', domain, '--no-prompt'],
                 capture_output=True,
