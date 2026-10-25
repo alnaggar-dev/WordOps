@@ -3318,4 +3318,9 @@ def load(app):
     app.handler.register(WOMultitenancyController)
     from wo.cli.plugins.multitenancy_backup import WOMultitenancyBackupController
     app.handler.register(WOMultitenancyBackupController)
+    from wo.cli.plugins.multitenancy_deploy import (
+        WOMultitenancyDeployController, WOMultitenancyCutoverController,
+    )
+    app.handler.register(WOMultitenancyDeployController)
+    app.handler.register(WOMultitenancyCutoverController)
     app.hook.register('post_setup', wo_multitenancy_hook)
