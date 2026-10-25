@@ -149,7 +149,7 @@ The default safe path:
 3. Dump every tenant database locally. Run the database backup family if backups are configured.
 4. Write the managed `wo-login-log.php` into the staged release and set ownership.
 5. Switch `content/current`, clear page caches, reset opcache, and gracefully reload tenant PHP-FPM services followed by nginx.
-6. Run WooCommerce database updates when its version changes or a tenant database version differs.
+6. Run WooCommerce database updates when its plugin version changes or a tenant database differs from WooCommerce's expected database version (the greater of the loaded plugin version and its last database-update callback version).
 7. Apply the baseline when its bytes or the Object Cache Pro version changed.
 8. Open the loopback bypass and check stores while public traffic remains blocked.
 9. Close the bypass, remove maintenance, release cron locks, and prune old releases.
@@ -159,7 +159,7 @@ If backups are not initialized, WordOps retains local dumps and warns that it sk
 Configured but disabled or failed backups stop deployment.
 
 Checks cover the home page, one published product, cart, checkout, My Account, login, and REST API.
-They check HTTP results, critical-error text, WooCommerce database versions, new fatal log entries, and fleet health.
+They check HTTP results, critical-error text, WooCommerce database versions against WooCommerce's expected database version, new fatal log entries, and fleet health.
 Each store must have a published product.
 Every page request sends `X-Requested-With: XMLHttpRequest` to bypass the managed FastCGI cache.
 A cached home-page 200 alone is not recovery: an error on any of the seven pages fails the checks.

@@ -233,10 +233,10 @@ class ContentDeploymentTests(unittest.TestCase):
             lambda: deploy.ContentDeployment._reset_caches(self.operation))
         self.operation._checks.side_effect = (
             lambda **kwargs: deploy.ContentDeployment._checks(self.operation, **kwargs))
-        self.patch(self.operation, '_wp', side_effect=lambda site, args: {
-            'post list': '1', 'post url': 'http://example.test/product/sample/',
-            'option get': '10.0',
-        }[' '.join(args[:2])])
+        self.patch(self.operation, '_wp', side_effect=lambda site, args:
+                   json.dumps(['10.0', '10.0']) if args[0] == 'eval' else {
+                       'post list': '1', 'post url': 'http://example.test/product/sample/',
+                   }[' '.join(args[:2])])
         fatal_errors = self.patch(self.operation, '_fatal_errors',
                                   wraps=self.operation._fatal_errors)
         health = self.patch(deploy, 'HealthChecker')
@@ -901,31 +901,75 @@ class ContentDeploymentTests(unittest.TestCase):
         self.operation._release_maintenance.assert_called_once_with()
         self.operation._unlock.assert_called_once_with()
 
-    def test_same_release_version_resumes_outdated_database_migration(self):
+    def test_woocommerce_schema_target_drives_migrations_and_checks(self):
         old, new = self.layout()
-        wp = self.patch(self.operation, '_wp', return_value='9.9')
-        deploy.ContentDeployment._database_updates(self.operation, old, new)
+        self.patch(self.operation, '_page')
+        self.patch(self.operation, '_fatal_errors')
+        health = self.patch(deploy, 'HealthChecker')
+        health.return_value.register_defaults.return_value.run_all.return_value = {'status': 'healthy'}
         site = self.operation.sites[0]
-        self.assertEqual(wp.call_args_list, [
-            mock.call(site, ['option', 'get', 'woocommerce_db_version']),
-            mock.call(site, ['wc', 'update', '--yes']),
-        ])
+        for plugin, current, expected, pending in (
+                ('10.0', '10.0', '10.0', False),
+                ('11.2.0', '11.2.0-1', '11.2.0-1', False),
+                ('10.0', '9.9', '10.0', True),
+                ('11.2.0', '11.2.0', '11.2.0-1', True),
+                ('11.2.0', '11.3.0', '11.2.0-1', True),
+                ('11.2.0', False, '11.2.0-1', True)):
+            with self.subTest(plugin=plugin, current=current, expected=expected):
+                for release in (old, new):
+                    self.write_json(os.path.join(release, 'RELEASE'), {
+                        'plugins': {'woocommerce': plugin}, 'themes': {'storefront': '4.6'},
+                    })
 
-    def test_same_release_and_database_version_needs_no_migration(self):
-        old, new = self.layout()
-        wp = self.patch(self.operation, '_wp', return_value='10.0')
-        deploy.ContentDeployment._database_updates(self.operation, old, new)
-        wp.assert_called_once_with(
-            self.operation.sites[0], ['option', 'get', 'woocommerce_db_version'])
+                def wp_output(site, args):
+                    if args[0] == 'eval':
+                        return json.dumps([current, expected])
+                    return {
+                        'wc update': '',
+                        'post list': '1',
+                        'post url': 'http://example.test/product/sample/',
+                    }[' '.join(args[:2])]
+
+                with mock.patch.object(self.operation, '_wp', side_effect=wp_output) as wp:
+                    deploy.ContentDeployment._database_updates(self.operation, old, new)
+                    self.assertEqual(wp.call_count, 2 if pending else 1)
+                    self.assertEqual(wp.call_args_list[0].args[0], site)
+                    self.assertEqual(wp.call_args_list[0].args[1][0], 'eval')
+                    if pending:
+                        wp.assert_called_with(site, ['wc', 'update', '--yes'])
+                    for loopback in (False, True):
+                        health.reset_mock()
+                        if pending:
+                            with self.assertRaisesRegex(deploy.DeployError, 'expected version'):
+                                deploy.ContentDeployment._checks(self.operation, loopback=loopback)
+                            health.assert_not_called()
+                        else:
+                            deploy.ContentDeployment._checks(self.operation, loopback=loopback)
+                            health.return_value.register_defaults.return_value.run_all.assert_called_once_with()
+
+    def test_woocommerce_schema_probe_uses_read_only_vendor_target_logic(self):
+        wp = self.patch(self.operation, '_wp', return_value=json.dumps(['11.2.0-1', '11.2.0-1']))
+        self.assertFalse(self.operation._woocommerce_db_pending(self.operation.sites[0]))
+        wp.assert_called_once()
+        site, args = wp.call_args.args
+        self.assertEqual(site, self.operation.sites[0])
+        self.assertEqual(args[0], 'eval')
+        self.assertIn('WC_Install::get_db_update_callbacks()', args[1])
+        self.assertIn('array_key_last( $updates )', args[1])
+        self.assertIn("version_compare( WC()->version, $latest, '>' ) ? WC()->version : $latest", args[1])
+        self.assertIn("get_option( 'woocommerce_db_version' )", args[1])
+        self.assertNotIn('update_option', args[1])
+        self.assertNotIn('update_db_version', args[1])
+        self.assertNotIn('11.2.0', args[1])
 
     def test_changed_woocommerce_release_runs_migration(self):
         old, new = self.layout()
         self.write_json(os.path.join(new, 'RELEASE'), {
             'plugins': {'woocommerce': '10.1'}, 'themes': {'storefront': '4.6'},
         })
-        wp = self.patch(self.operation, '_wp', return_value='10.1')
+        wp = self.patch(self.operation, '_wp')
         deploy.ContentDeployment._database_updates(self.operation, old, new)
-        wp.assert_any_call(self.operation.sites[0], ['wc', 'update', '--yes'])
+        wp.assert_called_once_with(self.operation.sites[0], ['wc', 'update', '--yes'])
 
     def test_apply_retries_failed_safe_release_with_unchanged_baseline(self):
         from wo.cli.plugins.multitenancy import WOMultitenancyController

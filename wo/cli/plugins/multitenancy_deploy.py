@@ -248,13 +248,25 @@ class ContentDeployment:
             raise DeployError('WP-CLI failed for {}: {}'.format(site['domain'], ' '.join(arguments[:3])))
         return result.stdout.strip()
 
+    def _woocommerce_db_pending(self, site):
+        # Mirror WC_Install::update_db_version without calling its mutating API:
+        # the last schema callback can be newer than the plugin version.
+        current, expected = json.loads(self._wp(site, ['eval', (
+            '$updates = WC_Install::get_db_update_callbacks(); '
+            '$latest = array_key_last( $updates ); '
+            '$expected = version_compare( WC()->version, $latest, \'>\' ) '
+            '? WC()->version : $latest; '
+            'echo wp_json_encode( array( '
+            'get_option( \'woocommerce_db_version\' ), $expected ) );'
+        )]))
+        return current != expected
+
     def _database_updates(self, old, new):
         before = read_release_info(old).get('plugins', {}).get('woocommerce')
         after = read_release_info(new).get('plugins', {}).get('woocommerce')
         if after:
             for site in self.sites:
-                pending = before != after or self._wp(
-                    site, ['option', 'get', 'woocommerce_db_version']) != after
+                pending = before != after or self._woocommerce_db_pending(site)
                 if pending:
                     self._wp(site, ['wc', 'update', '--yes'])
 
@@ -360,8 +372,8 @@ class ContentDeployment:
         product = self._wp(site, ['post', 'url', products[0]])
         for path in ('/', product, '/cart/', '/checkout/', '/my-account/', '/wp-login.php', '/wp-json/'):
             self._page(site, urljoin(base, path), loopback)
-        if version and self._wp(site, ['option', 'get', 'woocommerce_db_version']) != version:
-            raise DeployError('WooCommerce database version differs for ' + site['domain'])
+        if version and self._woocommerce_db_pending(site):
+            raise DeployError('WooCommerce database version differs from its expected version for ' + site['domain'])
 
     def _checks(self, loopback=False, rejected_release=None):
         release = current_release(self.root)
