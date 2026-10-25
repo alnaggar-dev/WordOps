@@ -256,6 +256,8 @@ Generated shared configuration disables loopback WP-Cron.
 WordOps maintains `/etc/cron.d/wo-multitenancy` with maintenance-aware, locked, every-minute tenant jobs.
 Each job has a deterministic delay of 0–59 seconds.
 Create, delete, rename, and non-dry-run apply regenerate these entries.
+Maintenance operations open existing `/tmp/wo-cron-<domain>.lock` files read-only, without creation flags, so locks owned by `www-data` work with Linux `protected_regular`.
+Missing lock files are created exclusively; a concurrent creator is handled by reopening read-only. Symlinks are never followed, and exclusive locks stay held until the operation releases them.
 
 Deploy owns the generated `wo-login-log.php` MU-plugin.
 It logs password failures outside `wp-login.php` to journald for the `wo-wordpress-auth` fail2ban jail.

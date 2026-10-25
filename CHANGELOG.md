@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 -   Fix open XML-RPC on multitenancy sites: the `xmlrpc.php` deny rule matched only `/xmlrpc.php`, so `/wp/xmlrpc.php` reached PHP and was used for password guessing. `wpcommon` now applies the same Jetpack-only rule to `/wp/xmlrpc.php`
 -   Fix fail2ban nginx jails watching no files: Debian's `defaults-debian.conf` sets `backend = systemd`, which ignores `logpath`. The nginx jails and `recidive` now set `backend = auto`
 -   Fix multitenancy sites logging outside `/var/log/nginx`, so fail2ban and logrotate never saw them. Vhosts now log to `/var/log/nginx/<domain>.{access,error}.log` with `logs/` symlinks, like standard sites; existing log files move there when the vhost is regenerated
+-   Fix multitenancy cron draining with Linux `protected_regular`: open existing `www-data` lock files read-only without `O_CREAT`, create missing locks exclusively, and safely reopen after a creation race while retaining symlink protection and exclusive flock behavior.
 
 ### v3.21.3 - 2024-06-14
 

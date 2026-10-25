@@ -1855,11 +1855,23 @@ server {{
                 MTFunctions.release_tenant_cron_locks(acquired)
                 return ({}, [domain or '<unknown>'])
             path = f'/tmp/wo-cron-{domain}.lock'
-            flags = os.O_RDONLY | os.O_CREAT
+            flags = os.O_RDONLY
             if hasattr(os, 'O_NOFOLLOW'):
                 flags |= os.O_NOFOLLOW
             try:
-                fd = os.open(path, flags, 0o644)
+                try:
+                    # O_CREAT rejects www-data-owned files in sticky /tmp
+                    # when Linux protected_regular is enabled.
+                    fd = os.open(path, flags)
+                except FileNotFoundError:
+                    try:
+                        fd = os.open(
+                            path, flags | os.O_CREAT | os.O_EXCL, 0o644
+                        )
+                    except FileExistsError:
+                        # Cron created the file first; open its inode without
+                        # O_CREAT, retaining O_NOFOLLOW for a symlink race.
+                        fd = os.open(path, flags)
                 handle = os.fdopen(fd, 'r')
             except OSError:
                 MTFunctions.release_tenant_cron_locks(acquired)

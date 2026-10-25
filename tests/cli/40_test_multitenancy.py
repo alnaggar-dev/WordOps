@@ -7,6 +7,7 @@ baselines, and tenant helpers. Run with:
 """
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -4234,6 +4235,146 @@ $wp_version = '6.9.1';
                 os.remove(lock_path)
             except FileNotFoundError:
                 pass
+
+    def test_cron_lock_helper_opens_protected_existing_file_read_only(self):
+        domain = 'protected-cron.example'
+        path = f'/tmp/wo-cron-{domain}.lock'
+        lock_path = os.path.join(self.tmp, 'cron.lock')
+        with open(lock_path, 'w') as fh:
+            fh.write('existing cron lock\n')
+        os.chmod(lock_path, 0o664)
+        before = os.stat(lock_path)
+        real_open = os.open
+
+        def open_lock(actual_path, flags, mode=0o777):
+            self.assertEqual(actual_path, path)
+            # Model Linux protected_regular rejecting O_CREAT on a lock
+            # owned by www-data, even when root can open it read-only.
+            if flags & os.O_CREAT:
+                raise PermissionError(errno.EACCES, 'protected_regular', path)
+            return real_open(lock_path, flags, mode)
+
+        with mock.patch.object(mtf.os, 'open', side_effect=open_lock) as opened:
+            locks, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+        self.addCleanup(MTFunctions.release_tenant_cron_locks, locks)
+        self.assertEqual(failures, [])
+        opened.assert_called_once_with(
+            path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+        )
+        self.assertEqual(locks[domain].read(), 'existing cron lock\n')
+        after = os.fstat(locks[domain].fileno())
+        self.assertEqual(
+            (after.st_ino, after.st_uid, after.st_mode),
+            (before.st_ino, before.st_uid, before.st_mode),
+        )
+
+    def test_cron_lock_helper_creates_missing_file_exclusively(self):
+        domain = 'missing-cron.example'
+        path = f'/tmp/wo-cron-{domain}.lock'
+        lock_path = os.path.join(self.tmp, 'cron.lock')
+        real_open = os.open
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+
+        def open_lock(actual_path, open_flags, mode=0o777):
+            self.assertEqual(actual_path, path)
+            return real_open(lock_path, open_flags, mode)
+
+        with mock.patch.object(mtf.os, 'open', side_effect=open_lock) as opened:
+            locks, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+        self.addCleanup(MTFunctions.release_tenant_cron_locks, locks)
+        self.assertEqual(failures, [])
+        self.assertIn(domain, locks)
+        self.assertEqual(opened.call_args_list, [
+            mock.call(path, flags),
+            mock.call(path, flags | os.O_CREAT | os.O_EXCL, 0o644),
+        ])
+        self.assertEqual(
+            os.fstat(locks[domain].fileno()).st_ino, os.stat(lock_path).st_ino
+        )
+
+    def test_cron_lock_helper_reopens_concurrently_created_file_read_only(self):
+        domain = 'racing-cron.example'
+        path = f'/tmp/wo-cron-{domain}.lock'
+        lock_path = os.path.join(self.tmp, 'cron.lock')
+        real_open = os.open
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+
+        def open_lock(actual_path, open_flags, mode=0o777):
+            self.assertEqual(actual_path, path)
+            if open_flags & os.O_CREAT:
+                with open(lock_path, 'x') as fh:
+                    fh.write('created by cron\n')
+                os.chmod(lock_path, 0o664)
+            return real_open(lock_path, open_flags, mode)
+
+        with mock.patch.object(mtf.os, 'open', side_effect=open_lock) as opened:
+            locks, failures = MTFunctions.acquire_tenant_cron_locks(
+                mock.Mock(), [{'domain': domain}], timeout=0
+            )
+        self.addCleanup(MTFunctions.release_tenant_cron_locks, locks)
+        self.assertEqual(failures, [])
+        self.assertEqual(locks[domain].read(), 'created by cron\n')
+        self.assertEqual(opened.call_args_list, [
+            mock.call(path, flags),
+            mock.call(path, flags | os.O_CREAT | os.O_EXCL, 0o644),
+            mock.call(path, flags),
+        ])
+        self.assertEqual(
+            os.fstat(locks[domain].fileno()).st_ino, os.stat(lock_path).st_ino
+        )
+
+    @unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'requires O_NOFOLLOW')
+    def test_cron_lock_helper_rejects_existing_and_racing_symlinks(self):
+        domain = 'symlink-cron.example'
+        path = f'/tmp/wo-cron-{domain}.lock'
+        real_open = os.open
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        for racing in (False, True):
+            for dangling in (False, True):
+                with self.subTest(racing=racing, dangling=dangling):
+                    suffix = f'{racing}-{dangling}'
+                    lock_path = os.path.join(self.tmp, f'cron-{suffix}.lock')
+                    target = os.path.join(self.tmp, f'target-{suffix}')
+                    if not dangling:
+                        with open(target, 'w') as fh:
+                            fh.write('do not touch\n')
+                    if not racing:
+                        os.symlink(target, lock_path)
+
+                    def open_lock(actual_path, open_flags, mode=0o777):
+                        self.assertEqual(actual_path, path)
+                        if racing and open_flags & os.O_CREAT:
+                            os.symlink(target, lock_path)
+                        return real_open(lock_path, open_flags, mode)
+
+                    with mock.patch.object(
+                        mtf.os, 'open', side_effect=open_lock
+                    ) as opened:
+                        locks, failures = MTFunctions.acquire_tenant_cron_locks(
+                            mock.Mock(), [{'domain': domain}], timeout=0
+                        )
+                    self.addCleanup(MTFunctions.release_tenant_cron_locks, locks)
+                    self.assertEqual(locks, {})
+                    self.assertEqual(failures, [domain])
+                    expected = [mock.call(path, flags)]
+                    if racing:
+                        expected.extend([
+                            mock.call(
+                                path, flags | os.O_CREAT | os.O_EXCL, 0o644
+                            ),
+                            mock.call(path, flags),
+                        ])
+                    self.assertEqual(opened.call_args_list, expected)
+                    self.assertTrue(os.path.islink(lock_path))
+                    if dangling:
+                        self.assertFalse(os.path.lexists(target))
+                    else:
+                        with open(target) as fh:
+                            self.assertEqual(fh.read(), 'do not touch\n')
 
     def _guarded_cron_test_command(self, domain, splay, ran):
         site_root = os.path.join(self.tmp, domain)
