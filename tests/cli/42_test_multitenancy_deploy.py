@@ -193,6 +193,139 @@ class ContentDeploymentTests(unittest.TestCase):
         self.operation._unlock.assert_called_once_with()
         self.assertEqual(self.records()[-1]['result'], 'fail')
 
+    def test_code_only_rollback_refreshes_nginx_before_all_seven_checks(self):
+        self.layout()
+        self.patch(deploy.MTFunctions, 'clear_all_caches', return_value=True)
+        self.patch(deploy.MTFunctions, 'reset_opcache', return_value=True)
+        failed_peer = False
+        reloads = []
+        pages = []
+
+        def reload_fpm(controller, service):
+            reloads.append((os.readlink(deploy.current_link(self.root)), service))
+            return True  # FPM cannot clear nginx's failed-peer state.
+
+        def reload_nginx(controller, domain):
+            nonlocal failed_peer
+            reloads.append((os.readlink(deploy.current_link(self.root)), 'nginx'))
+            failed_peer = False
+            return True
+
+        self.patch(deploy.WOService, 'reload_service', side_effect=reload_fpm)
+        self.patch(deploy.MTFunctions, 'safe_nginx_reload', side_effect=reload_nginx)
+        self.operation._reset_caches.side_effect = (
+            lambda: deploy.ContentDeployment._reset_caches(self.operation))
+        self.operation._checks.side_effect = (
+            lambda **kwargs: deploy.ContentDeployment._checks(self.operation, **kwargs))
+        self.patch(self.operation, '_wp', side_effect=lambda site, args: {
+            'post list': '1', 'post url': 'http://example.test/product/sample/',
+            'option get': '10.0',
+        }[' '.join(args[:2])])
+        fatal_errors = self.patch(self.operation, '_fatal_errors')
+        health = self.patch(deploy, 'HealthChecker')
+        health.return_value.register_defaults.return_value.run_all.return_value = {'status': 'healthy'}
+
+        def page(command, **kwargs):
+            nonlocal failed_peer
+            live = os.readlink(deploy.current_link(self.root))
+            if live == self.new:
+                failed_peer = True
+                status = '500'
+            else:
+                status = '502' if failed_peer else '200'
+            self.assertIn('X-Requested-With: XMLHttpRequest', command)
+            self.assertNotIn('--resolve', command)
+            pages.append((live, command[-1], status))
+            return types.SimpleNamespace(returncode=0, stdout=status + '\t', stderr='')
+
+        self.run.side_effect = page
+        with self.assertRaisesRegex(deploy.DeployError, 'HTTP 500'):
+            self.operation.deploy(self.new, code_only=True)
+
+        self.assert_live(self.old)
+        self.assertEqual(reloads, [
+            (self.new, 'php8.4-fpm'), (self.new, 'nginx'),
+            (self.old, 'php8.4-fpm'), (self.old, 'nginx'),
+        ])
+        self.assertEqual(pages, [(self.new, 'http://example.test/', '500')] + [
+            (self.old, 'http://example.test' + path, '200')
+            for path in ('/', '/product/sample/', '/cart/', '/checkout/',
+                         '/my-account/', '/wp-login.php', '/wp-json/')
+        ])
+        fatal_errors.assert_called_once_with()
+        health.return_value.register_defaults.return_value.run_all.assert_called_once_with()
+        for method in ('_maintenance', '_drain', '_bypass', '_release_maintenance'):
+            getattr(self.operation, method).assert_not_called()
+        self.assertEqual(self.records()[-1]['result'], 'fail')
+
+    def test_home_200_cannot_hide_product_502_in_either_check_path(self):
+        self.patch(self.operation, '_wp', side_effect=lambda site, args:
+                   '1' if args[1] == 'list' else 'http://example.test/product/sample/')
+        for loopback in (False, True):
+            with self.subTest(loopback=loopback):
+                self.run.reset_mock()
+                self.run.side_effect = [
+                    types.SimpleNamespace(returncode=0, stdout=status + '\t', stderr='')
+                    for status in ('200', '502')
+                ]
+                with self.assertRaisesRegex(deploy.DeployError, 'product/sample/.*HTTP 502'):
+                    self.operation._check_site(self.operation.sites[0], loopback, '10.0')
+                commands = [call.args[0] for call in self.run.call_args_list]
+                self.assertEqual([command[-1] for command in commands],
+                                 ['http://example.test/', 'http://example.test/product/sample/'])
+                for command in commands:
+                    self.assertIn('X-Requested-With: XMLHttpRequest', command)
+                    self.assertEqual('--resolve' in command, loopback)
+
+    def test_reset_caches_reloads_all_fpm_versions_then_nginx_once(self):
+        self.operation.sites += [
+            {'domain': 'older.test', 'php_version': '8.3'},
+            {'domain': 'same.test', 'php_version': '8.4'},
+        ]
+        calls = mock.Mock()
+        for target, method in (
+                (deploy.MTFunctions, 'clear_all_caches'),
+                (deploy.MTFunctions, 'reset_opcache'),
+                (deploy.WOService, 'reload_service'),
+                (deploy.MTFunctions, 'safe_nginx_reload')):
+            calls.attach_mock(self.patch(target, method, return_value=True), method)
+        deploy.ContentDeployment._reset_caches(self.operation)
+        self.assertEqual(calls.mock_calls, [
+            mock.call.clear_all_caches(self.controller),
+            mock.call.reset_opcache(self.controller),
+            mock.call.reload_service(self.controller, 'php8.3-fpm'),
+            mock.call.reload_service(self.controller, 'php8.4-fpm'),
+            mock.call.safe_nginx_reload(self.controller, 'same.test'),
+        ])
+
+    def test_fpm_reload_failure_does_not_reload_nginx(self):
+        self.patch(deploy.MTFunctions, 'clear_all_caches', return_value=True)
+        self.patch(deploy.MTFunctions, 'reset_opcache', return_value=True)
+        self.patch(deploy.WOService, 'reload_service', return_value=False)
+        nginx = self.patch(deploy.MTFunctions, 'safe_nginx_reload')
+        with self.assertRaisesRegex(deploy.DeployError, 'Cannot reload php8.4-fpm'):
+            deploy.ContentDeployment._reset_caches(self.operation)
+        nginx.assert_not_called()
+
+    def test_nginx_reload_failure_after_safe_switch_keeps_maintenance(self):
+        self.layout()
+        self.patch(deploy.MTFunctions, 'clear_all_caches', return_value=True)
+        self.patch(deploy.MTFunctions, 'reset_opcache', return_value=True)
+        self.patch(deploy.WOService, 'reload_service', return_value=True)
+        self.patch(deploy.MTFunctions, 'safe_nginx_reload', return_value=False)
+        self.operation._reset_caches.side_effect = (
+            lambda: deploy.ContentDeployment._reset_caches(self.operation))
+        with self.assertRaisesRegex(deploy.DeployError, 'Cannot reload nginx'):
+            self.operation.deploy(self.new)
+        self.assert_live(self.new)
+        self.operation._maintenance.assert_called_once_with()
+        self.operation._drain.assert_called_once_with()
+        self.operation._checks.assert_not_called()
+        self.operation._bypass.assert_called_once_with(False)
+        self.operation._release_maintenance.assert_not_called()
+        self.operation._recovery_message.assert_called_once_with()
+        self.assertEqual(self.records()[-1]['result'], 'fail')
+
     def test_code_only_rejects_plugin_theme_and_baseline_changes_before_restore(self):
         old, new = self.layout()
         for field in ('plugins', 'themes', 'baseline'):

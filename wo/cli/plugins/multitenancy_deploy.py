@@ -236,6 +236,10 @@ class ContentDeployment:
             service = 'php{}-fpm'.format(version)
             if not WOService.reload_service(self.controller, service):
                 raise DeployError('Cannot reload ' + service)
+        # FPM reloads do not reset nginx's failed-peer state or its cached
+        # FastCGI connections. Refresh nginx workers after FPM, including on
+        # rollback, without stopping listeners or changing maintenance gates.
+        self._reload_nginx()
 
     def _wp(self, site, arguments):
         result = subprocess.run(['wp'] + arguments + ['--allow-root', '--path=' + MTFunctions._site_htdocs(site)],

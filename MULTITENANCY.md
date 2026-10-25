@@ -97,7 +97,7 @@ wo multitenancy cutover
 
 Cutover requires tracked shared sites. It enables maintenance and drains active nginx, PHP, database, and cron work before moving folders.
 It moves existing content and baseline into a `pre-cutover` release, writes `RELEASE`, and creates the content links.
-It resets caches, reloads PHP-FPM, removes maintenance, and checks the fleet. Failure attempts to restore the old layout.
+It resets caches, gracefully reloads PHP-FPM then nginx, removes maintenance, and checks the fleet. Failure attempts to restore the old layout.
 It refuses a fleet that already uses the fixed content link.
 
 The drain reads `/status?json&full` directly over FastCGI from **both** WordOps
@@ -148,7 +148,7 @@ The default safe path:
 2. Lock cron and drain active work.
 3. Dump every tenant database locally. Run the database backup family if backups are configured.
 4. Write the managed `wo-login-log.php` into the staged release and set ownership.
-5. Switch `content/current`, clear page caches, reset opcache, and reload tenant PHP-FPM services.
+5. Switch `content/current`, clear page caches, reset opcache, and gracefully reload tenant PHP-FPM services followed by nginx.
 6. Run WooCommerce database updates when its version changes or a tenant database version differs.
 7. Apply the baseline when its bytes or the Object Cache Pro version changed.
 8. Open the loopback bypass and check stores while public traffic remains blocked.
@@ -161,6 +161,8 @@ Configured but disabled or failed backups stop deployment.
 Checks cover the home page, one published product, cart, checkout, My Account, login, and REST API.
 They check HTTP results, critical-error text, WooCommerce database versions, new fatal log entries, and fleet health.
 Each store must have a published product.
+Every page request sends `X-Requested-With: XMLHttpRequest` to bypass the managed FastCGI cache.
+A cached home-page 200 alone is not recovery: an error on any of the seven pages fails the checks.
 These checks do not prove that payments work. Test checkout separately after payment-related changes.
 
 A safe failure before the switch removes newly added maintenance gates and leaves the live release unchanged.
@@ -178,6 +180,15 @@ It skips maintenance, draining, WooCommerce migrations, and baseline apply.
 It still prepares the release, switches content, resets caches, and checks stores.
 A failure after the switch automatically selects the previous release and checks it again.
 Restoring these dumps would lose data written after the restore point.
+
+Every content switch, including automatic and explicit rollback, gracefully reloads nginx after PHP-FPM and before checking pages.
+Reloading FPM alone leaves nginx's per-worker upstream health and cached FastCGI connections untouched.
+The standard two-socket upstream has no shared `zone` or explicit failure overrides, so nginx defaults to `max_fails=1` and `fail_timeout=10s`.
+A transport failure during FPM replacement can leave a worker reporting `no live upstreams` even after the old files are back.
+The nginx reload starts fresh workers while old workers finish existing requests; it does not stop listeners or change maintenance gates.
+It uses the existing configuration-checked reload path and fails the operation if reload fails, rather than waiting out the failure timeout or accepting a cached home page.
+The safe path still drains before switching, and its maintenance gates stay closed until the normal checked resume.
+Code-only rollback retains all seven public page checks and the failed deployment history result; switching the link back alone is not a successful health check.
 
 ### Switch content back
 
