@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-WordOps is a **root-only Python CLI** (`wo`) that automates a WordPress server stack — Nginx, PHP-FPM, MariaDB, Redis, Let's Encrypt — on Ubuntu/Debian. This is the **`alnaggar-dev` fork**: Git-only install/update (no PyPI, no mainline/beta channels) plus a custom **multitenancy plugin** that lets many WordPress sites share one WP core via symlinks (`/var/www/shared/current` → `releases/wp-<ts>`) for ~90% disk savings and atomic symlink-swap rollback.
+WordOps is a **root-only Python CLI** (`wo`) that automates a WordPress server stack — Nginx, PHP-FPM, MariaDB, Redis, Let's Encrypt — on Ubuntu/Debian. This is the **`alnaggar-dev` fork**: Git-only install/update (no PyPI, no mainline/beta channels) plus a custom **multitenancy plugin**. Tenants share WordPress core through `/var/www/shared/current`. Separate content releases under `/var/www/shared/content/current` hold plugins, themes, MU-plugins, languages, and `baseline.json`, supplied by the site repository. Core `update`/`rollback` and content `deploy`/`deploy --back` are separate operations; switching files back does not restore tenant databases.
 
 Operating model: **trust-model-of-one** — solo operator, own code, own fleet. Prefer **deleting code over adding abstractions**; reducing surface area is a feature. Per-tenant isolation, audit trails, tamper detection, and multi-operator workflows are explicit **non-goals** — do not propose them.
 
@@ -55,7 +55,17 @@ wo update --branch <name>
 # Run commands (must be root)
 wo site create example.com --wp
 wo stack install --nginx --php
-wo multitenancy init|create|update|rollback|baseline
+wo multitenancy init
+wo multitenancy create example.com
+wo multitenancy update             # shared WordPress core only
+wo multitenancy rollback           # previous core release
+wo multitenancy cutover            # migrate an existing content layout once
+wo multitenancy deploy <release>   # safe content deployment
+wo multitenancy deploy <release> --code-only  # unchanged asset versions and baseline
+wo multitenancy deploy --back      # safe-path history needs --force and DB recovery
+wo multitenancy apply              # apply the live baseline to tenants
+wo multitenancy baseline           # show the live baseline
+wo multitenancy status             # core, deployed content commit, and tenant state
 
 # Local dev / editable install with test deps
 pip install -e ".[testing]"
@@ -87,7 +97,7 @@ tail -f /var/log/wo/wordops.log
 - **Entry/bootstrap**: `wo/cli/main.py`, `wo/cli/bootstrap.py`, `wo/cli/controllers/base.py`
 - **Core services**: `wo/core/variables.py` (`WOVar`), `wo/core/logging.py` (`Log`), `wo/core/exc.py`, `wo/core/shellexec.py`, `wo/core/services.py`, `wo/core/database.py`, `wo/core/mysql.py`, `wo/core/acme.py`
 - **Site command**: `wo/cli/plugins/site.py`, `site_create.py`, `site_functions.py`, `sitedb.py`, `models.py`
-- **Multitenancy**: `wo/cli/plugins/multitenancy.py`, `multitenancy_functions.py`, `multitenancy_db.py`, `multitenancy_health.py`, `config/plugins.d/multitenancy.conf`
+- **Multitenancy**: `wo/cli/plugins/multitenancy.py`, `multitenancy_functions.py`, `multitenancy_db.py`, `multitenancy_health.py`, `multitenancy_deploy.py`, `multitenancy_content.py`, `config/plugins.d/multitenancy.conf`
 - **Packaging/config**: `setup.py`, `setup.cfg`, `requirements.txt`, `config/wo.conf`
 - **AI context**: `AGENTS.md`; multi-tenancy plugin reference `MULTITENANCY.md`; fork install/update notes `FORK.md`
 
@@ -109,7 +119,8 @@ nosetests                                              # full suite + HTML cover
 python3 setup.py test                                 # nose.collector
 nosetests tests/cli/40_test_multitenancy.py    # single module (nose)
 python3 -m unittest tests.cli.40_test_multitenancy   # single module (stdlib, no live stack)
+python3 -m unittest tests.cli.42_test_multitenancy_deploy  # content deployment helpers
 ```
 
 - **Coverage** via the nose plugin (`setup.cfg [nosetests]`, `cover-package=wo`); artifacts are gitignored.
-- **CI does not run the Python unit suite.** `.github/workflows/main.yml` runs the **integration smoke** `tests/travis.sh --actions` — a full `wo stack install` + `wo site create/update` matrix on a live server — on Ubuntu 22.04/24.04. Multitenancy unit tests (`40_test_multitenancy.py`) are the only ones runnable without a live stack. `pypi.yml` (release) builds sdist/wheel and does not run tests.
+- **CI does not run the Python unit suite.** `.github/workflows/main.yml` runs the **integration smoke** `tests/travis.sh --actions` — a full `wo stack install` + `wo site create/update` matrix on a live server — on Ubuntu 22.04/24.04. Multitenancy unit tests include `40_test_multitenancy.py` and `42_test_multitenancy_deploy.py`; these run without a live stack. `pypi.yml` (release) builds sdist/wheel and does not run tests.

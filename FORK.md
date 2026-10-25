@@ -1,8 +1,8 @@
 # WordOps Fork Notes (alnaggar-dev)
 
-This fork installs and updates itself from Git only, using the `alnaggar-dev/WordOps` repository as the source for operator-facing install and update flows. The default branch is `main`, and version `3.22.0` comes directly from `setup.py`; there is no PyPI install path and no GitHub releases API version check.
+This fork installs and updates itself from Git only, using the `alnaggar-dev/WordOps` repository as the source for operator-facing install and update flows. The default branch is `main`, and version `3.23.1` comes directly from `setup.py`; there is no PyPI install path and no GitHub releases API version check.
 
-For the multi-tenancy plugin that ships with this fork, see `MULTITENANCY.md`.
+Multitenancy keeps WordPress core releases separate from site content. The site repository supplies plugins, themes, MU-plugins, languages, and `baseline.json` in content releases selected by `/var/www/shared/content/current`. Use `wo multitenancy deploy` to switch content, `deploy --back` to return to previous files, and `cutover` to move an existing layout into this model. Core updates still use `wo multitenancy update`. See `MULTITENANCY.md` for deployment and database recovery details.
 
 ## Install
 
@@ -83,8 +83,8 @@ Update behavior:
 | --- | --- |
 | `install` | Default branch `main`; fork Git install URL; silent Git identity bootstrap; `safe.directory`; CI-only Travis override branch. |
 | `wo/cli/plugins/update.py` | Default update branch `main`; `--branch <name>` override; fork changelog URL; fork raw install URL; `--mainline` and `--beta` unsupported-branch error. |
-| `setup.py` | Version `3.22.0`; `url`, `Source`, and `Tracker` metadata point to the fork; docs and community URLs remain upstream. |
-| `wo/core/variables.py` | Silent Git identity defaults via `getpass.getuser()` and `socket.getfqdn()`, with fallbacks `WordOps` and `localhost`; version `3.22.0`. |
+| `setup.py` | Version `3.23.1`; `url`, `Source`, and `Tracker` metadata point to the fork; docs and community URLs remain upstream. |
+| `wo/core/variables.py` | Silent Git identity defaults via `getpass.getuser()` and `socket.getfqdn()`, with fallbacks `WordOps` and `localhost`; version `3.23.1`. |
 | `wo/cli/templates/wo-update.mustache` | Reads the latest version by grepping `version='` from the fork raw `setup.py`; no releases API. |
 | `wo/cli/templates/sysctl.mustache` | URL updated to the fork. |
 | `README.md` | Carries fork URLs. |

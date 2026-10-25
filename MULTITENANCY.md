@@ -1,409 +1,260 @@
 # WordOps Multi-tenancy Plugin
 
-The WordOps multi-tenancy plugin lets many WordPress sites share one WordPress core while each site keeps its own `wp-config.php`, database credentials, salts, Redis prefix, uploads, cache, nginx vhost, and cache configuration. One shared core can save about 90% of core disk usage, because one roughly 60 MB core serves the fleet instead of 60 MB per site. Core updates and rollbacks are atomic symlink swaps: `current` moves between timestamped releases.
+Stores share WordPress core and site code. Each store keeps its database, credentials, salts, Redis database, uploads, cache, and nginx configuration.
+The operator owns the code and the fleet. Tenant security isolation and multi-operator workflows are not goals.
 
-Operating model: this fork assumes a trust model of one — a solo operator running their own code on their own fleet. Per-tenant isolation and multi-operator workflows are explicit non-goals.
+## Content model
 
-## Model
+WordPress core and site content have separate releases. `update` changes core only. `deploy` changes content only.
+Plugin, theme, MU-plugin, translation, and baseline changes come only from the site repository's `tools/deploy`.
+WordOps does not download or manage individual plugins and themes.
 
-| Area | Shared | Per site |
+```text
+/var/www/shared/
+  current -> releases/wp-YYYYMMDD-HHMMSS
+  releases/wp-YYYYMMDD-HHMMSS/           WordPress core
+  content/
+    YYYYMMDD-HHMMSS-abcdef0/
+      wp-content/{plugins,themes,mu-plugins,languages}/
+      baseline.json
+      RELEASE
+    current -> YYYYMMDD-HHMMSS-abcdef0
+    history.jsonl
+  wp-content -> content/current/wp-content
+  config/
+    baseline.json -> ../content/current/baseline.json
+    wp-config-shared.php
+  backups/db/
+```
+
+`content/current` is a relative link. A content deploy replaces only this link.
+The `wp-content` and `config/baseline.json` links stay fixed.
+Tenant content links still point through `/var/www/shared/wp-content`.
+Each tenant's `htdocs/wp` points through `/var/www/shared/current`.
+Uploads, cache, and upgrade folders remain real per-site directories.
+
+`RELEASE` is JSON with `commit`, `short`, `branch`, `date`, `built`, and plugin/theme version maps.
+Release names contain a timestamp and seven lowercase hexadecimal commit characters.
+Cutover uses a `YYYYMMDD-HHMMSS-pre-cutover` name instead.
+`content/history.jsonl` records each operation's time, release, previous release, path, restore point, and result.
+WordOps keeps the five newest content releases, plus the live and previous releases if needed.
+Core retention is separate.
+
+## Configuration and baseline
+
+Enable the plugin in `/etc/wo/plugins.d/multitenancy.conf`.
+This file contains infrastructure settings, not content sources.
+
+| Key | Default | Meaning |
 | --- | --- | --- |
-| WordPress core | `/var/www/shared/current` | `htdocs/wp` symlink to the shared core |
-| Releases | `/var/www/shared/releases/wp-<timestamp>/` | Site points at whichever release `current` selects |
-| Plugins, themes, MU plugins, languages | `/var/www/shared/wp-content/{plugins,themes,mu-plugins,languages}/` | `htdocs/wp-content/{plugins,themes,mu-plugins,languages}` symlink to shared tree |
-| Fleet config | `/var/www/shared/config/wp-config-shared.php` | Required by each generated tenant config |
-| Baseline | `/var/www/shared/config/baseline.json` | Site tracking stores the baseline version applied to that site |
-| Site config | Not shared | `htdocs/wp-config.php` with DB credentials, salts, unique Redis prefix and dedicated Redis database |
-| Mutable content | Not shared | `wp-content/uploads`, `wp-content/cache`, `wp-content/upgrade` real directories |
-| Web server | Not shared | nginx vhost and cache configuration |
+| `enable_plugin` | `true` in the packaged file | Enable the plugin. |
+| `shared_root` | `/var/www/shared` | Shared infrastructure root. |
+| `keep_releases` | `3` | Core releases retained for rollback. |
+| `wp_version` | `latest` fallback | Core version for init/update. The packaged file pins `7.0.2`. |
+| `php_version` | `8.4` | Default PHP version. |
+| `admin_email` | `admin@example.com` | Default tenant admin email. |
+| `apply_workers` | `4` | Parallel apply workers, limited to 1–16. |
+| `min_free_space_gb` | `2` | Free-space warning threshold. |
 
-The shared `wo-login-log.php` MU-plugin is WordOps-managed: `wo multitenancy init` and `wo multitenancy apply` install it and overwrite any edits.
-It logs WordPress password failures from forms other than `wp-login.php` (WooCommerce My Account and checkout, XML-RPC) to journald for the `wo-wordpress-auth` fail2ban jail.
-`wp-login.php` failures are not logged there because the `wo-wordpress` jail already counts them from the nginx access log, so each failure counts in one jail only.
-Submissions with empty username or password fields are excluded so OTP customers are not penalized.
+The site repository owns `baseline.json`. Deploy it with content rather than editing the live copy.
+It selects active plugins, the theme, and fleet-wide WordPress options:
 
-Multi-tenancy has three configuration layers:
-
-- `/etc/wo/plugins.d/multitenancy.conf` configures infrastructure and download sources only: shared root, release retention, WordPress/PHP defaults, health thresholds, and where plugin/theme zip files come from.
-- `/var/www/shared/config/baseline.json` is the source of truth for the active baseline: active plugins, active theme, and fleet-wide WordPress `options`. Site creation and `wo multitenancy apply` enforce this file through wp-cli.
-- `/var/www/shared/config/wp-config-shared.php` contains PHP constants and shared PHP config that every generated tenant loads.
-
-Each generated tenant `wp-config.php` does a `require_once` of `/var/www/shared/config/wp-config-shared.php` before defining its DB constants. The require is guarded by `WO_BYPASS_SHARED_CONFIG`, and risky paths lint the shared file with `php -l` before proceeding. The shared core is `current -> releases/wp-<timestamp>`; `update` builds a new release and repoints `current`, while `rollback` repoints it to the previous release.
-
-Generated shared config disables loopback WP-Cron (`DISABLE_WP_CRON` true). WordOps maintains `/etc/cron.d/wo-multitenancy` with one every-minute `wp cron event run --due-now` entry per enabled tenant, each prefixed with a deterministic per-domain sleep of 0–59 seconds (CRC32 of the domain, modulo 60) so fleet cron runs are splayed across the minute instead of starting simultaneously; `create`, `delete`, `rename`, and non-dry-run `apply` regenerate the whole file (a failed regeneration makes the command exit nonzero with a hint to run `wo multitenancy apply`), so `wo multitenancy apply` retrofits existing fleets. Because the shared define is guarded, a tenant may define `DISABLE_WP_CRON` as `false` in its own `wp-config.php` before the shared require, but that only re-enables loopback cron in addition to the managed entry — there is no per-site opt-out of `/etc/cron.d/wo-multitenancy`. The PHP stack defaults explicitly set `opcache.enable=1` and `opcache.interned_strings_buffer=64`.
-
-## Quick start
-
-1. Configure shared infrastructure and download sources in `/etc/wo/plugins.d/multitenancy.conf`.
-
-    ```ini
-    [multitenancy]
-    enable_plugin = true
-    shared_root = /var/www/shared
-
-    [wordpress_plugins]
-    redis-cache = latest
-    nginx-helper = latest
-
-    [wordpress_themes]
-    twentytwentyfour = latest
-    ```
-
-2. Initialize the shared infrastructure. This creates `/var/www/shared/config/baseline.json` only if it is missing.
-
-    ```bash
-    wo multitenancy init
-    ```
-
-3. Choose the baseline activation state with CLI helpers, or edit `baseline.json` by hand.
-
-    ```bash
-    wo multitenancy add-plugin redis-cache
-    wo multitenancy add-plugin nginx-helper
-    wo multitenancy set-theme twentytwentyfour
-    ```
-
-4. Create sites. New sites receive the plugins, theme, and options from `baseline.json`.
-
-    ```bash
-    wo multitenancy create example.com --php84 --wpfc
-    wo multitenancy create ssl.example.com --php84 --wpfc -le
-    wo multitenancy create redis.example.com --php84 --wpredis --force  # --wpredis is blocked by default; see create options
-    ```
-
-## Install & activate
-
-This plugin ships with this fork's `wo` CLI (see `FORK.md` for fork install and update details). Update the CLI from the fork first:
-
-```bash
-wo update --force
+```json
+{
+  "plugins": ["nginx-helper", "object-cache-pro"],
+  "theme": "woodmart-child",
+  "options": {
+    "blog_public": false,
+    "timezone_string": "UTC"
+  }
+}
 ```
 
-Enable the plugin and configure infrastructure/download sources through `/etc/wo/plugins.d/multitenancy.conf`:
+Apply is additive. Plugins absent from this list stay active unless you use `apply --prune`.
+Scalar options become strings, with booleans converted to `1` or `0`. Arrays and objects use JSON.
+WordOps does not maintain baseline Git history or revision counters.
 
-```ini
-[multitenancy]
-enable_plugin = true
-shared_root = /var/www/shared
-keep_releases = 3
-wp_version = latest
-php_version = 8.4
-admin_email = admin@example.com
+`config/wp-config-shared.php` contains fleet-wide PHP constants.
+Tenant configs require it before their database constants, unless `WO_BYPASS_SHARED_CONFIG` is true.
+`init`, `create`, `update`, and `apply` check its syntax with `php -l`.
 
-[wordpress_plugins]
-redis-cache = latest
-nginx-helper = latest
-
-[wordpress_themes]
-twentytwentyfour = latest
-```
-
-Initialize the shared core, baseline file, config, database metadata, permissions, and git tracking:
+## Initialization and cutover
 
 ```bash
 wo multitenancy init
 ```
 
-Then set the baseline activation state with `add-plugin`, `set-theme`, or by editing `/var/www/shared/config/baseline.json`. Re-running `wo multitenancy init --force` re-downloads every configured plugin and theme from its source, leaving a timestamped backup of each previous copy under `backups/assets/`, and repairs shared infrastructure; it never overwrites an existing `baseline.json`. Unlike `update`, a mid-seed failure is per-asset best-effort rather than an all-or-nothing rollback. It also removes a legacy `wo-baseline-enforcer.php` MU-plugin if one is present.
-
-## Configuration
-
-Configuration lives at `/etc/wo/plugins.d/multitenancy.conf`. This file controls infrastructure settings and download sources only; it does not control which plugins or theme are active on tenants.
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `enable_plugin` | — | Cement plugin-loader gate; the plugin only loads when set to `true`. |
-| `shared_root` | `/var/www/shared` | Shared core, content, config, baseline, and release root. |
-| `keep_releases` | `3` | Number of WordPress core releases kept for rollback. |
-| `keep_asset_backups` | `3` | Per-plugin/theme backups kept under `backups/assets/` after `init --force`, `update`, `update-plugin`, and `update-theme`. `0` keeps none; a negative value disables pruning. |
-| `wp_version` | `latest` | WordPress core version downloaded by `init` and `update`. `latest`, an exact version (e.g. `6.5.2`), or `nightly`; passed to `wp core download --version=...` when pinned. |
-| `php_version` | `8.4` | Default PHP version when the CLI/site does not specify one. |
-| `admin_email` | `admin@example.com` | Fallback admin email for site creation. |
-| `apply_workers` | `4` | Parallel workers for `wo multitenancy apply` (clamped to 1–16). Per-site wp-cli work runs concurrently; database tracking updates stay serialized. |
-| `min_free_space_gb` | `2` | Free-disk threshold (GB) below which the `health` disk check warns. |
-
-Defaults are the code fallbacks used when a key is missing. The packaged conf in this fork lists WordPress.org plugin sources in `[wordpress_plugins]` and sources `woodmart`/`woodmart-child` from `[github_themes]`; the active baseline lives in `/var/www/shared/config/baseline.json`.
-
-Optional source sections define plugins and themes downloaded from WordPress.org, GitHub, or direct zip URLs:
-
-| Section | Value format |
-| --- | --- |
-| `[wordpress_plugins]` | `slug = latest` |
-| `[wordpress_themes]` | `slug = latest` or `slug = <version>` |
-| `[github_plugins]` | `slug = user/repo,tag|branch,ref` |
-| `[github_themes]` | `slug = user/repo,tag|branch,ref` |
-| `[url_plugins]` | `slug = https://example.com/plugin.zip` |
-| `[url_themes]` | `slug = https://example.com/theme.zip` |
-
-```ini
-[multitenancy]
-enable_plugin = true
-shared_root = /var/www/shared
-keep_releases = 3
-wp_version = latest
-php_version = 8.4
-admin_email = admin@example.com
-
-[wordpress_plugins]
-redis-cache = latest
-nginx-helper = latest
-
-[wordpress_themes]
-twentytwentyfour = latest
-
-[github_plugins]
-private-plugin = owner/private-plugin,tag,1.2.3
-branch-plugin = owner/branch-plugin,branch,main
-
-[url_themes]
-custom-theme = https://example.com/custom-theme.zip
-```
-
-Ordering quirk: put all `[multitenancy]` scalar keys before any `[wordpress_plugins]`, `[wordpress_themes]`, `[github_*]`, or `[url_*]` section. Place the source sections at the end of the file so later scalar keys are not parsed into the wrong section.
-
-For private GitHub repositories, token resolution is `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. The token is sent as `Authorization: Bearer <token>`.
-
-Older templates may contain extra keys such as `baseline_plugins`, `baseline_theme`, `auto_ssl`, `default_cache`, `enable_hsts`, `wp_memory_limit`, `disable_file_edit`, and others. Legacy `baseline_plugins`/`baseline_theme` values are read only as one-time bootstrap seeds when `wo multitenancy init` must create a missing `baseline.json`; current activation is controlled by `baseline.json`.
-
-## Baseline configuration
-
-`/var/www/shared/config/baseline.json` is the git-tracked source of truth for tenant activation, fleet-wide WordPress options, and durable CLI-added plugin/theme source metadata:
-
-```json
-{
-  "version": 3,
-  "generated": "2026-07-04T12:00:00Z",
-  "plugins": [
-    "redis-cache",
-    "nginx-helper",
-    "custom-github",
-    "premium-url"
-  ],
-  "theme": "twentytwentyfour",
-  "sources": {
-    "plugins": {
-      "redis-cache": { "type": "wordpress", "version": "latest" },
-      "custom-github": { "type": "github", "repo": "owner/repo", "ref_type": "branch", "ref": "main" },
-      "premium-url": { "type": "url", "url": "https://example.com/plugin.zip" }
-    },
-    "themes": {
-      "twentytwentyfour": { "type": "wordpress", "version": "latest" },
-      "custom-theme": { "type": "github", "repo": "owner/theme", "ref_type": "default", "ref": null }
-    }
-  },
-  "options": {
-    "blog_public": false,
-    "timezone_string": "UTC",
-    "woocommerce_allowed_countries": ["US", "CA"],
-    "my_plugin_settings": {
-      "enabled": true,
-      "mode": "fleet"
-    }
-  }
-}
-```
-
-`plugins` is the additive activation list unless `apply --prune` is used. `theme` is the active theme slug. `options` is applied with `wp option update` during site creation and `wo multitenancy apply`: scalar values become strings (`true`/`false` become `1`/`0`), while arrays and objects are written as JSON.
-
-`sources` is optional and records where shared plugins and themes are downloaded from. Source entries use one of these shapes: WordPress.org `{ "type": "wordpress", "version": "latest" }` or a pinned version, GitHub `{ "type": "github", "repo": "owner/repo", "ref_type": "branch" | "tag" | "default", "ref": "main" | "v1.2.3" | null }`, or URL `{ "type": "url", "url": "https://example.com/plugin.zip" }`. `baseline.json` is now the durable source metadata for CLI-added plugins/themes, while `/etc/wo/plugins.d/multitenancy.conf` remains the packaged/operator source catalog and fallback for older baselines.
-
-`wo multitenancy init` creates `baseline.json` only when the file is missing. It never overwrites an existing baseline, even with `--force`. The first file is a starting template: legacy `baseline_plugins` or `baseline_theme` keys take precedence when present; otherwise plugins are seeded from the keys in `[wordpress_plugins]`, `[github_plugins]`, and `[url_plugins]`, and the theme is seeded from the first `[wordpress_themes]` entry, the `-child` entry in `[github_themes]`, or the first available theme source. After that first write, the file is operator-owned and init does not rewrite it.
-
-Hand-editing `baseline.json` is supported. Keep it under git tracking, bump `version` when changing plugins, theme, or options by hand so `validate` can report site drift correctly, and commit the change through the normal baseline workflow. `history` and `baseline-rollback --to-version=N` operate on `config/baseline.json` regardless of whether the change came from a CLI helper or a hand edit.
-
-## Commands
-
-Every command is `wo multitenancy <verb> [options]`. There is no `baseline` sub-group; `wo multitenancy baseline` alone only prints the current baseline and change hints.
-
-### Lifecycle
-
-| Command | Purpose |
-| --- | --- |
-| `wo multitenancy init [--force]` | Create shared directories, download core (honoring `wp_version`), create `baseline.json` only if it is missing, write `wp-config-shared.php`, initialize git tracking, switch release, set permissions, write DB config, and remove a legacy enforcer MU-plugin if present. Re-running with `--force` re-downloads all configured plugins/themes from their sources (backing up previous copies) but never overwrites an existing baseline. |
-| `wo multitenancy create <domain> [flags]` | Create a shared-core tenant, then apply the baseline plugins, theme, and options from `baseline.json`. For `--wpfc`/`--wpredis` sites that include `nginx-helper` in the baseline, it also enables Nginx Helper cache purging automatically. See [create options](#create-options). |
-| `wo multitenancy update [--force]` | Stage core and compare `$wp_db_version`. A higher schema gates HTTP, drains active PHP/DB work and cron sleepers, promotes assets, runs a loopback canary through the gate, takes quiescent tenant DB dumps, flips core, then runs supervised per-tenant `wp core update-db`. Equal schemas keep the original fast path. Pre-flip failures restore promoted assets before reopening traffic; restore failure intentionally leaves gates active. Post-flip failures stay gated and report partial/nonzero status. Before a schema-bumping flip, the pending tenant migrations are recorded in `config/pending-db-upgrades.json`; if the update is interrupted mid-migration, the next `update` run finishes the leftover tenant migrations from that ledger before doing anything else. `--force` only skips the canary abort. |
-| `wo multitenancy rollback [--force]` | Switch `current` back to the previous WordPress core release only. WordPress DB migrations are forward-only: rollback neither reverses schema changes nor restores tenant dumps. It also does not roll back plugin/theme updates after a successful update command. `--force` skips confirmation. |
-| `wo multitenancy delete <domain> [--force]` | Delete a tenant with `wo site delete ... --no-prompt`, then remove its multi-tenancy tracking row. |
-| `wo multitenancy remove [--force]` | Tear down the entire shared infrastructure. It refuses while sites remain unless `--force` is used. |
-
-### Inspection
-
-| Command | Purpose |
-| --- | --- |
-| `wo multitenancy status` | Show infrastructure summary, health checks, releases, sites, disk usage, and baseline. |
-| `wo multitenancy list` | Show a table of shared sites with domain, PHP, cache, SSL, and enabled state. |
-| `wo multitenancy validate` | Check `baseline.json`, plugin/theme files, sites whose baseline version is behind, and warn when `config/pending-db-upgrades.json` reports tenants left mid-migration by an interrupted update. |
-| `wo multitenancy health [--json] [--site=<domain>]` | Run health checks for shared infrastructure, database, disk space, PHP-FPM, nginx, and site HTTP reachability. Exit code: `0` healthy, `2` degraded, `1` unhealthy or uninitialized. |
-
-### Baseline
-
-| Command | Purpose |
-| --- | --- |
-| `wo multitenancy baseline` | Show current baseline version, plugins, and theme. Read-only. Extra arguments are ignored. |
-| `wo multitenancy add-plugin <slug> [--github=user/repo] [--branch=<b> \| --tag=<t>] [--url=<zip>] [--apply-now]` | Add a plugin to `baseline.json` and commit it. Default source is WordPress.org; GitHub and URL zip sources are supported. `--apply-now` rolls out immediately. |
-| `wo multitenancy add-theme <slug> [--github=user/repo] [--branch=<b> \| --tag=<t>] [--url=<zip>] [--set-default] [--apply-now]` | Add a theme from WordPress.org, GitHub, or URL zip and commit it. `--set-default` makes it the baseline active theme. `--apply-now` rolls out when the theme is also default. |
-| `wo multitenancy remove-plugin <slug> [--apply-now]` | Remove a plugin from the baseline and commit it. This is baseline-only; it does not live-deactivate the plugin on sites. |
-| `wo multitenancy update-plugin <slug>` | Re-fetch a plugin from baseline `sources` metadata first, then `/etc/wo/plugins.d/multitenancy.conf` fallback. Shared plugin files become live for all sites immediately. |
-| `wo multitenancy update-theme` | Re-fetch the configured baseline theme from baseline `sources` metadata first, then `/etc/wo/plugins.d/multitenancy.conf` fallback. Shared theme files become live for all sites immediately. Takes no slug. |
-| `wo multitenancy set-theme <slug> [--apply-now]` | Set an already-present shared theme as the baseline default, commit it, and optionally apply. |
-| `wo multitenancy apply [--dry-run] [--prune] [--verbose]` | Apply the current baseline to every enabled site by activating plugins, activating the theme, and updating `options` through wp-cli. Sites are processed in parallel (`apply_workers`, default 4). Default behavior is additive: plugins already active but absent from the baseline stay active. `--prune` is destructive and deactivates active plugins not listed in `baseline.json`; run `--dry-run --prune` first to see the exact would-be-deactivated set. For `--wpfc`/`--wpredis` sites with `nginx-helper` in the baseline, it also (re)enables Nginx Helper cache purging. Reports attempted, succeeded, and failed sites; clears caches globally unless dry-run. Exits nonzero when any site fails. |
-| `wo multitenancy history` | Show the last 20 git commits of `config/baseline.json`. |
-| `wo multitenancy baseline-rollback --to-version=N [--apply-now] [--force]` | Find the git commit for baseline version `N`, restore that content into `baseline.json`, and commit it as a **new** baseline version (current + 1) so history stays linear and `validate` drift detection keeps working. Optionally apply to sites. This can restore an older baseline without `sources`; afterward updates fall back to `/etc/wo/plugins.d/multitenancy.conf`, and per-item updates fail for slugs still lacking a source. |
-
-### Shared config & maintenance
-
-| Command | Purpose |
-| --- | --- |
-| `wo multitenancy shared-config --action edit` | Safely edit `wp-config-shared.php`. This is the only supported shared-config action. It uses `$EDITOR` with fallback `vi`, creates a timestamped `.bak`, keeps the 10 newest backups, lints with `php -l`, reloads all installed PHP-FPM versions and nginx on success, and auto-restores the backup on syntax error. |
-| `wo multitenancy maintenance --enable\|--disable [--site=<domain> \| --all] [--message="..."]` | Add or remove an nginx 503 maintenance page for one site or the whole fleet, then reload nginx once. Exactly one of enable/disable and exactly one of site/all is required. Exits nonzero when any site or the nginx reload fails. |
-
-### Preflight
-
-`init`, `create`, `update`, and `apply` run `php -l` on `wp-config-shared.php` before continuing and refuse to proceed on a syntax error.
-
-## create options
-
-| Option | Meaning |
-| --- | --- |
-| `<domain>` | Required positional domain. |
-| `--php74` | Use PHP 7.4. |
-| `--php80` | Use PHP 8.0. |
-| `--php81` | Use PHP 8.1. |
-| `--php82` | Use PHP 8.2. |
-| `--php83` | Use PHP 8.3. |
-| `--php84` | Use PHP 8.4. |
-| `--wpfc` | Use FastCGI cache. |
-| `--wpredis` | Use Redis cache. **Blocked by default**: the bundled `nginx-wo` 1.30.4 build segfaults its workers on the srcache/redis2 page-cache path, taking down all tenants. Pass `--force` to override at your own risk; prefer `--wpfc`. |
-| `--wprocket` | Use WP Rocket. |
-| `--wpce` | Use Cache Enabler. |
-| `--wpsc` | Use WP Super Cache. |
-| `-le` | Enable Let's Encrypt SSL. |
-| `--letsencrypt` | Enable Let's Encrypt SSL. |
-| `--hsts` | Enable HSTS. |
-| `--dns[=dns_cf]` | Use wildcard/DNS mode. |
-| `--admin-user` | WordPress admin username. Default: `SuperDuper`. |
-| `--admin-email` | WordPress admin email. Falls back to `admin_email` in config. |
-
-If no PHP flag is passed, the default comes from `php_version` in config, which defaults to 8.4. If no cache flag is passed, the site is created with basic/no cache. SSL is `-le` or `--letsencrypt`; a copied `—le` with an em dash causes `unrecognized arguments`. If Let's Encrypt setup fails, `create` does not abort or roll back the site: it continues, records the tenant as non-SSL, and leaves it on HTTP with a warning; when the failure is nginx configuration validation, the just-written SSL config is also removed so nginx stays valid. Rerun SSL setup after fixing the cause.
-
-Cache purging is automatic: when a site uses `--wpfc` or `--wpredis` and `nginx-helper` is in the baseline `plugins`, both `create` and `apply` seed the Nginx Helper option `rt_wp_nginx_helper_options` with purging enabled and the matching cache method (`enable_fastcgi` or `enable_redis`). Because Nginx Helper 2.3.4+ also gates the purge button behind a custom capability that WP-CLI plugin activation does not grant (activation only adds it for a logged-in admin), `create` and `apply` additionally grant the `Nginx Helper | Purge cache` and `Nginx Helper | Config` capabilities to the administrator role whenever `nginx-helper` is in the baseline — without this the button reports "you do not have the necessary privileges" even with purge enabled. You no longer need to open wp-admin → Nginx Helper and tick "Enable Purge" per site. To retrofit sites created before this behavior, run `wo multitenancy apply`.
-
-`--shared` is accepted globally but `create` ignores it; a created multi-tenancy site always uses shared core. `--force` on `create` overrides the `--wpredis` block and changes SSL setup: with an existing certificate it reinstalls it without the archived-certificate prompt, and for new issuance it skips the DNS-points-to-this-server precheck (DNS validation mode skips that precheck anyway). There is no command to convert an existing standalone WordPress site onto the shared core; shared-core sites must be created fresh with `create`.
-
-## Directory structure
-
-Shared tree:
-
-```text
-/var/www/shared/
-├── current -> releases/wp-YYYYMMDD-HHMMSS
-├── releases/
-│   └── wp-YYYYMMDD-HHMMSS/          # full WP core (+ router wp-config.php); keep_releases kept
-├── wp-content/
-│   ├── plugins/                     # shared, baseline-managed
-│   ├── themes/                      # shared, baseline-managed
-│   ├── mu-plugins/                  # shared
-│   └── languages/                   # shared
-├── config/
-│   ├── wp-config-shared.php         # fleet-wide, require_once'd
-│   └── baseline.json                # active plugins/theme, options, version
-└── .git/                            # tracks config/baseline.json only
-```
-
-Per-site tree:
-
-```text
-/var/www/<domain>/
-├── htdocs/
-│   ├── wp-config.php                # per-site DB creds, salts, Redis prefix + dedicated Redis database
-│   ├── wp -> /var/www/shared/current
-│   ├── wp-login.php -> shared core
-│   ├── wp-admin -> shared core
-│   ├── wp-includes -> shared core
-│   ├── wp-cron.php -> shared core
-│   ├── xmlrpc.php -> shared core
-│   ├── wp-comments-post.php -> shared core
-│   ├── wp-settings.php -> shared core
-│   ├── index.php                    # generated; requires wp/wp-blog-header.php
-│   └── wp-content/
-│       ├── plugins -> shared tree
-│       ├── themes -> shared tree
-│       ├── mu-plugins -> shared tree
-│       ├── languages -> shared tree
-│       ├── uploads/                 # real per-site dir
-│       ├── cache/                   # real per-site dir
-│       └── upgrade/                 # real per-site dir
-└── conf/nginx/                      # vhost + cache config; +maintenance include
-```
-
-## Updates, rollback & baseline history
-
-Core update and rollback are atomic symlink operations. `update` builds a new `releases/wp-<timestamp>` tree and repoints `current`; `rollback` repoints `current` to the previous release. By default, `keep_releases = 3` keeps three releases for rollback. When `wp_version` pins a version, `update` re-downloads that pinned version rather than the latest; change the pin or set it back to `latest` to move the core forward.
-
-After staging core, `update` parses `$wp_db_version` from both the active and staged `wp-includes/version.php`. Equal schema versions keep the existing fast update path. A lower staged schema aborts because automated database downgrade is unsupported; an unreadable or unparseable marker on either side also aborts rather than guessing.
-
-For a higher staged schema, `update` validates every tracked domain, captures the current nginx worker PIDs, then renders the existing per-tenant nginx maintenance gate **fully closed** and reloads nginx. No local or external bypass exists during the first drain or asset promotion. A gate that existed before the update is preserved byte-for-byte and never modified. Gate files live in each tenant's real `/var/www/<domain>/conf/nginx/` and `htdocs/` tree, outside the shared release.
-
-Immediately before the maintenance reload, `update` captures the current nginx worker PIDs. Because nginx reload is graceful, those old-generation workers remain alive until every request admitted before the gate finishes, including slow request bodies and requests not yet visible in FPM. The update then holds every managed `/tmp/wo-cron-<domain>.lock`, installs guarded cron lines, and waits for **all captured nginx workers to exit**. Only after that causal boundary does it require the PHP-FPM listen queue and active-worker count to be zero and tenant `information_schema.innodb_trx` count to be zero. The same wait covers the old cron runner's 60-second splay horizon. Nginx PIDs come from the process table, FPM queue/activity from WordOps' local JSON/full status endpoints, and transactions from MySQL; unreadable probes fail closed. The total bound is 330 seconds, slightly above the 300-second PHP request timeout. Timeout aborts before asset promotion and names the old PIDs, queued/active FPM work, or transactions that did not drain.
-
-Only after the first causal drain does `update` promote shared assets. It then temporarily renders a true-socket loopback bypass using nginx `$realip_remote_addr` rather than header-rewritten `$remote_addr`, reloads nginx a second time, and runs the canary against old core plus new assets; external/Cloudflare traffic remains 503. Both this gated canary and the earlier ungated health canary append a unique `wo_mt_canary` query parameter and send `X-Requested-With: XMLHttpRequest`; WordOps' `map-wp` maps both signals into cache fetch/store bypass, so canonical redirects that drop the query remain cache-proof. Redirects are followed manually for at most five hops: before making the next request, `update` requires HTTP/HTTPS, the default port (80/443), and a host in the tenant's apex/`www` pair; rejected `Location` values are logged and never requested. Each gated hop remains a separate no-follow curl with `--proto =http,https` and both allowed hosts/ports pinned to loopback, preserving TLS SNI and preventing public-DNS, cross-host, non-default-port, or alternate-protocol escapes. A final response must be 2xx. Next it captures that bypass generation, rewrites every update-owned gate fully closed, reloads nginx a third time, and performs the same causal drain again (without another cron-horizon delay). This waits out canary/local stragglers, so no bypass exists during snapshots. Only then does it export point-in-time tenant dumps. Any pre-flip failure releases locks and restores assets **before** ungating. Canary failure and drain-2 timeout already have closed gates; if an exceptional bypass-stage abort occurs, cleanup closes the bypass first. Restore failure retains gates.
-
-After the flip and new release record, each tenant runs `wp core update-db`; its cron lock is released only after that decision. Successful tenants have update-owned gates removed, failed tenants keep theirs, and one batch nginx reload applies successful ungates. Dumps accumulate and remain operator-managed. Upgrade post-flip paths never blanket-ungate.
-
-Immediately before a schema-bumping flip, `update` atomically writes `config/pending-db-upgrades.json` listing the new release and every tenant awaiting `wp core update-db`; each tenant is removed from the ledger as its migration succeeds, and the file is deleted once empty. If the process dies mid-migration (crash, reboot, SIGKILL), `validate` warns about the leftover ledger and the next `update` run recovers first: it re-gates the listed tenants, runs their pending migrations, removes the recovery gates, and only then proceeds — or exits nonzero naming the tenants that still fail.
-
-Each tenant's `wp core update-db` is supervised with a five-minute timeout. A timed-out WP/PHP/MySQL process is terminated by the subprocess runner, recorded as a failed tenant, left maintenance-gated, and has its cron lock released before the update continues to the next tenant.
-
-Post-flip failures do not trigger an automatic rollback. The command still performs release/asset cleanup, reports each failed and still-gated domain, prints the exact `wo multitenancy maintenance --disable --site=<domain>` manual ungate command plus the `wp core update-db --path=… --allow-root` remediation, emits `result=partial` with the failed count and pre-upgrade backup directory, and exits nonzero.
-
-`rollback` changes core files only. WordPress database migrations are forward-only, so it cannot reverse a schema migration. If `wp core update-db` ran, either validate that the older core works with the newer schema or import the appropriate pre-upgrade tenant dump from `shared_root/backups/db/<timestamp>/` with `wp db import`.
-
-Baseline changes are git-committed under `shared_root/.git`, with tracking limited to `config/baseline.json`. `history` shows recent baseline commits, and `baseline-rollback --to-version=N` restores the `baseline.json` content from the commit for version `N` and commits it as a new baseline version (current + 1), keeping history linear. `update` changes the shared core and shared plugin/theme files only; it does not bump the baseline version.
-
-Plugin and theme refreshes leave a timestamped backup of the previous copy under `shared_root/backups/assets/<stamp>/<plugins|themes>/<slug>`. On success, `init --force`, `update`, `update-plugin`, and `update-theme` prune these to the newest `keep_asset_backups` (default 3) per asset; set it to `0` to keep none, or a negative value to disable pruning.
-
-**Plugin migration warning:** schema-gated automatic dumps cover WordPress core schema changes only. Before an `update` that ships plugins with their own schema or data migrations, manually run `wp db export /secure/backup/<domain>.sql --path=/var/www/<domain>/htdocs --allow-root` for every tenant. Reverting shared plugin code cannot undo those database changes.
-
-Sites do not auto-upgrade on visit. Run `wo multitenancy apply`, or use `--apply-now` on baseline-changing commands that support it. By default `apply` is additive; include `--prune` only when you intentionally want plugins outside `baseline.json` deactivated.
-
-## Shared config safety & recovery
-
-Use `wo multitenancy shared-config --action edit` for shared config changes. The command creates a timestamped backup, keeps the 10 newest backups, opens `$EDITOR` or `vi`, lints the saved file with `php -l`, reloads all installed PHP-FPM versions and nginx on success, and restores the backup automatically on syntax error.
-
-If a shared-config edit still downs a site, edit that site's `/var/www/<domain>/htdocs/wp-config.php` and set:
-
-```php
-define('WO_BYPASS_SHARED_CONFIG', true);
-```
-
-This bypass brings the site up while you fix `/var/www/shared/config/wp-config-shared.php`. Remove the bypass after the shared file is fixed.
-
-## Tenancy caveat
-
-Plugins and themes are shared read-only symlinks. A plugin that writes into its own plugin directory, such as license files, generated assets, or caches under `wp-content/plugins/<slug>/`, can collide across sites or fail on the read-only tree. Keep mutable per-site state in `uploads`, and vet plugins before adding them to the baseline; most plugins store state in the database or uploads and are fine.
-
-## Troubleshooting
-
-| Symptom | Cause/fix |
-| --- | --- |
-| Site cannot find WordPress core | Check the site core symlink with `ls -la /var/www/<d>/htdocs/wp` and check `/var/www/shared/current`. |
-| nginx config or vhost issue | Run `nginx -t && systemctl reload nginx`. |
-| PHP-FPM unavailable | Check `systemctl status php8.4-fpm` or the service matching the site's PHP version. |
-| Uploads fail or media cannot be written | Fix uploads ownership with `chown -R www-data:www-data …/wp-content/uploads`. |
-| SSL flag rejected as `unrecognized arguments` | Use `-le` or `--letsencrypt`; replace any copied em dash with a normal hyphen. |
-| Redis cross-talk or lost cache isolation | Each site needs a unique `redis_prefix` and a dedicated `redis_db` (both enforced in the DB). Object Cache Pro flushes with `FLUSHDB`, so tenants sharing one Redis database wipe each other's cache — including OCP's metadata key, which triggers fleet-wide integrity-flush loops that keep every cache cold and make wp-admin run update/license checks inline on every page load. `wo multitenancy apply` backfills a dedicated database for tenants still on shared db 0; database 0 is reserved for standard sites. When the fleet outgrows the Redis `databases` limit, `create`/`apply` raise it in `/etc/redis/redis.conf` and restart Redis. |
-| `validate` flags a fresh site as behind | The create-time baseline version may not have been recorded; run `wo multitenancy apply`. |
-| Shared-config syntax error | Run `wo multitenancy shared-config --action edit` to use linted editing, or temporarily set `WO_BYPASS_SHARED_CONFIG` in the affected site's config while fixing the shared file. |
-
-## Logs
-
-Interactive multi-tenancy commands log to `/var/log/wo/wordops.log`. Scheduled backup jobs also append their stdout and stderr to `/var/log/wo/backup.log`.
+Init creates infrastructure folders and fixed content links, downloads core, writes shared configuration, and records the core release.
+It does not create a baseline or a content release.
+`init --force` reinitializes core infrastructure without downloading site content or changing ownership inside content releases.
+Existing real content folders and baseline files remain untouched.
+
+For an existing fleet with the old layout, run this once:
 
 ```bash
-wo --debug multitenancy <cmd>
-tail -f /var/log/wo/wordops.log
-tail -f /var/log/wo/backup.log  # exists after the first scheduled backup starts
+wo multitenancy cutover
 ```
+
+Cutover requires tracked shared sites. It enables maintenance and drains active nginx, PHP, database, and cron work before moving folders.
+It moves existing content and baseline into a `pre-cutover` release, writes `RELEASE`, and creates the content links.
+It resets caches, reloads PHP-FPM, removes maintenance, and checks the fleet. Failure attempts to restore the old layout.
+It refuses a fleet that already uses the fixed content link.
+
+A fresh init alone is not a complete content bootstrap.
+On the new layout, create requires live content. Deploy requires a previous live release and tracked sites.
+These server commands do not establish the first content release on an empty fleet.
+Provision initial live content before creating tenants.
+Existing pre-cutover fleets can still create tenants from their real shared content folder.
+
+## Content deploys
+
+Use the site repository's `tools/deploy` to build and transfer committed content.
+The server command accepts an already staged release:
+
+```bash
+wo multitenancy deploy <release>
+wo multitenancy deploy <release> --code-only
+```
+
+The default safe path:
+
+1. Enable maintenance on all tracked stores, with the loopback bypass closed.
+2. Lock cron and drain active work.
+3. Dump every tenant database locally. Run the database backup family if backups are configured.
+4. Write the managed `wo-login-log.php` into the staged release and set ownership.
+5. Switch `content/current`, clear page caches, reset opcache, and reload tenant PHP-FPM services.
+6. Run WooCommerce database updates when its version changes or a tenant database version differs.
+7. Apply the baseline when its bytes or the Object Cache Pro version changed.
+8. Open the loopback bypass and check stores while public traffic remains blocked.
+9. Close the bypass, remove maintenance, release cron locks, and prune old releases.
+
+A failed safe deploy can also trigger apply on the next safe deploy.
+If backups are not initialized, WordOps retains local dumps and warns that it skipped the remote database backup.
+Configured but disabled or failed backups stop deployment.
+
+Checks cover the home page, one published product, cart, checkout, My Account, login, and REST API.
+They check HTTP results, critical-error text, WooCommerce database versions, new fatal log entries, and fleet health.
+Each store must have a published product.
+These checks do not prove that payments work. Test checkout separately after payment-related changes.
+
+A safe failure before the switch removes newly added maintenance gates and leaves the live release unchanged.
+A safe failure after the switch keeps maintenance active. Fix forward or choose database recovery.
+WordOps does not automatically restore databases.
+
+### Code-only path
+
+Use `--code-only` only after reviewing changed code for database effects.
+The server requires identical plugin/theme version maps and identical baseline bytes.
+Those checks do not prove that code has no database effects.
+
+Code-only deployment takes database dumps while stores stay open.
+It skips maintenance, draining, WooCommerce migrations, and baseline apply.
+It still prepares the release, switches content, resets caches, and checks stores.
+A failure after the switch automatically selects the previous release and checks it again.
+Restoring these dumps would lose data written after the restore point.
+
+### Switch content back
+
+```bash
+wo multitenancy deploy --back
+wo multitenancy deploy --back --force
+```
+
+The command uses `content/history.jsonl` to find the previous release.
+After a code-only deploy, it switches files and checks the fleet without maintenance.
+After a safe deploy, it refuses unless you supply `--force`.
+It prints the restore point's per-store `wp db import` commands.
+
+Safe-path back enables maintenance, drains work, switches files, and checks the fleet.
+It keeps maintenance active, including when checks fail after the switch.
+Restore the chosen databases and check stores before reopening traffic:
+
+```bash
+wo multitenancy maintenance --all --disable
+```
+
+Switching files does not reverse database migrations, options, roles, plugin activation, or orders.
+Back does not automatically run apply or import dumps.
+
+## Tenant and core commands
+
+Every command below starts with `wo multitenancy`.
+
+| Command | Behavior |
+| --- | --- |
+| `create <domain> [flags]` | Require live content on the new layout, create a tenant, and apply baseline plugins, theme, and options. |
+| `apply [--dry-run] [--prune] [--verbose]` | Apply the live baseline to enabled tenants. Return nonzero if any site fails. |
+| `baseline` | Print the live baseline JSON. |
+| `status` | Show core release, deployed content commit, infrastructure checks, sites, disk use, and baseline. |
+| `validate` | Check baseline JSON and listed plugin/theme files. Show deployed commit and pending core migrations. |
+| `health [--json] [--site=<domain>]` | Check infrastructure, services, content state, and deployed commit. Exit 0 healthy, 2 degraded, or 1 unhealthy. |
+| `list` | List tracked tenants and their PHP, cache, SSL, and enabled state. |
+| `update [--force]` | Update core only. Test new core after switching, unless forced. |
+| `rollback [--force]` | Select previous core. It does not restore content or databases. |
+| `delete <domain> [--force]` | Delete a tenant and its tracking row. |
+| `remove [--force]` | Remove shared infrastructure. Refuse while tenants remain unless forced. |
+
+Apply does not download code, change releases, track baseline revisions, or rewrite the login logger.
+It repairs tenant Redis database assignment, synchronizes cron, and applies cache configuration.
+Use `apply --dry-run --prune` before deactivating plugins absent from the baseline.
+Apply does not recreate tenant core links or the generated front controller.
+
+### Create options
+
+```bash
+wo multitenancy create example.com --php84 --wpfc
+wo multitenancy create ssl.example.com --php84 --wpfc -le
+```
+
+PHP flags range from `--php74` through `--php84`.
+Cache flags include `--wpfc`, `--wpredis`, `--wprocket`, `--wpce`, and `--wpsc`.
+Prefer `--wpfc`. The bundled nginx build has a known failure on the Redis page-cache path.
+`--wpredis` therefore requires `--force`.
+Other options include `--admin-user`, `--admin-email`, `-le`/`--letsencrypt`, `--hsts`, and `--dns[=dns_cf]`.
+Without flags, PHP uses configuration and page caching is disabled.
+SSL failure leaves the tenant on HTTP with a warning.
+There is no command to convert standalone sites to shared core.
+
+### Core update safety
+
+Update stages core and compares `$wp_db_version`. A lower or unreadable schema marker aborts the update.
+Equal schema versions use the fast path. The canary runs after the core switch.
+For a higher schema, update enables maintenance, drains work, and takes tenant database dumps before switching.
+It then runs supervised per-tenant `wp core update-db` and tests new core through a loopback bypass.
+`--force` skips the canary, not the schema safety steps.
+
+`config/pending-db-upgrades.json` records unfinished migrations.
+The next update recovers these migrations before starting another update.
+Failed migrations keep affected stores gated and produce a nonzero result.
+Successful migrations can release their update-owned gates. Pre-existing maintenance remains unchanged.
+Post-switch failure does not automatically roll back core.
+Core rollback changes files only. Restore database dumps separately when recovery requires them.
+
+## Shared configuration and maintenance
+
+```bash
+wo multitenancy shared-config --action edit
+wo multitenancy maintenance --enable --all
+wo multitenancy maintenance --disable --site=example.com
+```
+
+Shared-config editing uses `$EDITOR` or `vi`, retains ten backups, checks PHP syntax, and reloads services.
+A syntax error restores the backup.
+For temporary recovery, define `WO_BYPASS_SHARED_CONFIG` as true in the affected tenant's config.
+Remove that bypass after repairing the shared file.
+
+Generated shared configuration disables loopback WP-Cron.
+WordOps maintains `/etc/cron.d/wo-multitenancy` with maintenance-aware, locked, every-minute tenant jobs.
+Each job has a deterministic delay of 0–59 seconds.
+Create, delete, rename, and non-dry-run apply regenerate these entries.
+
+Deploy owns the generated `wo-login-log.php` MU-plugin.
+It logs password failures outside `wp-login.php` to journald for the `wo-wordpress-auth` fail2ban jail.
+The nginx access-log jail handles `wp-login.php`. Empty username or password submissions do not enter the MU-plugin log.
+Keep mutable files in tenant uploads or databases, not shared plugin or theme folders.
+
+Interactive commands log to `/var/log/wo/wordops.log`.
+Scheduled backup output also goes to `/var/log/wo/backup.log`.
 
 ## Fleet Backups (Cloudflare R2)
 
@@ -429,6 +280,12 @@ There is one repository, not one repository per tenant. The snapshot tags are
 the tenant boundary: hourly database snapshots use `db` and `site:<domain>`;
 daily files use `files`; safety snapshots add `pre-restore`,
 `operation:<id>`, and (for fleet captures) `fleet`.
+
+File backups and fleet safety captures include the real live content release and `content/current`, not only a content symlink.
+The release includes its baseline and `RELEASE` metadata.
+They omit `/var/www/shared/.git` and do not archive every old content release.
+Before cutover, they capture the real shared `wp-content` folder.
+Fleet restore restores the selected release and current link, then recreates the two fixed links.
 
 ### Backup setup
 
@@ -531,12 +388,7 @@ prune_ping_url =                ; optional dead-man URL for the weekly prune
 check_ping_url =                ; optional dead-man URL for the monthly check
 ```
 
-The `[backup]` values are non-secret; R2 keys and `RESTIC_PASSWORD` stay in
-`/etc/wo/backup.env`. Keep all `[backup]` scalar keys above the plugin/theme
-source sections (`[wordpress_plugins]`, `[wordpress_themes]`, `[github_*]`,
-and `[url_*]`). This is the same scalar-section ordering quirk as the rest of
-this file: source sections belong at the end so later scalar keys are not
-parsed into the wrong section.
+The `[backup]` values are non-secret. R2 keys and `RESTIC_PASSWORD` stay in `/etc/wo/backup.env`.
 
 Configure one healthchecks.io-style dead-man check **per job**, not one URL for
 the whole fleet. The jobs have different periods and each URL receives
@@ -761,9 +613,9 @@ the matching database restore point before starting.
 
    Do not omit an older PHP-FPM version merely because the replacement's
    default is newer; restored vhosts point at their recorded PHP sockets.
-4. **Initialize multi-tenancy FIRST, before any restore.** This plain init
-   repairs/writes shared directories, config, and git scaffolding even without
-   `--force`; running it after a restore could clobber restored global state:
+4. **Initialize multi-tenancy before restoring an empty replacement server.**
+   Init creates core, configuration, and fixed links, but no live content release.
+   Do not run it after restoring global state.
 
    ```bash
    wo multitenancy init
@@ -779,7 +631,7 @@ the matching database restore point before starting.
    SNAPSHOT_ID='<files-snapshot-id>'
    /usr/local/bin/restic --retry-lock 5m restore "$SNAPSHOT_ID" --target / \
      --include /var/www/shared/config \
-     --include /var/www/shared/.git \
+     --include /var/www/shared/content \
      --include /var/www/shared/wp-content \
      --include /etc/wo/plugins.d/multitenancy.conf \
      --include /var/lib/wo-backup/staging/dbase.db \
@@ -893,15 +745,11 @@ the matching database restore point before starting.
 
 ### DR code-verification note
 
-`BaselineApplicator.apply_baseline_to_site` starts at
-`wo/cli/plugins/multitenancy_functions.py:3889` and its body through line 4062
-only applies plugins, options, cache configuration, and the theme through
-WP-CLI. `apply_baseline_to_sites` calls it at lines 4346-4354. It does not call
-`create_shared_symlinks`; that helper is the create-time path at lines 448-515
-and only creates missing links/index files. Therefore `wo multitenancy apply`
-does **not** regenerate `wp`, `wp-login.php`, or the generated `index.php` for
-an existing restored tenant, which is why the explicit relink loop is required
-in step 7.
+`BaselineApplicator.apply_baseline_to_site` in `wo/cli/plugins/multitenancy_functions.py`
+applies plugins, options, cache configuration, and the theme through WP-CLI.
+It does not call `create_shared_symlinks`.
+Therefore apply does not recreate tenant core links or `index.php`.
+The explicit relink loop in step 7 remains necessary.
 
 ### Backup threat model
 
