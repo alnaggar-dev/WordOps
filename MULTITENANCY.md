@@ -18,7 +18,8 @@ Operating model: this fork assumes a trust model of one — a solo operator runn
 | Web server | Not shared | nginx vhost and cache configuration |
 
 The shared `wo-login-log.php` MU-plugin is WordOps-managed: `wo multitenancy init` and `wo multitenancy apply` install it and overwrite any edits.
-It logs actual WordPress password failures to journald for the `wo-wordpress-auth` fail2ban jail.
+It logs WordPress password failures from forms other than `wp-login.php` (WooCommerce My Account and checkout, XML-RPC) to journald for the `wo-wordpress-auth` fail2ban jail.
+`wp-login.php` failures are not logged there because the `wo-wordpress` jail already counts them from the nginx access log, so each failure counts in one jail only.
 Submissions with empty username or password fields are excluded so OTP customers are not penalized.
 
 Multi-tenancy has three configuration layers:
