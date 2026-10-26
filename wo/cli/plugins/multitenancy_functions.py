@@ -24,7 +24,11 @@ from wo.core.logging import Log
 from wo.core.shellexec import WOShellExec
 from wo.core.variables import WOVar
 from wo.core.services import WOService
-from wo.cli.plugins.multitenancy_content import content_root
+from wo.cli.plugins.multitenancy_content import content_root, live_record
+
+# Local dump folders under <shared_root>/backups/db. Remote restic backups keep their own retention.
+KEEP_DB_DUMPS = 3
+DB_DUMP_NAME_RE = re.compile(r'^\d{4}-\d{2}-\d{2}-\d{6}$')
 
 
 class MTFunctions:
@@ -1868,7 +1872,33 @@ server {{
                     })
             except Exception as exc:
                 failures.append({'domain': domain, 'error': str(exc)})
+        if not failures:
+            MTFunctions.prune_tenant_database_backups(app, shared_root)
         return (not failures, failures, backup_dir)
+
+    @staticmethod
+    def prune_tenant_database_backups(app, shared_root):
+        """Keep the newest dump folders and the restore point that deploy --back prints."""
+        backup_root = os.path.join(shared_root, 'backups', 'db')
+        try:
+            record = live_record(shared_root) or {}
+        except ValueError as exc:
+            Log.warn(app, f'Kept old database dumps: cannot read content history: {exc}')
+            return
+        names = sorted(
+            name for name in os.listdir(backup_root)
+            if DB_DUMP_NAME_RE.match(name) and os.path.isdir(os.path.join(backup_root, name))
+        )
+        keep = set(names[-KEEP_DB_DUMPS:])
+        dumps = (record.get('restore_point') or {}).get('dumps')
+        if dumps:
+            keep.add(os.path.basename(os.path.normpath(dumps)))
+        for name in names:
+            if name not in keep:
+                try:
+                    shutil.rmtree(os.path.join(backup_root, name))
+                except OSError as exc:
+                    Log.warn(app, f'Could not remove old database dumps {name}: {exc}')
 
 
     @staticmethod

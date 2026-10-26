@@ -18,7 +18,7 @@ from cement.core.controller import CementBaseController, expose
 from wo.cli.plugins.multitenancy_backup_functions import fleet_operation
 from wo.cli.plugins.multitenancy_content import (
     HISTORY_FILE, KEEP_RELEASES, RELEASE_NAME_RE, content_root, current_link,
-    current_release, is_cut_over, list_releases, read_release_info,
+    current_release, is_cut_over, list_releases, live_record, read_release_info,
 )
 from wo.cli.plugins.multitenancy_db import MTDatabase
 from wo.cli.plugins.multitenancy_functions import MTFunctions
@@ -496,15 +496,10 @@ class ContentDeployment:
             self._history(name, old_name, path, result)
 
     def _previous(self):
-        live = os.path.basename(current_release(self.root) or '')
-        history = os.path.join(content_root(self.root), HISTORY_FILE)
-        if os.path.exists(history):
-            with open(history) as handle:
-                records = [json.loads(line) for line in handle if line.strip()]
-            for record in reversed(records):
-                if record['release'] == live and record.get('previous') and record['result'] in ('pass', 'fail'):
-                    return record
-        raise DeployError('No previous content release is recorded.')
+        record = live_record(self.root)
+        if record is None:
+            raise DeployError('No previous content release is recorded.')
+        return record
 
     def back(self, force=False):
         record = self._previous()

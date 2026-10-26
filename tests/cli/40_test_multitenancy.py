@@ -3607,6 +3607,51 @@ $wp_version = '6.9.1';
             run.call_args_list[0].args[0],
         )
 
+    def _old_dumps(self):
+        names = ['2000-01-0{}-000000'.format(day) for day in range(1, 6)] + ['manual-copy']
+        for name in names:
+            os.makedirs(os.path.join(self.tmp, 'backups', 'db', name))
+        return names
+
+    def _remaining_dumps(self):
+        return sorted(os.listdir(os.path.join(self.tmp, 'backups', 'db')))
+
+    def test_backup_keeps_newest_dumps_and_the_back_restore_point(self):
+        old = self._old_dumps()
+        content = os.path.join(self.tmp, 'content')
+        os.makedirs(os.path.join(content, '20000105-000000-abcdef0'))
+        os.symlink('20000105-000000-abcdef0', os.path.join(content, 'current'))
+        dumps = os.path.join(self.tmp, 'backups', 'db')
+        records = [
+            {'release': '20000104-000000-1234567', 'previous': 'x', 'result': 'pass',
+             'restore_point': {'dumps': os.path.join(dumps, old[1])}},
+            {'release': '20000105-000000-abcdef0', 'previous': '20000104-000000-1234567',
+             'result': 'pass', 'restore_point': {'dumps': os.path.join(dumps, old[0])}},
+            {'release': '20000105-000000-abcdef0', 'previous': None, 'result': 'aborted',
+             'restore_point': {'dumps': os.path.join(dumps, old[2])}},
+        ]
+        with open(os.path.join(content, 'history.jsonl'), 'w') as handle:
+            handle.write(''.join(json.dumps(record) + '\n' for record in records))
+        sites = [{'domain': 'ok.example', 'site_path': '/srv/ok'}]
+        with mock.patch.object(mtf.subprocess, 'run', return_value=mock.Mock(returncode=0)):
+            ok, _, backup_dir = MTFunctions.backup_tenant_databases(mock.Mock(), sites, self.tmp)
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            self._remaining_dumps(),
+            sorted([old[0], old[3], old[4], 'manual-copy', os.path.basename(backup_dir)]),
+        )
+
+    def test_failed_backup_keeps_old_dumps(self):
+        old = self._old_dumps()
+        sites = [{'domain': 'bad.example', 'site_path': '/srv/bad'}]
+        failed = mock.Mock(returncode=1, stdout='', stderr='export failed')
+        with mock.patch.object(mtf.subprocess, 'run', return_value=failed):
+            ok, _, backup_dir = MTFunctions.backup_tenant_databases(mock.Mock(), sites, self.tmp)
+
+        self.assertFalse(ok)
+        self.assertEqual(self._remaining_dumps(), sorted(old + [os.path.basename(backup_dir)]))
+
     def test_core_db_upgrade_aggregates_command_and_exception_failures(self):
         sites = [
             {'domain': 'ok.example', 'site_path': '/srv/ok'},

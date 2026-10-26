@@ -76,3 +76,20 @@ def read_release_info(release_path):
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def live_record(shared_root):
+    """History record of the operation that made the live release live, or None.
+
+    deploy --back switches to its previous release and prints its restore point.
+    """
+    live = os.path.basename(current_release(shared_root) or '')
+    try:
+        with open(os.path.join(content_root(shared_root), HISTORY_FILE)) as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+    except OSError:
+        return None
+    for record in reversed(records):
+        if record['release'] == live and record.get('previous') and record['result'] in ('pass', 'fail'):
+            return record
+    return None

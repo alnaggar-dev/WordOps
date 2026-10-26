@@ -39,6 +39,7 @@ Cutover uses a `YYYYMMDD-HHMMSS-pre-cutover` name instead.
 `content/history.jsonl` records each operation's time, release, previous release, path, restore point, and result.
 WordOps keeps the five newest content releases, plus the live and previous releases if needed.
 Core retention is separate.
+After each successful dump, WordOps keeps the three newest `backups/db/` dump folders, plus the restore point that `deploy --back` prints.
 
 ## Configuration and baseline
 
