@@ -3652,6 +3652,17 @@ $wp_version = '6.9.1';
         self.assertFalse(ok)
         self.assertEqual(self._remaining_dumps(), sorted(old + [os.path.basename(backup_dir)]))
 
+    def test_unreadable_history_keeps_old_dumps(self):
+        old = self._old_dumps()
+        content = os.path.join(self.tmp, 'content')
+        os.makedirs(os.path.join(content, 'history.jsonl'))
+        sites = [{'domain': 'ok.example', 'site_path': '/srv/ok'}]
+        with mock.patch.object(mtf.subprocess, 'run', return_value=mock.Mock(returncode=0)):
+            ok, _, backup_dir = MTFunctions.backup_tenant_databases(mock.Mock(), sites, self.tmp)
+
+        self.assertTrue(ok)
+        self.assertEqual(self._remaining_dumps(), sorted(old + [os.path.basename(backup_dir)]))
+
     def test_core_db_upgrade_aggregates_command_and_exception_failures(self):
         sites = [
             {'domain': 'ok.example', 'site_path': '/srv/ok'},

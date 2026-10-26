@@ -1882,7 +1882,7 @@ server {{
         backup_root = os.path.join(shared_root, 'backups', 'db')
         try:
             record = live_record(shared_root) or {}
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             Log.warn(app, f'Kept old database dumps: cannot read content history: {exc}')
             return
         names = sorted(

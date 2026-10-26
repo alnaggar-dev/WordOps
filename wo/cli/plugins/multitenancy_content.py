@@ -87,7 +87,7 @@ def live_record(shared_root):
     try:
         with open(os.path.join(content_root(shared_root), HISTORY_FILE)) as handle:
             records = [json.loads(line) for line in handle if line.strip()]
-    except OSError:
+    except FileNotFoundError:
         return None
     for record in reversed(records):
         if record['release'] == live and record.get('previous') and record['result'] in ('pass', 'fail'):
